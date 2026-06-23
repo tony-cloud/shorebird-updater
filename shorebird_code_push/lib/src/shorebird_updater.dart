@@ -127,6 +127,16 @@ abstract class ShorebirdUpdater {
   /// Throws a [ReadPatchException] if the read is unsuccessful.
   Future<Patch?> readNextPatch();
 
+  /// Overrides the generated random per-install device id used in patch
+  /// checks. Call this before [checkForUpdate] or [update] if your server
+  /// needs patch delivery bound to an app/account-specific identifier.
+  ///
+  /// The updater persists the override in its local state after a successful
+  /// call. The value should be stable for this installation/account and must
+  /// not contain sensitive secrets; it is sent to the update server as
+  /// `client_id`.
+  Future<void> setDeviceIdOverride(String deviceId);
+
   /// Checks for an available patch on [track] (or [UpdateTrack.stable] if no
   /// track is specified) and returns the [UpdateStatus].
   /// This method should be used to determine the update status before calling

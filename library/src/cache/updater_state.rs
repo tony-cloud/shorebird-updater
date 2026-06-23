@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 #[cfg(test)]
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,23 @@ fn is_file_not_found(error: &anyhow::Error) -> bool {
 impl UpdaterState {
     pub fn client_id(&self) -> String {
         self.serialized_state.client_id.clone()
+    }
+
+    pub fn set_client_id_override(&mut self, client_id: &str) -> Result<()> {
+        ensure!(
+            !client_id.is_empty(),
+            "Device id override must not be empty."
+        );
+        ensure!(
+            client_id.len() <= 256,
+            "Device id override must be 256 bytes or fewer."
+        );
+        ensure!(
+            !client_id.chars().any(char::is_control),
+            "Device id override must not contain control characters."
+        );
+        self.serialized_state.client_id = client_id.to_string();
+        self.save()
     }
 }
 
@@ -527,6 +544,24 @@ mod tests {
         let original_client_id = original.client_id();
         let next = load(&tmp, "1.0.0+2");
         assert_eq!(next.client_id(), original_client_id);
+    }
+
+    #[test]
+    fn client_id_override_persists_across_release_changes() {
+        let tmp = TempDir::new().unwrap();
+        let mut original = load(&tmp, "1.0.0+1");
+        original
+            .set_client_id_override("developer-device-id")
+            .unwrap();
+        let next = load(&tmp, "1.0.0+2");
+        assert_eq!(next.client_id(), "developer-device-id");
+    }
+
+    #[test]
+    fn client_id_override_rejects_empty_value() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = load(&tmp, "1.0.0+1");
+        assert!(state.set_client_id_override("").is_err());
     }
 
     #[test]

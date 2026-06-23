@@ -271,6 +271,13 @@ pub fn should_auto_update() -> anyhow::Result<bool> {
     with_config(|config| Ok(config.auto_update))
 }
 
+/// Overrides the generated per-install device/client id used for patch checks
+/// and server-side device targeting. The value is persisted in updater state
+/// and survives release-version cache resets.
+pub fn set_client_id_override(client_id: &str) -> anyhow::Result<()> {
+    with_mut_state(|state| state.set_client_id_override(client_id))
+}
+
 /// Synchronously checks for an update on the first non-null channel of:
 ///   1. `c_channel`
 ///   2. The channel specified in shorebird.yaml

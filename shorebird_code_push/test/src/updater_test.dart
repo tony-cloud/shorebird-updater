@@ -40,56 +40,59 @@ void main() {
     });
 
     group('checkForDownloadableUpdate', () {
-      test('forwards the result of shorebird_check_for_downloadable_update',
-          () {
-        when(
-          () => updaterBindings.shorebird_check_for_downloadable_update(
-            nullptr,
-          ),
-        ).thenReturn(true);
-        expect(updater.checkForDownloadableUpdate(), isTrue);
+      test(
+        'forwards the result of shorebird_check_for_downloadable_update',
+        () {
+          when(
+            () => updaterBindings.shorebird_check_for_downloadable_update(
+              nullptr,
+            ),
+          ).thenReturn(true);
+          expect(updater.checkForDownloadableUpdate(), isTrue);
 
-        when(
-          () => updaterBindings.shorebird_check_for_downloadable_update(
-            nullptr,
-          ),
-        ).thenReturn(false);
-        expect(updater.checkForDownloadableUpdate(), isFalse);
-      });
+          when(
+            () => updaterBindings.shorebird_check_for_downloadable_update(
+              nullptr,
+            ),
+          ).thenReturn(false);
+          expect(updater.checkForDownloadableUpdate(), isFalse);
+        },
+      );
 
       group('when a track is provided', () {
         setUp(() {
           when(
-            () => updaterBindings.shorebird_check_for_downloadable_update(
-              any(),
-            ),
+            () =>
+                updaterBindings.shorebird_check_for_downloadable_update(any()),
           ).thenReturn(true);
         });
 
-        test('forwards the result of shorebird_check_for_downloadable_update',
-            () {
-          expect(
-            updater.checkForDownloadableUpdate(track: UpdateTrack.beta),
-            isTrue,
-          );
+        test(
+          'forwards the result of shorebird_check_for_downloadable_update',
+          () {
+            expect(
+              updater.checkForDownloadableUpdate(track: UpdateTrack.beta),
+              isTrue,
+            );
 
-          expect(
-            updater.checkForDownloadableUpdate(track: UpdateTrack.stable),
-            isTrue,
-          );
+            expect(
+              updater.checkForDownloadableUpdate(track: UpdateTrack.stable),
+              isTrue,
+            );
 
-          final captured = verify(
-            () => updaterBindings.shorebird_check_for_downloadable_update(
-              captureAny(),
-            ),
-          ).captured;
-          expect(
-            captured.map(
-              (cstr) => (cstr as Pointer<Char>).cast<Utf8>().toDartString(),
-            ),
-            equals(['beta', 'stable']),
-          );
-        });
+            final captured = verify(
+              () => updaterBindings.shorebird_check_for_downloadable_update(
+                captureAny(),
+              ),
+            ).captured;
+            expect(
+              captured.map(
+                (cstr) => (cstr as Pointer<Char>).cast<Utf8>().toDartString(),
+              ),
+              equals(['beta', 'stable']),
+            );
+          },
+        );
       });
     });
 
@@ -100,6 +103,28 @@ void main() {
         ).thenReturn(123);
         final currentPatchNumber = updater.nextPatchNumber();
         expect(currentPatchNumber, 123);
+      });
+    });
+
+    group('setDeviceIdOverride', () {
+      test('forwards the device id to shorebird_set_device_id_override', () {
+        late String capturedDeviceId;
+        when(
+          () => updaterBindings.shorebird_set_device_id_override(any()),
+        ).thenAnswer((invocation) {
+          capturedDeviceId =
+              (invocation.positionalArguments.single as Pointer<Char>)
+                  .cast<Utf8>()
+                  .toDartString();
+          return true;
+        });
+
+        expect(updater.setDeviceIdOverride('developer-device-id'), isTrue);
+
+        verify(
+          () => updaterBindings.shorebird_set_device_id_override(captureAny()),
+        ).called(1);
+        expect(capturedDeviceId, 'developer-device-id');
       });
     });
 

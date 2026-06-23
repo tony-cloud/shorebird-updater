@@ -16,8 +16,9 @@ class Updater {
 
   /// The ffi bindings to the Updater library.
   @visibleForTesting
-  static UpdaterBindings bindings =
-      UpdaterBindings(ffi.DynamicLibrary.process());
+  static UpdaterBindings bindings = UpdaterBindings(
+    ffi.DynamicLibrary.process(),
+  );
 
   /// The currently active patch number.
   int currentPatchNumber() => bindings.shorebird_current_boot_patch_number();
@@ -31,6 +32,18 @@ class Updater {
       bindings.shorebird_check_for_downloadable_update(
         track == null ? ffi.nullptr : track.name.toNativeUtf8().cast<Char>(),
       );
+
+  /// Overrides the generated per-install device id sent in patch checks.
+  bool setDeviceIdOverride(String deviceId) {
+    final nativeDeviceId = deviceId.toNativeUtf8();
+    try {
+      return bindings.shorebird_set_device_id_override(
+        nativeDeviceId.cast<Char>(),
+      );
+    } finally {
+      malloc.free(nativeDeviceId);
+    }
+  }
 
   /// Downloads the latest patch, if available and returns an [UpdateResult]
   /// to indicate whether the update was successful.

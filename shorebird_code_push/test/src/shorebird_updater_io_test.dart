@@ -118,11 +118,7 @@ void main() {
           await expectLater(
             shorebirdUpdater.readNextPatch(),
             completion(
-              isA<Patch>().having(
-                (p) => p.number,
-                'number',
-                nextPatchNumber,
-              ),
+              isA<Patch>().having((p) => p.number, 'number', nextPatchNumber),
             ),
           );
         });
@@ -151,11 +147,7 @@ void main() {
           await expectLater(
             shorebirdUpdater.readNextPatch(),
             completion(
-              isA<Patch>().having(
-                (p) => p.number,
-                'number',
-                nextPatchNumber,
-              ),
+              isA<Patch>().having((p) => p.number, 'number', nextPatchNumber),
             ),
           );
         });
@@ -186,11 +178,7 @@ void main() {
           await expectLater(
             shorebirdUpdater.readNextPatch(),
             completion(
-              isA<Patch>().having(
-                (p) => p.number,
-                'number',
-                nextPatchNumber,
-              ),
+              isA<Patch>().having((p) => p.number, 'number', nextPatchNumber),
             ),
           );
         });
@@ -216,6 +204,61 @@ void main() {
           await expectLater(
             () => shorebirdUpdater.readNextPatch(),
             throwsA(isA<ReadPatchException>()),
+          );
+        });
+      });
+    });
+
+    group('setDeviceIdOverride', () {
+      group('when updater is unavailable', () {
+        setUp(() {
+          when(updater.currentPatchNumber).thenThrow(Exception('oops'));
+        });
+
+        test(
+          'does nothing',
+          overridePrint((_) async {
+            shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
+            await expectLater(
+              shorebirdUpdater.setDeviceIdOverride('developer-device-id'),
+              completes,
+            );
+            verifyNever(() => updater.setDeviceIdOverride(any()));
+          }),
+        );
+      });
+
+      group('when updater accepts the override', () {
+        setUp(() {
+          when(updater.currentPatchNumber).thenReturn(0);
+          when(
+            () => updater.setDeviceIdOverride('developer-device-id'),
+          ).thenReturn(true);
+          shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
+        });
+
+        test('forwards the device id to the updater', () async {
+          await expectLater(
+            shorebirdUpdater.setDeviceIdOverride('developer-device-id'),
+            completes,
+          );
+          verify(
+            () => updater.setDeviceIdOverride('developer-device-id'),
+          ).called(1);
+        });
+      });
+
+      group('when updater rejects the override', () {
+        setUp(() {
+          when(updater.currentPatchNumber).thenReturn(0);
+          when(() => updater.setDeviceIdOverride('')).thenReturn(false);
+          shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
+        });
+
+        test('throws a StateError', () async {
+          await expectLater(
+            shorebirdUpdater.setDeviceIdOverride(''),
+            throwsA(isA<StateError>()),
           );
         });
       });
@@ -304,7 +347,7 @@ void main() {
 
       group('when current patch has been rolled back', () {
         setUp(() {
-          // The app is currently running patch 1, but checkForDownloadableUpdate
+          // The app is running patch 1, but checkForDownloadableUpdate
           // triggered a rollback which set next_boot_patch to None (0).
           when(updater.currentPatchNumber).thenReturn(1);
           when(updater.nextPatchNumber).thenReturn(0);
@@ -331,15 +374,18 @@ void main() {
           shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
         });
 
-        test('forwards the provided track to the underlying updater call',
-            () async {
-          await expectLater(
-            shorebirdUpdater.checkForUpdate(track: track),
-            completion(equals(UpdateStatus.outdated)),
-          );
-          verify(() => updater.checkForDownloadableUpdate(track: track))
-              .called(1);
-        });
+        test(
+          'forwards the provided track to the underlying updater call',
+          () async {
+            await expectLater(
+              shorebirdUpdater.checkForUpdate(track: track),
+              completion(equals(UpdateStatus.outdated)),
+            );
+            verify(
+              () => updater.checkForDownloadableUpdate(track: track),
+            ).called(1);
+          },
+        );
       });
     });
 
@@ -401,15 +447,17 @@ void main() {
           shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
         });
 
-        test('propagates the exception and does not call freeUpdateResult',
-            () async {
-          await expectLater(
-            shorebirdUpdater.update(),
-            throwsA(isA<Exception>()),
-          );
-          verify(() => updater.update()).called(1);
-          verifyNever(() => updater.freeUpdateResult(any()));
-        });
+        test(
+          'propagates the exception and does not call freeUpdateResult',
+          () async {
+            await expectLater(
+              shorebirdUpdater.update(),
+              throwsA(isA<Exception>()),
+            );
+            verify(() => updater.update()).called(1);
+            verifyNever(() => updater.freeUpdateResult(any()));
+          },
+        );
       });
 
       group('when no update is available', () {
@@ -483,11 +531,7 @@ void main() {
             shorebirdUpdater.update,
             throwsA(
               isA<UpdateException>()
-                  .having(
-                    (e) => e.message,
-                    'message',
-                    'oops',
-                  )
+                  .having((e) => e.message, 'message', 'oops')
                   .having(
                     (e) => e.reason,
                     'reason',
@@ -627,15 +671,14 @@ void main() {
           shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
         });
 
-        test('forwards the provided track to the underlying updater call',
-            () async {
-          await expectLater(
-            shorebirdUpdater.update(track: track),
-            completes,
-          );
-          verify(() => updater.update(track: track)).called(1);
-          verify(() => updater.freeUpdateResult(any())).called(1);
-        });
+        test(
+          'forwards the provided track to the underlying updater call',
+          () async {
+            await expectLater(shorebirdUpdater.update(track: track), completes);
+            verify(() => updater.update(track: track)).called(1);
+            verify(() => updater.freeUpdateResult(any())).called(1);
+          },
+        );
       });
     });
   });

@@ -15,7 +15,7 @@
 //! `c_api::engine` — that surface is unstable and changes freely.
 use std::os::raw::c_char;
 
-use super::{allocate_c_string, free_c_string, log_on_error, to_rust_option};
+use super::{allocate_c_string, free_c_string, log_on_error, to_rust, to_rust_option};
 use crate::{updater, UpdateStatus};
 
 /// An unknown error occurred while updating. The update was not installed.
@@ -101,6 +101,23 @@ pub extern "C" fn shorebird_check_for_downloadable_update(c_channel: *const c_ch
             updater::check_for_downloadable_update(channel.as_deref())
         },
         "checking for update",
+        false,
+    )
+}
+
+/// Overrides the generated random per-install device/client id used in patch
+/// check requests. This is for applications that need to bind patch delivery
+/// to their own stable account/device identifier. The updater persists this
+/// value in state.json after a successful call.
+#[no_mangle]
+pub extern "C" fn shorebird_set_device_id_override(c_device_id: *const c_char) -> bool {
+    log_on_error(
+        || {
+            let device_id = to_rust(c_device_id)?;
+            updater::set_client_id_override(&device_id)?;
+            Ok(true)
+        },
+        "setting device id override",
         false,
     )
 }

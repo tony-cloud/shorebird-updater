@@ -120,6 +120,22 @@ updater.checkForUpdate(track: UpdateTrack('my-custom-track'));
 tracks. See [#3484](https://github.com/shorebirdtech/shorebird/issues/3484)
 for details.
 
+### Device id override
+
+The updater generates a random per-install `client_id` on first startup and
+persists it locally. Self-hosted update servers that encrypt or target patches
+per app/account device can override that id before checking for updates:
+
+```dart
+final updater = ShorebirdUpdater();
+await updater.setDeviceIdOverride('stable-app-device-id');
+await updater.checkForUpdate();
+```
+
+Do not put secrets in this value. It is sent to the update server as
+`client_id`; encryption keys should be derived from server-side or
+app-provided key material.
+
 ## Join us on Discord!
 
 We have an active [Discord server](https://discord.gg/shorebird) where you can

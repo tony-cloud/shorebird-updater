@@ -65,6 +65,18 @@ void main() {
       );
     });
 
+    group('setDeviceIdOverride', () {
+      test(
+        'does nothing',
+        overridePrint((_) async {
+          await expectLater(
+            shorebirdUpdater.setDeviceIdOverride('developer-device-id'),
+            completes,
+          );
+        }),
+      );
+    });
+
     group('update', () {
       test(
         'does nothing',
