@@ -23,4 +23,4 @@ For an Updater function to be visible to the Dart code, it must:
    `dart run ffigen`. ffigen reads only `updater_dart.h`, so engine-only
    symbols are not bound.
 1. Android specific: be listed in
-   https://github.com/shorebirdtech/flutter/blob/shorebird/dev/engine/src/flutter/shell/platform/android/android_exports.lst
+   https://github.com/tony-cloud/flutter/blob/tonycloud/dev/engine/src/flutter/shell/platform/android/android_exports.lst
