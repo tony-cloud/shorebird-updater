@@ -46,9 +46,8 @@ impl<'de> Deserialize<'de> for EventType {
         }
     }
 }
-/// Any edits to this struct should be made carefully and in accordance
-/// with our privacy policy:
-/// <https://docs.shorebird.dev/privacy>
+/// Any edits to this struct should be made carefully and in accordance with
+/// the configured update server's privacy policy.
 /// An event that is sent to the server when a patch is successfully installed.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PatchEvent {

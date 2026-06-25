@@ -72,7 +72,7 @@ pub struct UpdaterState {
 struct SerializedState {
     /// Stable per-install ID. Survives release-version changes; only
     /// reset when the app is uninstalled. Used for analytics.
-    /// <https://shorebird.dev/privacy/>
+    /// Treat this as privacy-sensitive update-server metadata.
     client_id: String,
     /// The release version this cache corresponds to. Mismatch with the
     /// app's reported release version triggers a wipe of all per-release

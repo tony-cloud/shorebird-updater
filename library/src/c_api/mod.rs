@@ -15,7 +15,7 @@
 // buckets. They are not `extern "C"`, so cbindgen never emits them.
 //
 // Engine-side usage lives at `engine/src/flutter/shell/common/shorebird/updater.cc`
-// in the Shorebird Flutter monorepo: <https://github.com/shorebirdtech/flutter>.
+// in the open Flutter fork: <https://git.tonycloud.org/flutter/flutter>.
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 

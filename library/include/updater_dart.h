@@ -89,8 +89,7 @@ bool shorebird_check_for_downloadable_update(const char *c_channel);
  * to their own stable account/device identifier. The updater persists this
  * value in state.json after a successful call.
  */
-SHOREBIRD_EXPORT
-bool shorebird_set_device_id_override(const char *c_device_id);
+SHOREBIRD_EXPORT bool shorebird_set_device_id_override(const char *c_device_id);
 
 /**
  * Synchronously download an update on the first non-null channel of:

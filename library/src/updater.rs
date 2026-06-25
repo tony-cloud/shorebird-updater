@@ -338,7 +338,8 @@ fn check_hash(path: &Path, expected_string: &str) -> anyhow::Result<()> {
     // This is a common error for developers.  We could avoid it entirely
     // by sending the hash of `libapp.so` to the server and having the
     // server only send updates when the hash matches.
-    // https://github.com/shorebirdtech/updater/issues/56
+    // A hash mismatch usually means the same version number was reused with a
+    // different app binary.
     if !hash_matches {
         bail!(
             "Update rejected: hash mismatch. Update was downloaded but \

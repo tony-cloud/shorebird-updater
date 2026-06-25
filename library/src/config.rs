@@ -13,12 +13,7 @@ use std::sync::Mutex;
 // cbindgen looks for const, ignore these so it doesn't warn about them.
 
 /// cbindgen:ignore
-#[cfg(test)]
-const DEFAULT_BASE_URL: &str = "DEFAULT_BASE_URL should be mocked using mockito::Server";
-
-/// cbindgen:ignore
-#[cfg(not(test))]
-const DEFAULT_BASE_URL: &str = "https://api.shorebird.dev";
+const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 
 /// cbindgen:ignore
 const DEFAULT_CHANNEL: &str = "stable";
@@ -275,6 +270,29 @@ mod tests {
             config.patch_public_key,
             Some("patch_public_key".to_string())
         );
+
+        Ok(())
+    }
+
+    // These tests are serial because they modify global state.
+    #[serial]
+    #[test]
+    fn set_config_defaults_to_open_self_hosted_server() -> Result<()> {
+        testing_reset_config();
+
+        let mut yaml = fake_yaml();
+        yaml.base_url = None;
+
+        set_config(
+            fake_app_config(),
+            Box::new(FakeExternalFileProvider {}),
+            "first_path".into(),
+            &yaml,
+            NetworkHooks::default(),
+        )?;
+
+        let config = super::with_config(|config| Ok(config.clone())).unwrap();
+        assert_eq!(config.base_url, super::DEFAULT_BASE_URL);
 
         Ok(())
     }

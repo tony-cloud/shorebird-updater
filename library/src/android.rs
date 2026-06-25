@@ -169,7 +169,8 @@ pub(crate) fn open_base_lib(apks_dir: &Path, lib_name: &str) -> anyhow::Result<B
     // https://chromium.googlesource.com/chromium/src/base/+/a5ca5def0453df367b9c42e9817a33d2a21e75fe/android/java/src/org/chromium/base/library_loader/Linker.java
     // Previously I tried reading libapp.so from from the AssetManager, but
     // it does show the lib/ directory in the list of assets.
-    // https://github.com/shorebirdtech/updater/pull/6
+    // Historical updater context: this avoids reading libapp.so via
+    // AssetManager.
 
     // Ideally we would do this apk reading from the C++ side and keep the rust
     // portable, but we have a zip library here, and don't on the C++ side.
@@ -245,7 +246,7 @@ pub fn libapp_path_from_settings(original_libapp_paths: &[String]) -> Result<Pat
     // path to the libapp.so file.  This is true for the current engine, but
     // may not be true in the future.  Better would be for the engine to
     // pass us the path to the base.apk.
-    // https://github.com/shorebirdtech/shorebird/issues/283
+    // This is fragile because Flutter passes multiple libapp paths here.
     // This is where the paths are set today:
     // First path is "libapp.so" (for dlopen), second is a full path:
     // https://github.com/flutter/engine/blob/a7c9cc58a71c5850be0215ab1997db92cc5e8d3e/shell/platform/android/io/flutter/embedding/engine/loader/FlutterLoader.java#L264
