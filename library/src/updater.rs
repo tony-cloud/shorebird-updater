@@ -5690,6 +5690,7 @@ mod authenticated_transport_tests {
         Ok(())
     }
     static TRANSPORT_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static TRANSPORT_OFFER_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static TRANSPORT_WRONG_KEY: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     static TRANSPORT_DOWNLOADS: std::sync::atomic::AtomicUsize =
@@ -5745,6 +5746,7 @@ mod authenticated_transport_tests {
         });
         TRANSPORT_WRONG_KEY.store(true, std::sync::atomic::Ordering::SeqCst);
         TRANSPORT_DOWNLOADS.store(0, std::sync::atomic::Ordering::SeqCst);
+        TRANSPORT_OFFER_URLS.lock().unwrap().clear();
         testing_set_network_hooks(
             |_, request| {
                 assert!(request.accept_encrypted_patch);
@@ -5781,6 +5783,14 @@ mod authenticated_transport_tests {
                     cache_key: "test-only".into(),
                 };
                 *TRANSPORT_BYTES.lock().unwrap() = ciphertext;
+                let download_url = format!(
+                    "http://example.invalid/private-patch?token={}",
+                    request.nonce
+                );
+                TRANSPORT_OFFER_URLS
+                    .lock()
+                    .unwrap()
+                    .push(download_url.clone());
                 let mut response = PatchCheckResponse {
                     authentication: None,
                     patch_available: true,
@@ -5789,8 +5799,7 @@ mod authenticated_transport_tests {
                         number: 1,
                         hash_signature: Some(sign_test_message(hash.as_bytes())),
                         hash,
-                        download_url: "http://example.invalid/private-patch?token=must-not-log"
-                            .into(),
+                        download_url,
                         encryption: Some(encryption),
                     }),
                 };
@@ -5822,6 +5831,10 @@ mod authenticated_transport_tests {
             TRANSPORT_DOWNLOADS.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+        let urls = TRANSPORT_OFFER_URLS.lock().unwrap();
+        assert_eq!(urls.len(), 2);
+        assert_ne!(urls[0], urls[1], "the signed grant changes between checks");
+        drop(urls);
         validate_next_boot_patch()?;
         let installed = next_boot_patch()?.unwrap();
         assert_eq!(
