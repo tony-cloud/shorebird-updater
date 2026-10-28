@@ -2,6 +2,7 @@
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::{
     config::UpdateConfig,
@@ -106,6 +107,17 @@ fn verify_inner(
     };
     let public_key =
         public_key.context("Patch response authentication requires patch_public_key")?;
+    let authenticated = decode_authenticated_response(auth, public_key)?;
+    if authenticated != AuthenticatedResponse::expected(request, response) {
+        bail!("Authenticated patch response does not match request context or response decision");
+    }
+    Ok(())
+}
+
+fn decode_authenticated_response(
+    auth: &ResponseAuthentication,
+    public_key: &str,
+) -> Result<AuthenticatedResponse> {
     let payload = base64::prelude::BASE64_STANDARD
         .decode(&auth.payload)
         .context("Invalid patch response authentication payload")?;
@@ -113,10 +125,76 @@ fn verify_inner(
     // Check the original bytes, not a reserialization whose representation may
     // differ between Go and Rust. Parsing below rejects duplicate/unknown keys.
     crate::cache::signing::check_signature(payload, &auth.signature, public_key)?;
-    let authenticated: AuthenticatedResponse =
-        serde_json::from_str(payload).context("Invalid authenticated patch response")?;
-    if authenticated != AuthenticatedResponse::expected(request, response) {
-        bail!("Authenticated patch response does not match request context or response decision");
+    serde_json::from_str(payload).context("Invalid authenticated patch response")
+}
+
+fn authentication_path(config: &UpdateConfig, patch_number: usize) -> PathBuf {
+    config
+        .storage_dir
+        .join("patches")
+        .join(patch_number.to_string())
+        .join("authentication.json")
+}
+
+/// Store the already-verified response before making its artifact bootable.
+/// The lifecycle owns this directory, so failed installs and rollback cleanup
+/// remove this record together with the corresponding artifact.
+pub fn persist_patch_authentication(
+    config: &UpdateConfig,
+    patch_number: usize,
+    authentication: Option<&ResponseAuthentication>,
+) -> Result<()> {
+    let path = authentication_path(config, patch_number);
+    if let Some(authentication) = authentication {
+        crate::cache::disk_io::write(authentication, &path)?;
+    } else if path.exists() {
+        // A legacy reoffer must not inherit context from another installation.
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// At boot the historical nonce is signed but cannot be compared with a fresh
+/// request. Recheck the pinned signature, current immutable app identity and
+/// selected patch number/hash instead. This prevents context transplant; it
+/// does not provide a monotonic counter against a complete device-storage reset.
+pub fn verify_boot_patch(config: &UpdateConfig, patch: &crate::cache::PatchInfo) -> Result<()> {
+    verify_boot_patch_inner(config, patch).context(UpdateError::InvalidSignature)
+}
+
+fn verify_boot_patch_inner(config: &UpdateConfig, patch: &crate::cache::PatchInfo) -> Result<()> {
+    let path = authentication_path(config, patch.number);
+    if !path.exists() {
+        if config.patch_response_verification == PatchResponseVerificationMode::Required {
+            bail!("Installed patch authentication is missing");
+        }
+        return Ok(());
+    }
+    let authentication: ResponseAuthentication = crate::cache::disk_io::read(&path)?;
+    let key = config
+        .patch_public_key
+        .as_deref()
+        .context("Installed patch authentication requires patch_public_key")?;
+    let authenticated = decode_authenticated_response(&authentication, key)?;
+    if authenticated.version != 1
+        || authenticated.app_id != config.app_id
+        || authenticated.release_version != config.release_version
+        || authenticated.platform != crate::config::current_platform()
+        || authenticated.arch != crate::config::current_arch()
+        || !authenticated.patch_available
+        || authenticated
+            .rolled_back_patch_numbers
+            .contains(&patch.number)
+    {
+        bail!("Installed patch authentication does not match current app context");
+    }
+    let signed_patch = authenticated
+        .patch
+        .context("Installed patch authentication has no patch")?;
+    if signed_patch.number != patch.number
+        || signed_patch.hash != crate::cache::hash_file(&patch.path)?
+    {
+        bail!("Installed patch authentication does not match selected patch number or bytes");
     }
     Ok(())
 }

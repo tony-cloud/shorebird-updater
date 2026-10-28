@@ -606,7 +606,8 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     }
 
     let patch_number = patch.number;
-    let result = download_and_install_patch(&config, &patch, action);
+    let result =
+        download_and_install_patch(&config, &patch, action, response.authentication.as_ref());
 
     if let Err(ref err) = result {
         // Queue a diagnostic event for the failed update attempt.
@@ -861,6 +862,7 @@ fn download_and_install_patch(
     config: &UpdateConfig,
     patch: &crate::network::Patch,
     action: DownloadAction,
+    authentication: Option<&crate::response_auth::ResponseAuthentication>,
 ) -> anyhow::Result<UpdateStatus> {
     // Verify the signature before anything is fetched, in every mode: it
     // covers `patch.hash`, and the post-inflate hash check ties the
@@ -962,6 +964,7 @@ fn download_and_install_patch(
         shorebird_info!("Prior download already complete; skipping fetch.");
     }
 
+    crate::response_auth::persist_patch_authentication(config, patch.number, authentication)?;
     install_downloaded_patch(config, patch, &download_path)
 }
 
@@ -1469,23 +1472,35 @@ pub fn validate_next_boot_patch() -> anyhow::Result<()> {
             config.patch_public_key.as_deref(),
             config.patch_verification,
         );
-        let Some(patch_number) = state.next_boot_patch().map(|p| p.number) else {
-            return Ok(());
-        };
-        let result = state.validate_next_boot_patch();
-        if let Err(ref err) = result {
+        let mut first_error = None;
+        while let Some(patch) = state.next_boot_patch() {
+            let result = crate::response_auth::verify_boot_patch(config, &patch)
+                .and_then(|_| state.validate_next_boot_patch());
+            let Err(err) = result else { break };
+            // A failed context check must retire the patch just like a failed
+            // artifact signature. Validate the fallback before exposing it.
+            state
+                .lifecycle_mut()
+                .mark_bad(patch.number, BadReason::ValidationFailed)?;
+            state.lifecycle_mut().recompute_next_boot()?;
             let event = update_failure_event(
                 config,
                 state.client_id(),
                 "boot_validation",
-                patch_number,
-                err,
+                patch.number,
+                &err,
             );
             if let Err(queue_err) = state.queue_event(event) {
                 shorebird_error!("Failed to queue boot validation event: {:?}", queue_err);
             }
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
         }
-        result
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     })
 }
 
@@ -5477,5 +5492,162 @@ mod authenticated_transport_tests {
             assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
             Ok(())
         })
+    }
+
+    static BOOT_OFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+    fn init_authenticated_boot_test(tmp: &TempDir) {
+        tests::init_for_testing_with_yaml(
+            tmp,
+            None,
+            &format!(
+                "\npatch_public_key: {}\npatch_response_verification: required",
+                response_test_public_key()
+            ),
+        );
+        write_fake_apk(
+            tmp.path().join("base.apk").to_str().unwrap(),
+            b"nonempty native AOT base",
+        );
+        testing_set_network_hooks(
+            |_, request| {
+                use sha2::Digest;
+                let number = BOOT_OFFER.load(std::sync::atomic::Ordering::SeqCst);
+                let hash = hex::encode(sha2::Sha256::digest(ENVELOPE));
+                let mut response = PatchCheckResponse {
+                    authentication: None,
+                    patch_available: number != 0,
+                    patch: (number != 0).then(|| Patch {
+                        number,
+                        hash_signature: Some(sign_test_message(hash.as_bytes())),
+                        hash,
+                        download_url: "https://example.com/patch".to_string(),
+                    }),
+                    rolled_back_patch_numbers: (number == 0).then_some(vec![2]),
+                };
+                crate::response_auth::authenticate_test_response(&request, &mut response);
+                Ok(response)
+            },
+            |_, destination, _| {
+                let bytes = replacement_transport();
+                std::fs::write(destination, &bytes)?;
+                Ok(DownloadResult {
+                    total_bytes: bytes.len() as u64,
+                    content_length: Some(bytes.len() as u64),
+                })
+            },
+            |_, _| Ok(()),
+        );
+    }
+
+    fn install_authenticated(number: usize) -> Result<()> {
+        BOOT_OFFER.store(number, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        validate_next_boot_patch()
+    }
+
+    #[serial]
+    #[test]
+    fn boot_rejects_authenticated_context_transplanted_under_new_patch_number() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        with_mut_state(|state| {
+            state.record_boot_start_for_patch(1)?;
+            state.record_boot_success()
+        })?;
+        crate::test_utils::install_fake_patch(2)?;
+        for name in ["state.json", "dlc.vmcode", "authentication.json"] {
+            std::fs::copy(
+                tmp.path().join("patches/1").join(name),
+                tmp.path().join("patches/2").join(name),
+            )?;
+        }
+        assert!(validate_next_boot_patch().is_err());
+        with_mut_state(|state| {
+            assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+            Ok(())
+        })?;
+        assert!(!tmp.path().join("patches/2/authentication.json").exists());
+        validate_next_boot_patch()?;
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn boot_rejects_other_signed_app_context_and_post_install_tampering() -> Result<()> {
+        use base64::Engine;
+        for field in [
+            "app_id",
+            "release_version",
+            "platform",
+            "arch",
+            "version",
+            "patch_number",
+            "artifact",
+            "signature",
+            "missing",
+        ] {
+            let tmp = TempDir::new()?;
+            init_authenticated_boot_test(&tmp);
+            install_authenticated(1)?;
+            let path = tmp.path().join("patches/1/authentication.json");
+            let mut authentication: crate::response_auth::ResponseAuthentication =
+                crate::cache::disk_io::read(&path)?;
+            if field == "missing" {
+                std::fs::remove_file(&path)?;
+            } else if field == "artifact" {
+                let artifact = tmp.path().join("patches/1/dlc.vmcode");
+                let mut bytes = std::fs::read(&artifact)?;
+                bytes[0] ^= 1;
+                std::fs::write(artifact, bytes)?;
+            } else if field == "signature" {
+                authentication.signature.replace_range(..1, "!");
+                crate::cache::disk_io::write(&authentication, &path)?;
+            } else {
+                // A validly signed context from another app/build/patch under
+                // the same key must still fail; not just invalid signatures.
+                let decoded = base64::prelude::BASE64_STANDARD.decode(&authentication.payload)?;
+                let mut payload: serde_json::Value = serde_json::from_slice(&decoded)?;
+                match field {
+                    "version" => payload["version"] = 2.into(),
+                    "patch_number" => payload["patch"]["number"] = 2.into(),
+                    _ => payload[field] = "another-context".into(),
+                }
+                let bytes = serde_json::to_vec(&payload)?;
+                authentication.signature = sign_test_message(&bytes);
+                authentication.payload = base64::prelude::BASE64_STANDARD.encode(bytes);
+                crate::cache::disk_io::write(&authentication, &path)?;
+            }
+            assert!(validate_next_boot_patch().is_err(), "{field}");
+            with_mut_state(|state| {
+                assert_eq!(state.next_boot_patch(), None, "{field}");
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn legitimate_signed_rollback_preserves_bootable_authenticated_fallback() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        with_mut_state(|state| {
+            state.record_boot_start_for_patch(1)?;
+            state.record_boot_success()
+        })?;
+        install_authenticated(2)?;
+        BOOT_OFFER.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(update(None)?, UpdateStatus::NoUpdate);
+        validate_next_boot_patch()?;
+        with_mut_state(|state| {
+            assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+            Ok(())
+        })?;
+        assert!(tmp.path().join("patches/1/authentication.json").exists());
+        assert!(!tmp.path().join("patches/2/authentication.json").exists());
+        Ok(())
     }
 }

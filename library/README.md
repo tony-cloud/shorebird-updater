@@ -350,8 +350,19 @@ before applying rollback lists or accepting an update. A rollback-only response
 uses `patch_available: false` and `patch: null`; absent or null outer rollback
 lists are compared as `[]`. The artifact hash signature remains separately
 required for pinned-key apps, including strict verification on subsequent boots.
-Response authentication is checked online; encrypted-envelope offline expiry
-and runtime applicability are enforced by the interpreter runtime.
+The verified response authentication is stored atomically with the downloaded
+patch before it is promoted to Installed. At boot its pinned signature, version,
+app/release/platform/architecture, selected patch number, and recomputed artifact
+hash are checked again. Required mode rejects missing stored authentication;
+optional mode permits legacy records but verifies any authentication present.
+The historical nonce was checked online and is not compared to a new nonce at
+boot. A signed channel override remains valid across launches. Every fallback
+selected after validation failure is checked before it is exposed to the engine.
+
+These checks prevent signed-context transplantation between patches or builds.
+They do not provide a secure monotonic counter against a complete device-storage
+rollback. Encrypted-envelope offline expiry and runtime applicability are
+enforced by the interpreter runtime.
 
 ## TODO:
 
