@@ -93,3 +93,9 @@ the transport and reconstructs the exact target binary. Other tests reject every
 modified signed encryption field, wrong keys, ciphertext mutation, and app/device/
 patch context mismatch. A full updater test exercises unavailable key, retry,
 installation and strict boot verification without downloading a second copy.
+
+Unencrypted legacy delivery retains exact-URL resume identity. Refreshing a
+signed plaintext download grant can therefore restart a partial download. The
+final executable hash alone does not identify its compressed diff bytes, so the
+updater does not strip query parameters for plaintext offers. This conservative
+availability limitation avoids combining different compressed transports.
