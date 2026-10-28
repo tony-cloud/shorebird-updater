@@ -420,6 +420,7 @@ mod test {
                 // call or the shorebird.yaml, so we should default to "stable".
                 assert_eq!(request.channel, "stable");
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -474,6 +475,7 @@ mod test {
             |_url, request| {
                 assert_eq!(request.channel, "beta");
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -536,6 +538,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: None,
@@ -615,6 +618,7 @@ mod test {
                 // piped through to the network request.
                 assert_eq!(request.channel, "beta");
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -665,6 +669,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -731,6 +736,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -765,6 +771,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: Some(vec![1]),
@@ -816,6 +823,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -843,6 +851,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: Some(vec![1]),
@@ -906,6 +915,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -933,6 +943,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: Some(vec![1]),
@@ -951,6 +962,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -1003,6 +1015,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 2,
@@ -1027,6 +1040,7 @@ mod test {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -1122,6 +1136,7 @@ mod test {
                 // Hang until we have the lock.
                 let _lock = CALLBACK_MUTEX.lock().unwrap();
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: Some(crate::Patch {
                         number: 1,

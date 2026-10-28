@@ -1,6 +1,6 @@
 pub(crate) mod disk_io;
 pub mod lifecycle;
-mod signing;
+pub(crate) mod signing;
 pub mod updater_state;
 
 pub use signing::{check_patch_signature, hash_file};

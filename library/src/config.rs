@@ -2,7 +2,7 @@
 use crate::network::NetworkHooks;
 
 use crate::updater::AppConfig;
-use crate::yaml::{PatchVerificationMode, YamlConfig};
+use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode, YamlConfig};
 use crate::{ExternalFileProvider, UpdateError};
 use std::path::PathBuf;
 
@@ -115,6 +115,7 @@ pub struct UpdateConfig {
     pub file_provider: Box<dyn ExternalFileProvider>,
     pub patch_public_key: Option<String>,
     pub patch_verification: PatchVerificationMode,
+    pub patch_response_verification: PatchResponseVerificationMode,
 }
 
 /// Returns Ok if the config was set successfully, Err if it was already set.
@@ -158,6 +159,7 @@ pub fn set_config(
             file_provider,
             patch_public_key: yaml.patch_public_key.to_owned(),
             patch_verification: yaml.patch_verification.unwrap_or_default(),
+            patch_response_verification: yaml.patch_response_verification.unwrap_or_default(),
         };
         shorebird_debug!("Updater configured with: {:?}", new_config);
         *config = Some(new_config);
@@ -227,6 +229,7 @@ mod tests {
             base_url: Some("fake_base_url".to_string()),
             patch_public_key: None,
             patch_verification: None,
+            patch_response_verification: None,
         }
     }
 
@@ -252,6 +255,7 @@ mod tests {
                 base_url: Some("fake_base_url".to_string()),
                 patch_public_key: Some("patch_public_key".to_string()),
                 patch_verification: None,
+                patch_response_verification: None,
             },
             NetworkHooks::default(),
         )?;

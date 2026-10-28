@@ -269,7 +269,7 @@ pub fn testing_set_network_hooks(
     });
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Patch {
     /// The patch number.  Starts at 1 for each new release and increases
     /// monotonically.
@@ -287,8 +287,10 @@ pub struct Patch {
 /// Any edits to this struct should be made carefully and in accordance with
 /// the configured update server's privacy policy.
 /// The request body for the patch check endpoint.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PatchCheckRequest {
+    /// Fresh challenge bound into authenticated responses to prevent replay.
+    pub nonce: String,
     /// The Shorebird app_id built into the shorebird.yaml in the app.
     /// app_ids are unique to each app and are used to identify the app
     /// within the update server (similar to a bundle identifier).  They
@@ -335,6 +337,7 @@ impl std::fmt::Debug for PatchCheckRequest {
             platform,
             arch,
             client_id: _,
+            nonce: _,
             current_patch_number,
         } = self;
         f.debug_struct("PatchCheckRequest")
@@ -356,6 +359,7 @@ impl PatchCheckRequest {
         current_patch_number: Option<usize>,
     ) -> PatchCheckRequest {
         PatchCheckRequest {
+            nonce: uuid::Uuid::new_v4().to_string(),
             app_id: config.app_id.clone(),
             channel: config.channel.clone(),
             release_version: config.release_version.clone(),
@@ -383,6 +387,7 @@ impl PatchCheckRequest {
             platform,
             arch,
             client_id: _,
+            nonce: _,
             current_patch_number,
         } = self;
         format!(
@@ -403,6 +408,8 @@ pub struct CreatePatchEventRequest {
 /// A response from the server telling us the latest state of patches for this release.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PatchCheckResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<crate::response_auth::ResponseAuthentication>,
     pub patch_available: bool,
     #[serde(default)]
     pub patch: Option<Patch>,
@@ -478,6 +485,7 @@ mod tests {
     #[test]
     fn patch_check_request_debug_masks_client_id() {
         let request = super::PatchCheckRequest {
+            nonce: "test-nonce".to_string(),
             app_id: "app_id".to_string(),
             channel: "stable".to_string(),
             release_version: "1.0.0+1".to_string(),
@@ -495,6 +503,7 @@ mod tests {
     #[test]
     fn patch_check_request_log_line_omits_client_id() {
         let request = super::PatchCheckRequest {
+            nonce: "test-nonce".to_string(),
             app_id: "app_id".to_string(),
             channel: "stable".to_string(),
             release_version: "1.0.0+1".to_string(),
@@ -515,6 +524,7 @@ mod tests {
     #[test]
     fn patch_check_request_serializes_client_id() {
         let request = super::PatchCheckRequest {
+            nonce: "test-nonce".to_string(),
             app_id: "app_id".to_string(),
             channel: "stable".to_string(),
             release_version: "1.0.0+1".to_string(),
@@ -526,7 +536,7 @@ mod tests {
         let json_string = serde_json::to_string(&request).unwrap();
         assert_eq!(
             json_string,
-            r#"{"app_id":"app_id","channel":"stable","release_version":"1.0.0+1","platform":"android","arch":"aarch64","client_id":"11111111-2222-3333-4444-555555555555","current_patch_number":3}"#
+            r#"{"nonce":"test-nonce","app_id":"app_id","channel":"stable","release_version":"1.0.0+1","platform":"android","arch":"aarch64","client_id":"11111111-2222-3333-4444-555555555555","current_patch_number":3}"#
         );
     }
 
@@ -609,6 +619,7 @@ mod tests {
         let result = (network_hooks.patch_check_request_fn)(
             "",
             super::PatchCheckRequest {
+                nonce: "test-nonce".to_string(),
                 app_id: "".to_string(),
                 channel: "".to_string(),
                 release_version: "".to_string(),

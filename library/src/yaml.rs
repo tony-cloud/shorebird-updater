@@ -11,6 +11,16 @@ pub enum PatchVerificationMode {
     InstallOnly,
 }
 
+/// Whether a patch-check response must authenticate its context and rollback list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PatchResponseVerificationMode {
+    /// Accept unsigned legacy responses, but verify authentication when supplied.
+    #[default]
+    Optional,
+    /// Require a nonce-bound response signature and strict artifact verification.
+    Required,
+}
+
 /// Struct for parsing shorebird.yaml.
 #[derive(Debug)]
 pub struct YamlConfig {
@@ -27,6 +37,7 @@ pub struct YamlConfig {
     pub patch_public_key: Option<String>,
     /// When to verify patch signatures. Defaults to "strict" (verify at boot time).
     pub patch_verification: Option<PatchVerificationMode>,
+    pub patch_response_verification: Option<PatchResponseVerificationMode>,
 }
 
 impl YamlConfig {
@@ -42,6 +53,7 @@ impl YamlConfig {
         let mut auto_update: Option<bool> = None;
         let mut patch_public_key: Option<String> = None;
         let mut patch_verification: Option<PatchVerificationMode> = None;
+        let mut patch_response_verification = None;
 
         for line in yaml.lines() {
             let line = line.trim();
@@ -75,11 +87,36 @@ impl YamlConfig {
                         }
                     });
                 }
+                "patch_response_verification" => {
+                    patch_response_verification = Some(match value {
+                        "optional" => PatchResponseVerificationMode::Optional,
+                        "required" => PatchResponseVerificationMode::Required,
+                        _ => {
+                            return Err(format!(
+                                "invalid value for patch_response_verification: '{value}'"
+                            ))
+                        }
+                    });
+                }
                 _ => {} // Ignore unknown keys for forward compatibility.
             }
         }
 
         let app_id = app_id.ok_or("missing required field: app_id")?;
+
+        if patch_response_verification == Some(PatchResponseVerificationMode::Required) {
+            if patch_public_key.as_deref().is_none_or(|key| key.is_empty()) {
+                return Err(
+                    "patch_response_verification: required needs patch_public_key".to_string(),
+                );
+            }
+            if patch_verification == Some(PatchVerificationMode::InstallOnly) {
+                return Err(
+                    "patch_response_verification: required needs patch_verification: strict"
+                        .to_string(),
+                );
+            }
+        }
 
         Ok(YamlConfig {
             app_id,
@@ -88,6 +125,7 @@ impl YamlConfig {
             auto_update,
             patch_public_key,
             patch_verification,
+            patch_response_verification,
         })
     }
 }
@@ -240,5 +278,27 @@ patch_verification: unknown_mode
         let result = YamlConfig::from_yaml(yaml);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("patch_verification"));
+    }
+}
+
+#[cfg(test)]
+mod response_verification_tests {
+    use super::*;
+
+    #[test]
+    fn required_response_verification_needs_pinned_key_and_strict_boot() {
+        assert!(
+            YamlConfig::from_yaml("app_id: test\npatch_response_verification: required").is_err()
+        );
+        assert!(YamlConfig::from_yaml("app_id: test\npatch_response_verification: required\npatch_public_key: test\npatch_verification: install_only").is_err());
+        let config = YamlConfig::from_yaml(
+            "app_id: test\npatch_response_verification: required\npatch_public_key: test",
+        )
+        .unwrap();
+        assert_eq!(
+            config.patch_response_verification,
+            Some(PatchResponseVerificationMode::Required)
+        );
+        assert!(YamlConfig::from_yaml("app_id: test\npatch_response_verification: typo").is_err());
     }
 }

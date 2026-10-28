@@ -304,6 +304,55 @@ both modes. The `check_hash()` step still runs during install to detect
 download corruption, but there is no cryptographic verification that the
 patch came from a trusted source.
 
+### Authenticated Patch-Check Responses
+
+New encrypted interpreter releases should configure all three settings:
+
+```yaml
+patch_public_key: <base64 PKCS#1 DER RSA public key>
+patch_verification: strict
+patch_response_verification: required
+```
+
+Required response verification rejects initialization without a public key or
+with `patch_verification: install_only`. The default response mode is `optional`
+for legacy servers. In either mode, supplied authentication must verify against
+the bundled key; it is never ignored or downgraded to an unsigned response.
+
+Every patch-check request contains a fresh UUIDv4 `nonce`. The server may return
+`authentication: {payload: <standard base64>, signature: <standard base64>}`.
+The signature is RSA PKCS#1 v1.5 SHA-256 over the exact decoded UTF-8 JSON payload
+bytes. The version 1 payload contains:
+
+```json
+{
+  "version": 1,
+  "app_id": "the-request-app-id",
+  "release_version": "1.0.0+1",
+  "platform": "ios",
+  "arch": "aarch64",
+  "channel": "stable",
+  "nonce": "the-request-nonce",
+  "patch_available": true,
+  "patch": {
+    "number": 1,
+    "hash": "sha256-of-reconstructed-artifact",
+    "download_url": "https://example.com/patch",
+    "hash_signature": "legacy-signature-of-hash"
+  },
+  "rolled_back_patch_numbers": []
+}
+```
+
+The updater verifies the original payload bytes, rejects duplicate/unknown
+payload fields, then compares every field with the request and outer response
+before applying rollback lists or accepting an update. A rollback-only response
+uses `patch_available: false` and `patch: null`; absent or null outer rollback
+lists are compared as `[]`. The artifact hash signature remains separately
+required for pinned-key apps, including strict verification on subsequent boots.
+Response authentication is checked online; encrypted-envelope offline expiry
+and runtime applicability are enforced by the interpreter runtime.
+
 ## TODO:
 
 - Add an async API.

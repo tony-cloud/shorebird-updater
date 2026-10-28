@@ -409,7 +409,7 @@ pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bo
         ))
     })?;
 
-    let (request, url, request_fn) = with_config(|config| {
+    let (request, url, request_fn, response_config) = with_config(|config| {
         let mut config = config.clone();
 
         if let Some(channel) = channel {
@@ -420,10 +420,12 @@ pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bo
             PatchCheckRequest::new(&config, &client_id, current_patch_number),
             patches_check_url(&config.base_url),
             config.network_hooks.patch_check_request_fn,
+            config.clone(),
         ))
     })?;
 
-    let response = request_fn(&url, request)?;
+    let response = request_fn(&url, request.clone())?;
+    crate::response_auth::verify_response(&request, &response, &response_config)?;
     shorebird_debug!("Patch check response: {:?}", response);
 
     if let Some(rolled_back_patches) = response.rolled_back_patch_numbers {
@@ -569,7 +571,8 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
 
     // Check for update.
     let patch_check_request_fn = &(config.network_hooks.patch_check_request_fn);
-    let response = patch_check_request_fn(&patches_check_url(&config.base_url), request)?;
+    let response = patch_check_request_fn(&patches_check_url(&config.base_url), request.clone())?;
+    crate::response_auth::verify_response(&request, &response, &config)?;
     shorebird_info!("Patch check response: {:?}", response);
 
     if let Some(rolled_back_patches) = response.rolled_back_patch_numbers {
@@ -1954,6 +1957,7 @@ patch_verification: bogus_mode
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/1", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -2023,6 +2027,7 @@ patch_verification: bogus_mode
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/1", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -2377,6 +2382,7 @@ patch_verification: bogus_mode
     fn does_not_download_known_bad_patch() -> anyhow::Result<()> {
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(crate::network::Patch {
                 number: 1,
@@ -2427,6 +2433,7 @@ patch_verification: bogus_mode
         let patch_number = 1;
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: patch_number,
@@ -2464,6 +2471,7 @@ patch_verification: bogus_mode
     ) -> usize {
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: false,
             patch: None,
             rolled_back_patch_numbers: None,
@@ -2540,6 +2548,7 @@ patch_verification: bogus_mode
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: None,
@@ -2634,6 +2643,7 @@ patch_verification: bogus_mode
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/1", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -2704,6 +2714,7 @@ patch_verification: bogus_mode
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(Patch {
                         number: 1,
@@ -2808,6 +2819,7 @@ patch_verification: bogus_mode
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(Patch {
                         number: 1,
@@ -3180,6 +3192,7 @@ patch_verification: bogus_mode
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/1", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -3242,6 +3255,7 @@ patch_verification: bogus_mode
         let second_part = &patch_bytes[split_at..];
 
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -3325,6 +3339,7 @@ patch_verification: bogus_mode
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/1", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -3403,6 +3418,7 @@ patch_verification: bogus_mode
                 // If we've obtained and released the config lock, this test has passed.
                 if unsafe { HAS_FINISHED_CONFIG } {
                     return Ok(PatchCheckResponse {
+                        authentication: None,
                         patch_available: false,
                         patch: None,
                         rolled_back_patch_numbers: None,
@@ -3475,6 +3491,7 @@ mod rollback_tests {
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/4", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 4,
@@ -3547,6 +3564,7 @@ mod rollback_tests {
     fn does_not_roll_back_when_rolled_back_patches_is_empty() -> Result<()> {
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: false,
             patch: None,
             rolled_back_patch_numbers: Some(vec![]),
@@ -3586,6 +3604,7 @@ mod rollback_tests {
     fn rolls_back_from_current_patch_to_release() -> Result<()> {
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: false,
             patch: None,
             rolled_back_patch_numbers: Some(vec![1]),
@@ -3626,6 +3645,7 @@ mod rollback_tests {
         let mut server = mockito::Server::new();
         let download_url = format!("{}/patch/1", server.url());
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: true,
             patch: Some(Patch {
                 number: 1,
@@ -3711,6 +3731,7 @@ mod check_for_downloadable_update_tests {
     ) -> mockito::ServerGuard {
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
+            authentication: None,
             patch_available: available_patch_number.is_some(),
             patch: available_patch_number.map(|number| Patch {
                 number,
@@ -4199,6 +4220,7 @@ mod download_validation_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(Patch {
                         number: 1,
@@ -4246,6 +4268,7 @@ mod download_validation_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(Patch {
                         number: 1,
@@ -4294,6 +4317,7 @@ mod download_validation_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(Patch {
                         number: 1,
@@ -4337,6 +4361,7 @@ mod download_validation_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: None, // Server says available but doesn't provide patch.
                     rolled_back_patch_numbers: None,
@@ -4423,6 +4448,7 @@ mod rollback_unit_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: Some(vec![99]),
@@ -4465,6 +4491,7 @@ mod rollback_unit_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     // Roll back both patches.
@@ -4519,6 +4546,7 @@ mod resume_edge_case_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(Patch {
                         number: 1,
@@ -4807,6 +4835,7 @@ mod resume_edge_case_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: true,
                     patch: Some(crate::Patch {
                         number: 1,
@@ -4850,6 +4879,7 @@ mod multi_engine_tests {
         testing_set_network_hooks(
             |_url, _request| {
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: None,
@@ -5086,6 +5116,7 @@ mod patch_check_current_patch_number_tests {
                     Ordering::SeqCst,
                 );
                 Ok(PatchCheckResponse {
+                    authentication: None,
                     patch_available: false,
                     patch: None,
                     rolled_back_patch_numbers: None,
@@ -5242,5 +5273,209 @@ mod failure_classification_tests {
             UpdateError::CorruptPatch.to_string(),
             "Downloaded patch was invalid"
         );
+    }
+}
+
+#[cfg(test)]
+mod authenticated_transport_tests {
+    use super::*;
+    use crate::{
+        network::{testing_set_network_hooks, DownloadResult, Patch, PatchCheckResponse},
+        test_utils::{response_test_public_key, sign_test_message, write_fake_apk},
+    };
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    const ENVELOPE: &[u8] = include_bytes!("../test_fixtures/interpreter_envelope.json");
+
+    fn replacement_transport() -> Vec<u8> {
+        let mut output = std::io::Cursor::new(Vec::new());
+        patch::make_patch(Vec::new(), ENVELOPE.to_vec(), &mut output);
+        output.into_inner()
+    }
+
+    #[test]
+    fn cli_encrypted_envelope_reconstructs_against_nonempty_native_base() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let compressed = tmp.path().join("download");
+        let installed = tmp.path().join("dlc.vmcode");
+        std::fs::write(&compressed, replacement_transport())?;
+        inflate(
+            &compressed,
+            std::io::Cursor::new(b"nonempty native AOT snapshot".to_vec()),
+            &installed,
+        )?;
+        assert_eq!(std::fs::read(&installed)?, ENVELOPE);
+        let hash = crate::cache::hash_file(&installed)?;
+        check_hash(&installed, &hash)?;
+        let signature = sign_test_message(hash.as_bytes());
+        crate::cache::check_patch_signature(
+            &hash,
+            Some(&signature),
+            Some(&response_test_public_key()),
+        )?;
+        let mut corrupted = signature.clone();
+        corrupted.replace_range(..1, if signature.starts_with('A') { "B" } else { "A" });
+        assert!(crate::cache::check_patch_signature(
+            &hash,
+            Some(&corrupted),
+            Some(&response_test_public_key())
+        )
+        .is_err());
+        assert!(check_hash(&installed, &"0".repeat(64)).is_err());
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn invalid_response_cannot_roll_back_or_download_in_either_entry_point() -> Result<()> {
+        for check_only in [false, true] {
+            let tmp = TempDir::new()?;
+            tests::init_for_testing_with_yaml(
+                &tmp,
+                None,
+                &format!(
+                    "\npatch_public_key: {}\npatch_response_verification: required",
+                    response_test_public_key()
+                ),
+            );
+            crate::test_utils::install_fake_patch(1)?;
+            testing_set_network_hooks(
+                |_, request| {
+                    let mut response = PatchCheckResponse {
+                        authentication: None,
+                        patch_available: true,
+                        patch: Some(Patch {
+                            number: 99999,
+                            hash: "a".repeat(64),
+                            download_url: "https://example.com/patch".to_string(),
+                            hash_signature: None,
+                        }),
+                        rolled_back_patch_numbers: Some(vec![1]),
+                    };
+                    crate::response_auth::authenticate_test_response(&request, &mut response);
+                    // A network attacker changes a signed rollback instruction.
+                    response.rolled_back_patch_numbers = Some(vec![1, 2]);
+                    Ok(response)
+                },
+                |_, _, _| panic!("unauthenticated response reached download"),
+                |_, _| Ok(()),
+            );
+            if check_only {
+                assert!(check_for_downloadable_update(None).is_err());
+            } else {
+                assert!(update(None).is_err());
+            }
+            with_mut_state(|state| {
+                assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+                assert!(state.lifecycle().installed_artifact_path(1).exists());
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn signed_rollback_only_response_applies_in_either_entry_point() -> Result<()> {
+        for check_only in [false, true] {
+            let tmp = TempDir::new()?;
+            tests::init_for_testing_with_yaml(
+                &tmp,
+                None,
+                &format!(
+                    "\npatch_public_key: {}\npatch_response_verification: required",
+                    response_test_public_key()
+                ),
+            );
+            crate::test_utils::install_fake_patch(1)?;
+            testing_set_network_hooks(
+                |_, request| {
+                    let mut response = PatchCheckResponse {
+                        authentication: None,
+                        patch_available: false,
+                        patch: None,
+                        rolled_back_patch_numbers: Some(vec![1]),
+                    };
+                    crate::response_auth::authenticate_test_response(&request, &mut response);
+                    Ok(response)
+                },
+                |_, _, _| panic!("rollback-only response reached download"),
+                |_, _| Ok(()),
+            );
+            if check_only {
+                assert!(!check_for_downloadable_update(None)?);
+            } else {
+                assert_eq!(update(None)?, UpdateStatus::NoUpdate);
+            }
+            with_mut_state(|state| {
+                assert_eq!(state.next_boot_patch(), None);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn replacement_hash_failure_preserves_last_good_then_boot_failure_rolls_back() -> Result<()> {
+        let tmp = TempDir::new()?;
+        tests::init_for_testing(&tmp, None);
+        write_fake_apk(
+            tmp.path().join("base.apk").to_str().unwrap(),
+            b"nonempty native AOT base",
+        );
+        crate::test_utils::install_fake_patch(1)?;
+        with_mut_state(|state| {
+            state.record_boot_start_for_patch(1)?;
+            state.record_boot_success()
+        })?;
+        testing_set_network_hooks(
+            |_, _| {
+                Ok(PatchCheckResponse {
+                    authentication: None,
+                    patch_available: true,
+                    patch: Some(Patch {
+                        number: 2,
+                        hash: "0".repeat(64),
+                        download_url: "https://example.com/patch".to_string(),
+                        hash_signature: None,
+                    }),
+                    rolled_back_patch_numbers: None,
+                })
+            },
+            |_, destination, _| {
+                let bytes = replacement_transport();
+                std::fs::write(destination, &bytes)?;
+                Ok(DownloadResult {
+                    total_bytes: bytes.len() as u64,
+                    content_length: Some(bytes.len() as u64),
+                })
+            },
+            |_, _| Ok(()),
+        );
+        assert!(update(None).is_err());
+        with_mut_state(|state| {
+            assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+            assert!(matches!(
+                state.lifecycle_mut().read_state(2),
+                Some(lifecycle::PatchState::Bad {
+                    reason: BadReason::InstallHashMismatch,
+                    ..
+                })
+            ));
+            assert!(!state.lifecycle().installed_artifact_path(2).exists());
+            Ok(())
+        })?;
+        assert_eq!(update(None)?, UpdateStatus::UpdateIsBadPatch);
+        // A subsequent correctly installed replacement reaches the boot marker;
+        // an interpreter rejection must return to the last successful patch.
+        crate::test_utils::install_fake_patch(3)?;
+        with_mut_state(|state| {
+            state.record_boot_start_for_patch(3)?;
+            state.record_boot_failure_for_patch(3)?;
+            assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+            Ok(())
+        })
     }
 }

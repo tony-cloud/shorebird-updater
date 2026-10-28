@@ -31,3 +31,5 @@ pub use self::updater::*;
 
 #[cfg(test)]
 extern crate tempfile;
+
+mod response_auth;

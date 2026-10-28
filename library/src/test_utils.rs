@@ -61,3 +61,27 @@ pub fn write_fake_apk(apk_path: &str, libapp_contents: &[u8]) {
     zip.write_all(libapp_contents).unwrap();
     zip.finish().unwrap();
 }
+
+/// Throwaway RSA key, committed solely for deterministic protocol tests.
+pub fn response_test_public_key() -> String {
+    use base64::Engine;
+    base64::prelude::BASE64_STANDARD
+        .encode(include_bytes!("../test_fixtures/response_test_public.der"))
+}
+
+pub fn sign_test_message(message: &[u8]) -> String {
+    use base64::Engine;
+    let pair = ring::signature::RsaKeyPair::from_der(include_bytes!(
+        "../test_fixtures/response_test_private.der"
+    ))
+    .unwrap();
+    let mut signature = vec![0; pair.public().modulus_len()];
+    pair.sign(
+        &ring::signature::RSA_PKCS1_SHA256,
+        &ring::rand::SystemRandom::new(),
+        message,
+        &mut signature,
+    )
+    .unwrap();
+    base64::prelude::BASE64_STANDARD.encode(signature)
+}

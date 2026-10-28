@@ -1868,6 +1868,7 @@ dependencies = [
  "mockito",
  "once_cell",
  "oslog",
+ "patch",
  "pipe",
  "ring",
  "serde",

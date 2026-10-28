@@ -1,0 +1,27 @@
+{
+  "format": "open-aot-vmcode-encrypted-v1",
+  "metadata": {
+    "app_id": "transport-test-app",
+    "app_build_id": "1.0.0+1",
+    "flavor_id": "pro",
+    "license_type": "pro",
+    "sdk_hash": "test-sdk",
+    "base_snapshot_hash": "9e9c84bda29a69fbcef3e06bedd9eebaf7732aa6e0671617a44c5e7148879bee",
+    "patch_snapshot_hash": "f2a1e73ed93c769b7cb6a233ba54334c2ea63970297b0cfe27df3fc41f81c930",
+    "target_os": "ios",
+    "target_arch": "arm64",
+    "runtime_mode": "dart-bytecode-interpreter",
+    "offline_expires_at": "2030-01-01T00:00:00.000Z"
+  },
+  "payload_kind": "full-snapshot",
+  "reconstructed_size": 38,
+  "payload_sha256": "f2a1e73ed93c769b7cb6a233ba54334c2ea63970297b0cfe27df3fc41f81c930",
+  "encrypted_payload_base64": "M2elb+iKrHf0Yf7lxYwKHfGz81GCWz0FTAKG6nkMIMJgacKTzqU=",
+  "encryption": {
+    "algorithm": "AES-256-GCM",
+    "key_id": "test-only-key",
+    "nonce_base64": "AAECAwQFBgcICQoL",
+    "tag_base64": "1coLX4kFUYE+Bc3M+SElOg==",
+    "aad_sha256": "6273b6145931311b9e88e42cbe1b372c932dea0bb7ca081eaf835f7b671dc627"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxIjQEhCMxSIPTw4jdOm1\nwJlmjQKvhRfuMlBWrECEXCe6glIUPf5N2HIx3eDKkWIyRrbJyg3zUs7v2klY70On\nXbVTqr0jm0nxanZ2g6PyVc4XwrLKqTKY12REcpYxciVPcGJqOpmuwrANNSQ9Cmj4\n9DDwXvFQJ5qiH9LMYQ0blhyWMqmaUlMGaisyxGAy5JObcYKYsxp6WyCSgD+L9x3u\nbsib9R/8ttymgIoHaA5y0TfS7moEyYMPgIZRhd3HsrBQaZzib/Rkzd0OduoUTxlC\njeUN8lmSDkQSxQhp/g+grQIeYMPfIfgBZVWf3C2But4ZIk+si7oigO7a/kd6QZs7\n5QIDAQAB\n-----END PUBLIC KEY-----\n",
+  "request": {
+    "release_version": "1.0.0+1",
+    "patch_number": null,
+    "patch_hash": null,
+    "platform": "ios",
+    "arch": "aarch64",
+    "app_id": "e521f712-a06e-44b0-8554-bef2a7df2566",
+    "channel": "stable",
+    "client_id": null,
+    "current_patch_number": null,
+    "nonce": "8e4c8b4f-eacc-4a46-9548-b03510b15444"
+  },
+  "response": {
+    "patch_available": true,
+    "patch": {
+      "number": 1,
+      "download_url": "http://updates.test/storage/dl/patches/apps/e521f712-a06e-44b0-8554-bef2a7df2566/releases/1/patches/1/ios/aarch64/dlc.vmcode",
+      "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "hash_signature": "J+MfYTWKTr4y0fUpsJ321CsqmS8crLLbLOp/UAi1No2dbN9gIEFSgaMBKCAeECpzOxRbw7SvVqMGcwqQLe1reaDdSw6ZCU0bwVxBpajLMCItbimE3HaI7EmkBRSKqbFmB/2dusouJKaq9SQSe7iOVWSDu1XtUEDYUBJBN7m9UCYbXHrjCdv91NaaRgVg1Rkz11tSV8AZAzieIZYqeQIjB0hXfcrALlJ1x57wI/7Q7w+wj9RbOxRoWcyM/Haz96/flq2PtMBZ4uIOdL+oLJoGMT4/I20qLDjNc2jAp194xHIu+sV8Aox+rynjG3+PALWLkNOfYexjLhvV4fOMuxGCHw=="
+    },
+    "rolled_back_patch_numbers": [],
+    "authentication": {
+      "payload": "eyJ2ZXJzaW9uIjoxLCJhcHBfaWQiOiJlNTIxZjcxMi1hMDZlLTQ0YjAtODU1NC1iZWYyYTdkZjI1NjYiLCJyZWxlYXNlX3ZlcnNpb24iOiIxLjAuMCsxIiwicGxhdGZvcm0iOiJpb3MiLCJhcmNoIjoiYWFyY2g2NCIsImNoYW5uZWwiOiJzdGFibGUiLCJub25jZSI6IjhlNGM4YjRmLWVhY2MtNGE0Ni05NTQ4LWIwMzUxMGIxNTQ0NCIsInBhdGNoX2F2YWlsYWJsZSI6dHJ1ZSwicGF0Y2giOnsibnVtYmVyIjoxLCJoYXNoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImRvd25sb2FkX3VybCI6Imh0dHA6Ly91cGRhdGVzLnRlc3Qvc3RvcmFnZS9kbC9wYXRjaGVzL2FwcHMvZTUyMWY3MTItYTA2ZS00NGIwLTg1NTQtYmVmMmE3ZGYyNTY2L3JlbGVhc2VzLzEvcGF0Y2hlcy8xL2lvcy9hYXJjaDY0L2RsYy52bWNvZGUiLCJoYXNoX3NpZ25hdHVyZSI6IkorTWZZVFdLVHI0eTBmVXBzSjMyMUNzcW1TOGNyTExiTE9wL1VBaTFObzJkYk45Z0lFRlNnYU1CS0NBZUVDcHpPeFJidzdTdlZxTUdjd3FRTGUxcmVhRGRTdzZaQ1UwYndWeEJwYWpMTUNJdGJpbUUzSGFJN0Vta0JSU0txYkZtQi8yZHVzb3VKS2FxOVNRU2U3aU9WV1NEdTFYdFVFRFlVQkpCTjdtOVVDWWJYSHJqQ2R2OTFOYWFSZ1ZnMVJrejExdFNWOEFaQXppZUlaWXFlUUlqQjBoWGZjckFMbEoxeDU3d0kvN1E3dyt3ajlSYk94Um9XY3lNL0hhejk2L2ZscTJQdE1CWjR1SU9kTCtvTEpvR01UNC9JMjBxTERqTmMyakFwMTk0eEhJdStzVjhBb3grcnluakczK1BBTFdMa05PZllleGpMaHZWNGZPTXV4R0NIdz09In0sInJvbGxlZF9iYWNrX3BhdGNoX251bWJlcnMiOltdfQ==",
+      "signature": "GJg/LojvtIcLS59UgeSlT14uQ1YB4mIWhjsisNl//yGBva5/ScHhxNmbE1dC6sVRdGsdYxHY5zaSbgi0DE3auYw61oQ+MdzS+va3CG1AEK3idE/UHUtsqbNenTqQfyRPrQURC9jVXGAp6YZ3XqgY/eULiYaJAhsgc3SXhhb35NJYEqDopeYwlu9Ii2DnzoT8qhfkQ+e3GOvs3j0nmjjLN/UyJYsyC1Lw9H4qEGYnrftTG7stBL7DScyJEGG4EC0YfeDxYUUD7JPqaV59THN2XIJ20ebD86lJj/z82+Wgkfva8Z0XZ2+q/AZf44kKrttcZWSTOfSOxbAWtMfukho93g=="
+    }
+  }
+}
