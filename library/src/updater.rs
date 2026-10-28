@@ -436,7 +436,7 @@ pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bo
         let action = with_state(|state| {
             Ok(state.lifecycle().decide_start(
                 patch.number,
-                &patch.download_url,
+                &patch.download_identity(),
                 &patch.hash,
                 patch.hash_signature.as_deref(),
             ))
@@ -588,7 +588,7 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     let action = with_state(|state| {
         Ok(state.lifecycle().decide_start(
             patch.number,
-            &patch.download_url,
+            &patch.download_identity(),
             &patch.hash,
             patch.hash_signature.as_deref(),
         ))
@@ -916,7 +916,7 @@ fn download_and_install_patch(
         with_mut_state(|state| {
             state.lifecycle_mut().record_download_started(
                 patch.number,
-                &patch.download_url,
+                &patch.download_identity(),
                 &patch.hash,
                 patch.hash_signature.as_deref(),
             )
@@ -982,7 +982,24 @@ fn install_downloaded_patch(
         lifecycle::installed_artifact_path(Path::new(&config.storage_dir), patch.number);
 
     let patch_base_rs = patch_base(config)?;
-    if let Err(e) = inflate(download_path, patch_base_rs, &installed_path) {
+    let inflation = if patch.encryption.is_some() {
+        let client_id = with_state(|state| Ok(state.client_id()))?;
+        match crate::encrypted_patch::decrypt(config, patch, &client_id, download_path) {
+            Ok(plaintext) => {
+                let size = plaintext.len();
+                inflate_reader(plaintext, size, patch_base_rs, &installed_path)
+            }
+            // A key may become available after authenticated provisioning. Keep
+            // the ciphertext resumable, but never promote an unauthenticated patch.
+            Err(error) if error.is::<crate::encrypted_patch::KeyResolutionFailed>() => {
+                return Err(error)
+            }
+            Err(error) => Err(error.context(UpdateError::CorruptPatch)),
+        }
+    } else {
+        inflate(download_path, patch_base_rs, &installed_path)
+    };
+    if let Err(e) = inflation {
         // Inflate failed — bytes won't decompress. Deterministically bad.
         // The error is returned as-is (message-preserving): content problems are
         // already tagged `CorruptPatch` inside `validate_compressed_patch`, and a
@@ -1239,29 +1256,30 @@ fn inflate<RS>(patch_path: &Path, base_r: RS, output_path: &Path) -> anyhow::Res
 where
     RS: Read + Seek,
 {
+    validate_compressed_patch(patch_path)?;
+    let size = fs::metadata(patch_path)?.len();
+    let reader = std::io::BufReader::new(
+        fs::File::open(patch_path).with_file_context(FileOperation::ReadFile, patch_path)?,
+    );
+    inflate_reader(reader, size, base_r, output_path)
+}
+
+pub(crate) fn inflate_reader<R, RS>(
+    compressed_patch_r: R,
+    patch_file_size: u64,
+    base_r: RS,
+    output_path: &Path,
+) -> anyhow::Result<()>
+where
+    R: Read + Send + 'static,
+    RS: Read + Seek,
+{
     use comde::de::Decompressor;
     use comde::zstd::ZstdDecompressor;
-    use std::io::{BufReader, BufWriter, SeekFrom};
+    use std::io::{BufWriter, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    // Validate the compressed patch before attempting decompression.
-    validate_compressed_patch(patch_path)?;
-
-    // Capture sizes up front for diagnostic context.
-    let patch_file_size = fs::metadata(patch_path).map(|m| m.len()).unwrap_or(0);
-
-    shorebird_info!(
-        "Inflating patch from {:?} ({} bytes)",
-        patch_path,
-        patch_file_size
-    );
-
-    // Open all our files first for error clarity.  Otherwise we might see
-    // PipeReader/Writer errors instead of file open errors.
-    let compressed_patch_r = BufReader::new(
-        fs::File::open(patch_path).with_file_context(FileOperation::ReadFile, patch_path)?,
-    );
     let output_file_w =
         fs::File::create(output_path).with_file_context(FileOperation::CreateFile, output_path)?;
 
@@ -1981,6 +1999,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: Some(vec![2]),
         };
@@ -2051,6 +2070,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: Some(vec![2]),
         };
@@ -2404,6 +2424,7 @@ patch_verification: bogus_mode
                 download_url: "download_url".to_string(),
                 hash: "hash".to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2455,6 +2476,7 @@ patch_verification: bogus_mode
                 hash: "#".to_string(),
                 download_url: "download_url".to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2666,6 +2688,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2736,6 +2759,7 @@ patch_verification: bogus_mode
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -2841,6 +2865,7 @@ patch_verification: bogus_mode
                         hash: HELLO_TESTS_HASH.to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: OFFERED_SIGNATURE.lock().unwrap().clone(),
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -3215,6 +3240,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -3278,6 +3304,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -3362,6 +3389,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -3514,6 +3542,7 @@ mod rollback_tests {
                     .to_string(),
                 download_url: download_url.to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: Some(vec![3, 2]),
         };
@@ -3669,6 +3698,7 @@ mod rollback_tests {
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: Some(vec![2]),
         };
@@ -3753,6 +3783,7 @@ mod check_for_downloadable_update_tests {
                 hash: "#".to_string(),
                 download_url: "download_url".to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers,
         };
@@ -4242,6 +4273,7 @@ mod download_validation_tests {
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -4290,6 +4322,7 @@ mod download_validation_tests {
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -4339,6 +4372,7 @@ mod download_validation_tests {
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -4568,6 +4602,7 @@ mod resume_edge_case_tests {
                         hash: PATCH_HASH.to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -4857,6 +4892,7 @@ mod resume_edge_case_tests {
                         hash: PATCH_HASH.to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -5365,6 +5401,7 @@ mod authenticated_transport_tests {
                             hash: "a".repeat(64),
                             download_url: "https://example.com/patch".to_string(),
                             hash_signature: None,
+                            encryption: None,
                         }),
                         rolled_back_patch_numbers: Some(vec![1]),
                     };
@@ -5455,6 +5492,7 @@ mod authenticated_transport_tests {
                         hash: "0".repeat(64),
                         download_url: "https://example.com/patch".to_string(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -5520,6 +5558,7 @@ mod authenticated_transport_tests {
                     patch: (number != 0).then(|| Patch {
                         number,
                         hash_signature: Some(sign_test_message(hash.as_bytes())),
+                        encryption: None,
                         hash,
                         download_url: "https://example.com/patch".to_string(),
                     }),
@@ -5648,6 +5687,152 @@ mod authenticated_transport_tests {
         })?;
         assert!(tmp.path().join("patches/1/authentication.json").exists());
         assert!(!tmp.path().join("patches/2/authentication.json").exists());
+        Ok(())
+    }
+    static TRANSPORT_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static TRANSPORT_WRONG_KEY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static TRANSPORT_DOWNLOADS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn transport_key(
+        _id: *const libc::c_char,
+        _aad: *const libc::c_char,
+        output: *mut u8,
+        capacity: usize,
+        written: *mut usize,
+    ) -> bool {
+        if capacity < 32 {
+            return false;
+        }
+        let byte = if TRANSPORT_WRONG_KEY.load(std::sync::atomic::Ordering::SeqCst) {
+            0x43
+        } else {
+            0x42
+        };
+        unsafe {
+            std::ptr::write_bytes(output, byte, 32);
+            *written = 32;
+        }
+        true
+    }
+
+    fn native_fixture_bytes(field: &str) -> Vec<u8> {
+        use base64::Engine;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../test_fixtures/server_encrypted_native_v2.json"
+        ))
+        .unwrap();
+        base64::prelude::BASE64_STANDARD
+            .decode(fixture[field].as_str().unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn encrypted_native_update_waits_for_key_then_installs_and_validates_boot() -> Result<()> {
+        use base64::Engine;
+        use ring::aead;
+        use sha2::{Digest, Sha256};
+        let directory = TempDir::new()?;
+        init_authenticated_boot_test(&directory);
+        write_fake_apk(
+            directory.path().join("base.apk").to_str().unwrap(),
+            &native_fixture_bytes("base_binary_base64"),
+        );
+        crate::config::with_config_mut(|config| {
+            config.as_mut().unwrap().patch_decryption_key_provider = Some(transport_key);
+        });
+        TRANSPORT_WRONG_KEY.store(true, std::sync::atomic::Ordering::SeqCst);
+        TRANSPORT_DOWNLOADS.store(0, std::sync::atomic::Ordering::SeqCst);
+        testing_set_network_hooks(
+            |_, request| {
+                assert!(request.accept_encrypted_patch);
+                let base = native_fixture_bytes("base_binary_base64");
+                let target = native_fixture_bytes("target_binary_base64");
+                let hash = hex::encode(Sha256::digest(&target));
+                let mut transport = Cursor::new(Vec::new());
+                patch::make_patch(base, target, &mut transport);
+                let transport = transport.into_inner();
+                let device_hash = hex::encode(Sha256::digest(request.client_id.as_bytes()));
+                let aad = format!("open-aot-patch-delivery-v2\napp_id={}\nrelease_id=1\npatch_number=1\npatch_hash={}\ntransport_hash={}\nplatform={}\narch={}\ndevice_id_hash={}", request.app_id, hash, hex::encode(Sha256::digest(&transport)), request.platform, request.arch, device_hash);
+                let nonce = [7; 12];
+                let key = aead::LessSafeKey::new(
+                    aead::UnboundKey::new(&aead::AES_256_GCM, &[0x42; 32]).unwrap(),
+                );
+                let mut ciphertext = transport;
+                key.seal_in_place_append_tag(
+                    aead::Nonce::assume_unique_for_key(nonce),
+                    aead::Aad::from(aad.as_bytes()),
+                    &mut ciphertext,
+                )
+                .unwrap();
+                let encode =
+                    |data: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
+                let encryption = crate::encrypted_patch::EncryptionMetadata {
+                    algorithm: "AES-256-GCM".into(),
+                    kdf: "HMAC-SHA256".into(),
+                    key_id: "test-derived-key".into(),
+                    nonce: encode(&nonce),
+                    aad: encode(aad.as_bytes()),
+                    aad_hash: hex::encode(Sha256::digest(aad.as_bytes())),
+                    encrypted_hash: hex::encode(Sha256::digest(&ciphertext)),
+                    device_id_hash: device_hash,
+                    cache_key: "test-only".into(),
+                };
+                *TRANSPORT_BYTES.lock().unwrap() = ciphertext;
+                let mut response = PatchCheckResponse {
+                    authentication: None,
+                    patch_available: true,
+                    rolled_back_patch_numbers: None,
+                    patch: Some(Patch {
+                        number: 1,
+                        hash_signature: Some(sign_test_message(hash.as_bytes())),
+                        hash,
+                        download_url: "http://example.invalid/private-patch?token=must-not-log"
+                            .into(),
+                        encryption: Some(encryption),
+                    }),
+                };
+                crate::response_auth::authenticate_test_response(&request, &mut response);
+                Ok(response)
+            },
+            |_, destination, _| {
+                TRANSPORT_DOWNLOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let ciphertext = TRANSPORT_BYTES.lock().unwrap();
+                std::fs::write(destination, &*ciphertext)?;
+                Ok(DownloadResult {
+                    total_bytes: ciphertext.len() as u64,
+                    content_length: Some(ciphertext.len() as u64),
+                })
+            },
+            |_, _| Ok(()),
+        );
+        let error = update(None).unwrap_err();
+        assert!(error.is::<crate::encrypted_patch::KeyResolutionFailed>());
+        assert!(next_boot_patch()?.is_none());
+        let actual_download = with_state(|state| Ok(state.lifecycle().download_artifact_path(1)))?;
+        assert_eq!(
+            std::fs::read(&actual_download)?,
+            *TRANSPORT_BYTES.lock().unwrap()
+        );
+        TRANSPORT_WRONG_KEY.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        assert_eq!(
+            TRANSPORT_DOWNLOADS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        validate_next_boot_patch()?;
+        let installed = next_boot_patch()?.unwrap();
+        assert_eq!(
+            std::fs::read(&installed.path)?,
+            native_fixture_bytes("target_binary_base64")
+        );
+        assert!(directory
+            .path()
+            .join("patches/1/authentication.json")
+            .exists());
+        testing_reset_config();
         Ok(())
     }
 }

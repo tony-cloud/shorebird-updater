@@ -21,6 +21,38 @@ use super::{allocate_c_string, free_c_string, log_on_error, to_rust};
 use crate::c_api::c_file::CFileProvider;
 use crate::updater;
 
+/// Application-owned resolver for a 32-byte per-patch AES key. `key_id` and
+/// validated UTF-8 `aad` are borrowed NUL-terminated strings. Write exactly
+/// 32 bytes and set `written`, or return false. May run on an updater worker;
+/// must be thread-safe and remain callable for the process lifetime. Never
+/// return the server master secret or derive keys from public device IDs.
+pub type PatchDecryptionKeyProvider = unsafe extern "C" fn(
+    key_id: *const c_char,
+    aad: *const c_char,
+    key_out: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> bool;
+
+/// Register before shorebird_init; returns false after initialization.
+/// A non-null provider requires encrypted patch delivery and strict signed
+/// response/boot policies. Null disables delivery encryption before init only.
+/// Key provisioning is the application's authenticated service responsibility.
+#[no_mangle]
+pub extern "C" fn shorebird_set_patch_decryption_key_provider(
+    provider: Option<
+        unsafe extern "C" fn(
+            key_id: *const c_char,
+            aad: *const c_char,
+            key_out: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> bool,
+    >,
+) -> bool {
+    crate::encrypted_patch::set_provider(provider)
+}
+
 /// Struct containing configuration parameters for the updater.
 /// Passed to `shorebird_init`.
 /// NOTE: If this struct is changed all language bindings must be updated.

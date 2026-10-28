@@ -427,6 +427,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -482,6 +483,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -625,6 +627,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -676,6 +679,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -743,6 +747,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -830,6 +835,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -922,6 +928,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -969,6 +976,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: Some(vec![]),
                 })
@@ -1022,6 +1030,7 @@ mod test {
                         hash: HELLO_PATCH_2_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -1047,6 +1056,7 @@ mod test {
                         hash: HELLO_TESTS_PATCH.hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: Some(vec![2]),
                 })
@@ -1143,6 +1153,7 @@ mod test {
                         hash: "ignored".to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        encryption: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })

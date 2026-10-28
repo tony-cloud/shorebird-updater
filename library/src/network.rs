@@ -269,7 +269,7 @@ pub fn testing_set_network_hooks(
     });
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Patch {
     /// The patch number.  Starts at 1 for each new release and increases
     /// monotonically.
@@ -282,15 +282,52 @@ pub struct Patch {
     /// The signature of `hash`, if this patch is signed. None otherwise.
     #[serde(default)]
     pub hash_signature: Option<String>,
+    /// Authenticated encrypted transport metadata, when delivery is opted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<crate::encrypted_patch::EncryptionMetadata>,
+}
+
+impl Patch {
+    /// Signed grants rotate without changing the ciphertext. Retain both the
+    /// stable origin/path and authenticated ciphertext hash as resume identity;
+    /// never send this synthetic identity to the HTTP client.
+    pub(crate) fn download_identity(&self) -> std::borrow::Cow<'_, str> {
+        match &self.encryption {
+            Some(encryption) => std::borrow::Cow::Owned(format!(
+                "encrypted-sha256:{}:{}",
+                encryption.encrypted_hash,
+                self.download_url
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(&self.download_url)
+            )),
+            None => std::borrow::Cow::Borrowed(&self.download_url),
+        }
+    }
+}
+
+impl std::fmt::Debug for Patch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Patch")
+            .field("number", &self.number)
+            .field("hash", &self.hash)
+            .field("download_url", &"<redacted>")
+            .field("signed", &self.hash_signature.is_some())
+            .field("encryption", &self.encryption)
+            .finish()
+    }
 }
 
 /// Any edits to this struct should be made carefully and in accordance with
 /// the configured update server's privacy policy.
 /// The request body for the patch check endpoint.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PatchCheckRequest {
     /// Fresh challenge bound into authenticated responses to prevent replay.
     pub nonce: String,
+    /// Only advertised after an application key provider is configured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accept_encrypted_patch: bool,
     /// The Shorebird app_id built into the shorebird.yaml in the app.
     /// app_ids are unique to each app and are used to identify the app
     /// within the update server (similar to a bundle identifier).  They
@@ -338,6 +375,7 @@ impl std::fmt::Debug for PatchCheckRequest {
             arch,
             client_id: _,
             nonce: _,
+            accept_encrypted_patch,
             current_patch_number,
         } = self;
         f.debug_struct("PatchCheckRequest")
@@ -348,6 +386,7 @@ impl std::fmt::Debug for PatchCheckRequest {
             .field("arch", arch)
             .field("client_id", &"<redacted>")
             .field("current_patch_number", current_patch_number)
+            .field("accept_encrypted_patch", accept_encrypted_patch)
             .finish()
     }
 }
@@ -360,6 +399,7 @@ impl PatchCheckRequest {
     ) -> PatchCheckRequest {
         PatchCheckRequest {
             nonce: uuid::Uuid::new_v4().to_string(),
+            accept_encrypted_patch: config.patch_decryption_key_provider.is_some(),
             app_id: config.app_id.clone(),
             channel: config.channel.clone(),
             release_version: config.release_version.clone(),
@@ -388,10 +428,11 @@ impl PatchCheckRequest {
             arch,
             client_id: _,
             nonce: _,
+            accept_encrypted_patch,
             current_patch_number,
         } = self;
         format!(
-            "app_id: {app_id}, channel: {channel}, release_version: {release_version}, platform: {platform}, arch: {arch}, current_patch_number: {current_patch_number:?}"
+            "app_id: {app_id}, channel: {channel}, release_version: {release_version}, platform: {platform}, arch: {arch}, current_patch_number: {current_patch_number:?}, accept_encrypted_patch: {accept_encrypted_patch}"
         )
     }
 }
@@ -437,7 +478,7 @@ pub fn download_to_path(
     path: &Path,
     resume_from: u64,
 ) -> anyhow::Result<DownloadResult> {
-    shorebird_info!("Downloading patch from: {}", url);
+    shorebird_info!("Downloading patch artifact");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_file_context(FileOperation::CreateDir, parent)?;
     }
@@ -486,6 +527,7 @@ mod tests {
     fn patch_check_request_debug_masks_client_id() {
         let request = super::PatchCheckRequest {
             nonce: "test-nonce".to_string(),
+            accept_encrypted_patch: false,
             app_id: "app_id".to_string(),
             channel: "stable".to_string(),
             release_version: "1.0.0+1".to_string(),
@@ -504,6 +546,7 @@ mod tests {
     fn patch_check_request_log_line_omits_client_id() {
         let request = super::PatchCheckRequest {
             nonce: "test-nonce".to_string(),
+            accept_encrypted_patch: false,
             app_id: "app_id".to_string(),
             channel: "stable".to_string(),
             release_version: "1.0.0+1".to_string(),
@@ -516,7 +559,7 @@ mod tests {
         // line are matched to it character for character.
         assert_eq!(
             request.log_line(),
-            "app_id: app_id, channel: stable, release_version: 1.0.0+1, platform: android, arch: aarch64, current_patch_number: Some(3)"
+            "app_id: app_id, channel: stable, release_version: 1.0.0+1, platform: android, arch: aarch64, current_patch_number: Some(3), accept_encrypted_patch: false"
         );
         assert!(!request.log_line().contains("client_id"));
     }
@@ -525,6 +568,7 @@ mod tests {
     fn patch_check_request_serializes_client_id() {
         let request = super::PatchCheckRequest {
             nonce: "test-nonce".to_string(),
+            accept_encrypted_patch: false,
             app_id: "app_id".to_string(),
             channel: "stable".to_string(),
             release_version: "1.0.0+1".to_string(),
@@ -620,6 +664,7 @@ mod tests {
             "",
             super::PatchCheckRequest {
                 nonce: "test-nonce".to_string(),
+                accept_encrypted_patch: false,
                 app_id: "".to_string(),
                 channel: "".to_string(),
                 release_version: "".to_string(),

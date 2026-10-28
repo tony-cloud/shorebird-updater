@@ -95,3 +95,7 @@ Install:
 https://github.com/taiki-e/cargo-llvm-cov#installation
 
 `cargo llvm-cov` will then generate the report.
+
+The open encrypted-delivery integration, native key-provider API, provisioning
+requirements and storage boundaries are documented in
+[Encrypted native patch delivery](docs/encrypted_delivery.md).

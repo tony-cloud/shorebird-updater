@@ -11,13 +11,19 @@ use crate::{
     yaml::PatchResponseVerificationMode,
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseAuthentication {
     /// Standard base64 of the exact JSON UTF-8 bytes signed by the server.
     pub payload: String,
     /// RSA PKCS#1 v1.5 SHA-256 signature of the decoded payload bytes.
     pub signature: String,
+}
+
+impl std::fmt::Debug for ResponseAuthentication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResponseAuthentication { payload: <redacted>, signature: <redacted> }")
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -27,6 +33,8 @@ struct AuthenticatedPatch {
     hash: String,
     download_url: String,
     hash_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption: Option<crate::encrypted_patch::EncryptionMetadata>,
 }
 
 impl From<&Patch> for AuthenticatedPatch {
@@ -36,6 +44,7 @@ impl From<&Patch> for AuthenticatedPatch {
             hash: patch.hash.clone(),
             download_url: patch.download_url.clone(),
             hash_signature: patch.hash_signature.clone(),
+            encryption: patch.encryption.clone(),
         }
     }
 }
@@ -90,7 +99,9 @@ pub fn verify_response(
         config.patch_public_key.as_deref(),
         config.patch_response_verification,
     )
-    .context(UpdateError::InvalidSignature)
+    .context(UpdateError::InvalidSignature)?;
+    crate::encrypted_patch::validate_offer(request, response, config)
+        .context(UpdateError::InvalidSignature)
 }
 
 fn verify_inner(
@@ -219,6 +230,7 @@ mod tests {
     fn request() -> PatchCheckRequest {
         PatchCheckRequest {
             nonce: "25828b34-0d5f-490e-8213-72b8672b660d".to_string(),
+            accept_encrypted_patch: false,
             app_id: "app".to_string(),
             release_version: "1.0.0+1".to_string(),
             platform: "ios".to_string(),
@@ -237,6 +249,7 @@ mod tests {
                 hash: "a".repeat(64),
                 download_url: "https://example.com/7".to_string(),
                 hash_signature: None,
+                encryption: None,
             }),
             rolled_back_patch_numbers: Some(vec![1, 2]),
         }

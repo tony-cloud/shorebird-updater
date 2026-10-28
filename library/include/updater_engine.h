@@ -74,6 +74,19 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * Register before shorebird_init; returns false after initialization.
+ * A non-null provider requires encrypted patch delivery and strict signed
+ * response/boot policies. Null disables delivery encryption before init only.
+ * Key provisioning is the application's authenticated service responsibility.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_set_patch_decryption_key_provider(bool (*provider)(const char *key_id,
+                                                                  const char *aad,
+                                                                  uint8_t *key_out,
+                                                                  uintptr_t capacity,
+                                                                  uintptr_t *written));
+
+/**
  * Free a string returned by the updater library.
  *
  * # Safety

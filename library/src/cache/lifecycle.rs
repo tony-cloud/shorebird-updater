@@ -418,7 +418,10 @@ pub enum SkipReason {
 
 impl PatchLifecycle {
     /// Decide what to do when the server offers patch `n`. Reads the
-    /// on-disk state and matches it against the server's `url` + `hash`.
+    /// on-disk state and matches it against the server's download identity +
+    /// `hash`. Unencrypted offers use the full URL. Authenticated encrypted
+    /// offers use a synthetic stable origin/path+ciphertext-hash identity so
+    /// rotating a signed URL grant preserves safe resumption.
     /// A mismatch on either field discards the prior state — the patch
     /// was deleted and re-uploaded with the same number, or routed
     /// through a different CDN URL, and the prior bytes can't be

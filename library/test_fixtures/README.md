@@ -16,3 +16,10 @@ native application base. AES decryption is the interpreter runtime's job.
 `server_response_public.der` is the same fixture's PEM key converted to PKCS#1
 DER. The Rust test verifies both its signed response and legacy artifact-hash
 signature, providing a Go-to-Rust protocol compatibility check.
+
+`server_encrypted_native_v2.json` is a separate TEST-ONLY Go HTTP fixture. It
+includes an intentionally public derived AES key, signed encryption metadata,
+ciphertext, native Mach-O base/target bytes and a real Rust-produced binary diff.
+The Go producer is `TestAuthenticatedEncryptedPatchDeliveryHTTP` with
+`SHOREBIRD_ENCRYPTED_RESPONSE_{BASE,TRANSPORT,OUTPUT,FIXTURE}` environment paths.
+Never use its key, RSA public key, grant URLs or application identity in production.

@@ -63,6 +63,7 @@ pub fn testing_reset_config() {
         *config = None;
     });
     set_running_patch_number(None);
+    crate::encrypted_patch::reset_provider();
 }
 
 pub fn check_initialized_and_call<F, R>(
@@ -114,6 +115,7 @@ pub struct UpdateConfig {
     pub network_hooks: NetworkHooks,
     pub file_provider: Box<dyn ExternalFileProvider>,
     pub patch_public_key: Option<String>,
+    pub patch_decryption_key_provider: Option<crate::c_api::engine::PatchDecryptionKeyProvider>,
     pub patch_verification: PatchVerificationMode,
     pub patch_response_verification: PatchResponseVerificationMode,
 }
@@ -158,9 +160,11 @@ pub fn set_config(
             network_hooks,
             file_provider,
             patch_public_key: yaml.patch_public_key.to_owned(),
+            patch_decryption_key_provider: crate::encrypted_patch::provider(),
             patch_verification: yaml.patch_verification.unwrap_or_default(),
             patch_response_verification: yaml.patch_response_verification.unwrap_or_default(),
         };
+        crate::encrypted_patch::validate_config(&new_config)?;
         shorebird_debug!("Updater configured with: {:?}", new_config);
         *config = Some(new_config);
 

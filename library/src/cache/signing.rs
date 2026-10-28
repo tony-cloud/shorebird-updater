@@ -50,13 +50,13 @@ pub fn check_patch_signature(
 /// See https://docs.rs/ring/latest/ring/signature/index.html#signing-and-verifying-with-rsa-pkcs1-15-padding
 /// for more information.
 pub fn check_signature(message: &str, signature: &str, public_key: &str) -> Result<()> {
-    shorebird_debug!("Message is {}", message);
-    shorebird_debug!("Public key is {:?}", public_key);
-    shorebird_debug!("Signature is {}", signature);
+    // Signed response payloads can contain bearer download URLs and device
+    // routing identifiers. Never log the authenticated bytes or signature.
+    shorebird_debug!("Verifying signed message ({} bytes)", message.len());
 
     let public_key_bytes = base64::prelude::BASE64_STANDARD
         .decode(public_key)
-        .with_context(|| format!("Failed to decode public_key: {}", public_key))?;
+        .context("Failed to decode public_key")?;
     let public_key = ring::signature::UnparsedPublicKey::new(
         &ring::signature::RSA_PKCS1_2048_8192_SHA256,
         public_key_bytes,
@@ -149,7 +149,7 @@ mod tests {
         let result = super::check_signature(MESSAGE, SIGNATURE, "bad_public_key");
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
-        assert_eq!(error, "Failed to decode public_key: bad_public_key");
+        assert_eq!(error, "Failed to decode public_key");
     }
 
     #[test]
