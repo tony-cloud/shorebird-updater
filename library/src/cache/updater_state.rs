@@ -3,19 +3,19 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Result};
-#[cfg(test)]
-use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
 use crate::events::PatchEvent;
 use crate::yaml::PatchVerificationMode;
 
 use super::lifecycle::{PatchLifecycle, PatchState};
-#[cfg(test)]
-use super::signing;
 use super::{disk_io, PatchInfo};
 
 const STATE_FILE_NAME: &str = "state.json";
+
+/// The most events kept waiting to be sent. A device offline for long enough
+/// to queue more drops the oldest, so the state file stays small.
+pub const MAX_QUEUED_EVENTS: usize = 50;
 
 /// Files and directories under `cache_dir` that shorebird has ever
 /// written. On a release-version change or unparseable state we wipe
@@ -39,11 +39,11 @@ const SHOREBIRD_OWNED_PATHS: &[&str] = &["patches", "pointers.json", "patches_st
 ///
 /// Per-patch state lives inside [`PatchLifecycle`] (one document per
 /// patch number under `{cache}/patches/{N}/state.json`). UpdaterState
-/// itself only owns the per-device `client_id` and the per-release event
-/// queue; all other patch-related fields are pointers managed by the
+/// itself only owns the per-install `client_id` and the event queue; all
+/// other patch-related fields are pointers managed by the
 /// lifecycle.
-// TODO(eseidel): Split the per-release state from the per-device state
-// so per-device state isn't reset on release-version change.
+// TODO(eseidel): Split the per-release state from the per-install state
+// so per-install state isn't reset on release-version change.
 #[derive(Debug)]
 pub struct UpdaterState {
     /// Persistent app-storage root. Holds `state.json`, `pointers.json`,
@@ -60,9 +60,9 @@ pub struct UpdaterState {
 
 /// UpdaterState fields that are serialized to disk at `{cache}/state.json`.
 ///
-/// Every per-release field on disk (this struct, `pointers.json`, and the
-/// per-patch `state.json` files under `patches/`) is wiped when
-/// `release_version` changes. The release version effectively names a
+/// Every per-release field on disk (`release_version` here, `pointers.json`,
+/// and the per-patch `state.json` files under `patches/`) is wiped when
+/// `release_version` changes; `client_id` and `queued_events` are kept. The release version effectively names a
 /// unique build of the engine + updater, since the updater ships
 /// embedded in the engine — there's no "version range" of updater code
 /// that's mutually compatible. On a release-version mismatch, anything
@@ -78,8 +78,11 @@ struct SerializedState {
     /// app's reported release version triggers a wipe of all per-release
     /// state.
     release_version: String,
-    /// Events that have not yet been sent to the server. Format may
-    /// change between releases, so this is per-release state.
+    /// Events that have not yet been sent to the server, oldest first. Kept
+    /// across release-version changes: each event names its own release, and
+    /// dropping them would lose installs the server should count. An updater
+    /// that can't read an older format falls back to a new state (see
+    /// `load_or_new_on_error`), as for any unreadable state file.
     queued_events: Vec<PatchEvent>,
 }
 
@@ -127,6 +130,7 @@ impl UpdaterState {
         patch_public_key: Option<&str>,
         verification_mode: PatchVerificationMode,
         client_id: String,
+        queued_events: Vec<PatchEvent>,
     ) -> Self {
         Self {
             lifecycle: PatchLifecycle::load_or_default(cache_dir.clone(), download_dir),
@@ -136,7 +140,7 @@ impl UpdaterState {
             serialized_state: SerializedState {
                 client_id,
                 release_version,
-                queued_events: Vec::new(),
+                queued_events,
             },
         }
     }
@@ -180,6 +184,7 @@ impl UpdaterState {
         patch_public_key: Option<&str>,
         verification_mode: PatchVerificationMode,
         client_id: String,
+        queued_events: Vec<PatchEvent>,
     ) -> Self {
         for relative in SHOREBIRD_OWNED_PATHS {
             let path = cache_dir.join(relative);
@@ -209,6 +214,7 @@ impl UpdaterState {
             patch_public_key,
             verification_mode,
             client_id,
+            queued_events,
         );
         if let Err(e) = state.save() {
             shorebird_warn!("Error saving state {:?}, ignoring.", e);
@@ -240,6 +246,7 @@ impl UpdaterState {
                         patch_public_key,
                         verification_mode,
                         loaded.client_id(),
+                        loaded.serialized_state.queued_events,
                     );
                 }
                 loaded
@@ -255,6 +262,7 @@ impl UpdaterState {
                     patch_public_key,
                     verification_mode,
                     generate_client_id(),
+                    Vec::new(),
                 )
             }
         }
@@ -349,65 +357,6 @@ impl UpdaterState {
             .validate_next_boot_patch(self.patch_public_key.as_deref(), self.verification_mode)
     }
 
-    /// Moves the inflated artifact at `patch.path` into the lifecycle's
-    /// installed location, validates the signature in `InstallOnly`
-    /// mode, transitions the patch to `Installed`, and promotes it to
-    /// `next_boot_patch`.
-    ///
-    /// Test-only entry point. The production update flow inflates
-    /// directly into the lifecycle's installed location and transitions
-    /// `Downloaded → Installed` via `lifecycle::record_install_complete`,
-    /// so no production caller goes through this function. Gated to
-    /// `#[cfg(test)]` so a future refactor can't accidentally
-    /// reintroduce the divergence — direct lifecycle calls are the
-    /// canonical path. Used by `test_utils::install_fake_patch` and
-    /// the tests below.
-    #[cfg(test)]
-    pub fn install_patch(
-        &mut self,
-        patch: &PatchInfo,
-        hash: &str,
-        signature: Option<&str>,
-    ) -> Result<()> {
-        if !patch.path.exists() {
-            bail!("Patch file {} does not exist", patch.path.display());
-        }
-        // InstallOnly mode verifies the signature here; Strict mode
-        // verifies it again at boot time via validate_next_boot_patch.
-        if self.verification_mode == PatchVerificationMode::InstallOnly {
-            if let Some(public_key) = &self.patch_public_key {
-                let sig = signature.context("Patch signature is missing")?;
-                signing::check_signature(hash, sig, public_key)?;
-            }
-        }
-        let installed_path = self.lifecycle.installed_artifact_path(patch.number);
-        if let Some(parent) = installed_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(&patch.path, &installed_path)?;
-        // Mirror `record_install_complete`'s cleanup of the now-stale
-        // compressed download bytes if any are sitting in the patch dir.
-        let download = self.lifecycle.download_artifact_path(patch.number);
-        if download.exists() {
-            if let Err(e) = std::fs::remove_file(&download) {
-                shorebird_error!(
-                    "Failed to remove stale download for patch {}: {:?}",
-                    patch.number,
-                    e
-                );
-            }
-        }
-        let installed_size = std::fs::metadata(&installed_path)?.len();
-        self.lifecycle.write_state(
-            patch.number,
-            &PatchState::Installed {
-                signature: signature.map(String::from),
-                size: installed_size,
-            },
-        )?;
-        self.lifecycle.promote_to_next_boot(patch.number)
-    }
-
     /// Removes the artifacts for `patch_number` and recomputes pointers.
     /// Used today for server-driven rollbacks.
     pub fn uninstall_patch(&mut self, patch_number: usize) -> Result<()> {
@@ -434,8 +383,15 @@ impl UpdaterState {
 
 /// PatchEvent management.
 impl UpdaterState {
+    /// Adds `event` to the end of the queue, dropping the oldest events if
+    /// the queue would hold more than [`MAX_QUEUED_EVENTS`].
     pub fn queue_event(&mut self, event: PatchEvent) -> Result<()> {
-        self.serialized_state.queued_events.push(event);
+        let events = &mut self.serialized_state.queued_events;
+        events.push(event);
+        if events.len() > MAX_QUEUED_EVENTS {
+            let excess = events.len() - MAX_QUEUED_EVENTS;
+            events.drain(..excess);
+        }
         self.save()
     }
 
@@ -448,9 +404,23 @@ impl UpdaterState {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn clear_events(&mut self) -> Result<()> {
         self.serialized_state.queued_events.clear();
         self.save()
+    }
+
+    /// Removes the first queued event equal to `event`, once the server has
+    /// it. Does nothing if it's no longer queued (dropped for space).
+    pub fn remove_event(&mut self, event: &PatchEvent) -> Result<()> {
+        let events = &mut self.serialized_state.queued_events;
+        match events.iter().position(|queued| queued == event) {
+            Some(index) => {
+                events.remove(index);
+                self.save()
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -458,13 +428,8 @@ impl UpdaterState {
 mod tests {
     use super::*;
     use crate::cache::lifecycle::BadReason;
+    use crate::test_utils::install_fake_patch_into;
     use tempfile::TempDir;
-
-    fn fake_artifact(tmp: &TempDir, number: usize) -> PatchInfo {
-        let path = tmp.path().join(format!("patch{}.full", number));
-        std::fs::write(&path, format!("patch_{}_bytes", number)).unwrap();
-        PatchInfo { number, path }
-    }
 
     fn load(tmp: &TempDir, release_version: &str) -> UpdaterState {
         UpdaterState::load_or_new_on_error(
@@ -481,8 +446,7 @@ mod tests {
         // Ports `patch_manager.rs::reset_tests::deletes_patches_dir_and_resets_patches_state`.
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        let p = fake_artifact(&tmp, 1);
-        state.install_patch(&p, "hash", None).unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         state.save().unwrap();
         assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
 
@@ -546,6 +510,56 @@ mod tests {
         assert_eq!(next.client_id(), original_client_id);
     }
 
+    fn event(patch_number: usize) -> PatchEvent {
+        PatchEvent {
+            app_id: "app_id".to_string(),
+            arch: "aarch64".to_string(),
+            client_id: "client_id".to_string(),
+            identifier: crate::events::EventType::PatchInstallSuccess,
+            patch_number,
+            platform: "android".to_string(),
+            release_version: "1.0.0+1".to_string(),
+            timestamp: 1,
+            message: None,
+            failure_category: None,
+            event_id: Some(format!("id-{patch_number}")),
+        }
+    }
+
+    #[test]
+    fn queued_events_persist_across_release_changes() {
+        let tmp = TempDir::new().unwrap();
+        let mut original = load(&tmp, "1.0.0+1");
+        original.queue_event(event(1)).unwrap();
+        let next = load(&tmp, "1.0.0+2");
+        assert_eq!(next.copy_events(10), vec![event(1)]);
+    }
+
+    #[test]
+    fn queue_drops_oldest_past_the_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = load(&tmp, "1.0.0+1");
+        for n in 0..MAX_QUEUED_EVENTS + 2 {
+            state.queue_event(event(n)).unwrap();
+        }
+        let events = load(&tmp, "1.0.0+1").copy_events(MAX_QUEUED_EVENTS + 2);
+        assert_eq!(events.len(), MAX_QUEUED_EVENTS);
+        assert_eq!(events[0], event(2));
+        assert_eq!(events[MAX_QUEUED_EVENTS - 1], event(MAX_QUEUED_EVENTS + 1));
+    }
+
+    #[test]
+    fn remove_event_removes_only_that_event() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = load(&tmp, "1.0.0+1");
+        state.queue_event(event(1)).unwrap();
+        state.queue_event(event(2)).unwrap();
+        state.remove_event(&event(1)).unwrap();
+        // Removing an event that's gone already is a no-op.
+        state.remove_event(&event(1)).unwrap();
+        assert_eq!(load(&tmp, "1.0.0+1").copy_events(10), vec![event(2)]);
+    }
+
     #[test]
     fn client_id_override_persists_across_release_changes() {
         let tmp = TempDir::new().unwrap();
@@ -568,8 +582,7 @@ mod tests {
     fn corrupt_state_file_creates_new_state() {
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        let p = fake_artifact(&tmp, 1);
-        state.install_patch(&p, "hash", None).unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         state.save().unwrap();
 
         std::fs::write(tmp.path().join(STATE_FILE_NAME), "garbage").unwrap();
@@ -579,115 +592,15 @@ mod tests {
     }
 
     #[test]
-    fn install_patch_renames_into_lifecycle_dir_and_sets_next_boot() {
-        // Ports `patch_manager.rs::add_patch_tests::adds_patch_successfully`.
-        let tmp = TempDir::new().unwrap();
-        let mut state = load(&tmp, "1.0.0+1");
-        let p = fake_artifact(&tmp, 1);
-        state.install_patch(&p, "hash", None).unwrap();
-        let next = state.next_boot_patch().unwrap();
-        assert_eq!(next.number, 1);
-        assert!(next.path.exists());
-        assert!(!tmp.path().join("patch1.full").exists(), "source moved");
-    }
-
-    #[test]
-    fn install_patch_replaces_unbooted_predecessor() {
+    fn installing_replaces_unbooted_predecessor() {
         // Ports
         // `patch_manager.rs::next_boot_patch_tests::adding_patch_deletes_unbooted_patch_not_last_booted`.
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        state
-            .install_patch(&fake_artifact(&tmp, 1), "h1", None)
-            .unwrap();
-        state
-            .install_patch(&fake_artifact(&tmp, 2), "h2", None)
-            .unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
+        install_fake_patch_into(&mut state, 2).unwrap();
         assert_eq!(state.next_boot_patch().map(|p| p.number), Some(2));
         assert!(!state.lifecycle.installed_artifact_path(1).exists());
-    }
-
-    #[test]
-    fn install_patch_errors_when_file_missing() {
-        // Ports `patch_manager.rs::add_patch_tests::errs_if_file_path_does_not_exist`.
-        let tmp = TempDir::new().unwrap();
-        let mut state = load(&tmp, "1.0.0+1");
-        let bogus = PatchInfo {
-            number: 1,
-            path: tmp.path().join("nope"),
-        };
-        assert!(state.install_patch(&bogus, "h", None).is_err());
-    }
-
-    // The base64-encoded RSA key + matching signature were generated for
-    // signing.rs's tests; reused here to exercise the InstallOnly path
-    // without standing up our own keypair fixture.
-    const TEST_PUBLIC_KEY: &str = "MIIBCgKCAQEA2wdpEGbuvlPsb9i0qYrfMefJnEw1BHTi8SYZTKrXOvJWmEpPE1hWfbkvYzXu5a96gV1yocF3DMwn04VmRlKhC4AhsD0NL0UNhYhotbKG91Kwi1vAXpHhCdz5gQEBw0K1uB4Jz+zK6WK+31PryYpwLwbyXNqXoY8IAAUQ4STsHYV5w+BMSi8pepWMRd7DR9RHcbNOZlJvdBQ5NxvB4JN4dRMq8cC73ez1P9d7Dfwv3TWY+he9EmuXLT2UivZSlHIrGBa7MFfqyUe2ro0F7Te/B0si12itBbWIqycvqcXjeOPNn6WEpqN7IWjb9LUh162JyYaz5Lb/VeeJX8LKtElccwIDAQAB";
-    const TEST_HASH: &str = "404e5caa5b906f6d03c97657e8c4d604d759f9cfba1a8bba9d5b49a5ebc174f9";
-    const TEST_SIGNATURE: &str = "2ixSo5LpaWUSLg2GJEV+D+uyLeLjp0c3vNXnl0yb1iJjAdpn10BFlbcwCcjaJW9PNky2HU2hKOBe62PkFHOU8DDYOfxf2LGg/ToLGPHin85WrwFAceAUYDs7JpQr43dRTbrXcT8k5tuCQOTwXecGwuWcOFFvh0GbXFnyAmi7fLfN9CtTsG2GIOle/LyYLwoviTrXn/fZTZEYrqxD/wZ4QzoWOWLWNvrPbILhqWELkBLhdZeK0+nC2CIxFRYd3bUeOi1AGtPyHKBfdwuf4VO3+HbwJVaAEiD7HU2Bj+Zp1xeSdbznmYgBV86oizrLFd23D+lBfTlmDGgdfNE9J4Z2/g==";
-
-    fn load_with_verification(
-        tmp: &TempDir,
-        public_key: Option<&str>,
-        mode: PatchVerificationMode,
-    ) -> UpdaterState {
-        UpdaterState::load_or_new_on_error(
-            tmp.path(),
-            &tmp.path().join("downloads"),
-            "1.0.0+1",
-            public_key,
-            mode,
-        )
-    }
-
-    #[test]
-    fn install_patch_install_only_accepts_valid_signature() {
-        // Ports `patch_manager.rs::add_patch_tests::install_only_succeeds_with_valid_signature`.
-        let tmp = TempDir::new().unwrap();
-        let mut state = load_with_verification(
-            &tmp,
-            Some(TEST_PUBLIC_KEY),
-            PatchVerificationMode::InstallOnly,
-        );
-        let p = fake_artifact(&tmp, 1);
-        state
-            .install_patch(&p, TEST_HASH, Some(TEST_SIGNATURE))
-            .unwrap();
-        assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
-    }
-
-    #[test]
-    fn install_patch_install_only_rejects_missing_signature() {
-        // Ports
-        // `patch_manager.rs::add_patch_tests::install_only_errs_if_signature_is_missing_when_public_key_configured`.
-        let tmp = TempDir::new().unwrap();
-        let mut state = load_with_verification(
-            &tmp,
-            Some(TEST_PUBLIC_KEY),
-            PatchVerificationMode::InstallOnly,
-        );
-        let p = fake_artifact(&tmp, 1);
-        assert!(state.install_patch(&p, TEST_HASH, None).is_err());
-        // Failure leaves no Installed state.
-        assert!(state.next_boot_patch().is_none());
-    }
-
-    #[test]
-    fn install_patch_install_only_rejects_bad_signature() {
-        // Ports
-        // `patch_manager.rs::add_patch_tests::install_only_errs_if_signature_is_invalid`
-        // and (same code path)
-        // `patch_manager.rs::add_patch_tests::install_only_errs_if_public_key_is_invalid`.
-        let tmp = TempDir::new().unwrap();
-        let mut state = load_with_verification(
-            &tmp,
-            Some(TEST_PUBLIC_KEY),
-            PatchVerificationMode::InstallOnly,
-        );
-        let p = fake_artifact(&tmp, 1);
-        assert!(state
-            .install_patch(&p, TEST_HASH, Some("not_a_real_signature"))
-            .is_err());
     }
 
     #[test]
@@ -698,9 +611,7 @@ mod tests {
         // `patch_manager.rs::record_boot_success_for_patch_tests::succeeds_when_provided_next_boot_patch_number`.
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        state
-            .install_patch(&fake_artifact(&tmp, 1), "h", None)
-            .unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         state.record_boot_start_for_patch(1).unwrap();
         assert_eq!(state.currently_booting_patch().map(|p| p.number), Some(1));
         state.record_boot_success().unwrap();
@@ -719,9 +630,7 @@ mod tests {
         // `patch_manager.rs::record_boot_failure_for_patch_tests::deletes_failed_patch_artifacts`.
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        state
-            .install_patch(&fake_artifact(&tmp, 1), "h", None)
-            .unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         state.record_boot_start_for_patch(1).unwrap();
         state.record_boot_failure_for_patch(1).unwrap();
         assert!(state.is_known_bad_patch(1));
@@ -735,9 +644,7 @@ mod tests {
         // patch bad and recomputes pointers.
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        state
-            .install_patch(&fake_artifact(&tmp, 1), "h", None)
-            .unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         state.record_boot_failure_for_patch(1).unwrap();
         assert!(state.is_known_bad_patch(1));
         assert!(state.next_boot_patch().is_none());
@@ -747,9 +654,7 @@ mod tests {
     fn uninstall_patch_clears_artifacts_and_recomputes_pointers() {
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        state
-            .install_patch(&fake_artifact(&tmp, 1), "h", None)
-            .unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
         state.uninstall_patch(1).unwrap();
         assert!(state.next_boot_patch().is_none());
@@ -760,28 +665,11 @@ mod tests {
     fn is_known_bad_patch_after_mark_bad() {
         let tmp = TempDir::new().unwrap();
         let mut state = load(&tmp, "1.0.0+1");
-        state
-            .install_patch(&fake_artifact(&tmp, 1), "h", None)
-            .unwrap();
+        install_fake_patch_into(&mut state, 1).unwrap();
         state
             .lifecycle
             .mark_bad(1, BadReason::InstallHashMismatch)
             .unwrap();
         assert!(state.is_known_bad_patch(1));
-    }
-
-    #[test]
-    fn install_patch_install_only_skips_verification_when_no_public_key() {
-        // Ports
-        // `patch_manager.rs::add_patch_tests::install_only_succeeds_with_any_signature_if_no_public_key`.
-        // InstallOnly + no public_key configured → signature is never
-        // checked, so any value (including garbage) is accepted.
-        let tmp = TempDir::new().unwrap();
-        let mut state = load_with_verification(&tmp, None, PatchVerificationMode::InstallOnly);
-        let p = fake_artifact(&tmp, 1);
-        state
-            .install_patch(&p, "any-hash", Some("garbage-signature"))
-            .unwrap();
-        assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
     }
 }

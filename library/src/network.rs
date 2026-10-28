@@ -4,7 +4,7 @@
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::string::ToString;
 
@@ -70,7 +70,7 @@ pub fn patch_check_request_default(
     url: &str,
     request: PatchCheckRequest,
 ) -> anyhow::Result<PatchCheckResponse> {
-    shorebird_info!("Sending patch check request: {:?}", request);
+    shorebird_info!("Sending patch check request: {}", request.log_line());
     let result = ureq::post(url).send_json(&request);
     let response = handle_network_result(result)?;
     let parsed = response.into_body().read_json()?;
@@ -120,8 +120,7 @@ pub fn download_to_path_default(
         File::create(dest).with_file_context(FileOperation::CreateFile, dest)?
     };
 
-    std::io::copy(&mut response.into_body().as_reader(), &mut file)
-        .with_file_context(FileOperation::WriteFile, dest)?;
+    copy_body_to_file(&mut response.into_body().as_reader(), &mut file, dest)?;
 
     let total_bytes = std::fs::metadata(dest)
         .with_file_context(FileOperation::ReadFile, dest)?
@@ -133,31 +132,97 @@ pub fn download_to_path_default(
     })
 }
 
+/// How long an event post may take. The flush that sends it holds a lock
+/// other flushes wait on, so one that never gets an answer must give up.
+const REPORT_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn report_event_default(url: &str, request: CreatePatchEventRequest) -> anyhow::Result<()> {
-    let result = ureq::post(url).send_json(&request);
+    let result = ureq::post(url)
+        .config()
+        .timeout_global(Some(REPORT_EVENT_TIMEOUT))
+        .build()
+        .send_json(&request);
     handle_network_result(result)?;
     Ok(())
 }
 
-/// Handles the result of a network request, returning the response if it was
-/// successful, an error if it was not, or a special error if the network
-/// request failed due to a lack of internet connection.
+/// A typed network-layer failure.
+///
+/// Preserving the failure as a concrete type (rather than a `bail!`-ed string)
+/// lets the failure classifier in `updater.rs` distinguish "the server answered
+/// with an error status" from "we never reached the server". This is internal
+/// enabling work for the categorized-failure surface planned in the
+/// `shorebird_code_push` v3 PRD (Change #7: sealed `Failed{category, code,
+/// retryable}`). It is intentionally *not* exposed across the C ABI — the FFI
+/// still flattens every failure to `SHOREBIRD_UPDATE_ERROR` today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkError {
+    /// The server was reached but responded with a non-success HTTP status.
+    Server { status: u16 },
+    /// The request never reached the server (offline, DNS failure, connection
+    /// refused), or the connection failed mid-response (the peer disconnected,
+    /// a timeout).
+    Transport,
+}
+
+impl std::fmt::Display for NetworkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // These messages are not shown to end users — they surface only in logs
+        // and the server-bound failure diagnostic event. They must stay generic
+        // across all network operations (patch check, download, event report).
+        match self {
+            NetworkError::Server { status } => write!(f, "Request failed with status: {status}"),
+            NetworkError::Transport => {
+                write!(
+                    f,
+                    "Network request failed; the server could not be reached."
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkError {}
+
+/// Maps a raw `ureq` result into our typed [`NetworkError`] (or preserves the
+/// underlying `ureq` error for the uncommon cases), returning the response on
+/// success.
 fn handle_network_result(
     result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> anyhow::Result<ureq::http::Response<ureq::Body>> {
     match result {
         Ok(response) => Ok(response),
-        Err(ureq::Error::StatusCode(code)) => {
-            bail!("Request failed with status: {}", code)
-        }
-        Err(ureq::Error::HostNotFound)
-        | Err(ureq::Error::ConnectionFailed)
-        | Err(ureq::Error::Io(_)) => {
-            // TODO: This message says "Patch check request" even when the
-            // failure is a download or event report.
-            bail!("Patch check request failed due to network error. Please check your internet connection.");
-        }
+        Err(ureq::Error::StatusCode(code)) => Err(NetworkError::Server { status: code }.into()),
+        // Keep ureq's error as the cause, so logs and the failure event say
+        // why the server couldn't be reached (an untrusted certificate, a DNS
+        // failure, a refused connection) instead of only that it couldn't.
+        Err(
+            e @ (ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Io(_)),
+        ) => Err(anyhow::Error::new(e).context(NetworkError::Transport)),
         Err(e) => bail!(e),
+    }
+}
+
+/// Streams a response body into `file`, keeping read and write failures
+/// apart: a body that stops mid-download (the peer disconnected, the
+/// connection timed out) is a network failure, and only a failed write is a
+/// file failure. `std::io::copy` returns both as one `io::Error`, which
+/// reported every dropped connection as "Failed to write to file".
+fn copy_body_to_file(
+    body: &mut impl Read,
+    file: &mut impl Write,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match body.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context(NetworkError::Transport)),
+        };
+        file.write_all(&buf[..n])
+            .with_file_context(FileOperation::WriteFile, dest)?;
     }
 }
 
@@ -222,7 +287,7 @@ pub struct Patch {
 /// Any edits to this struct should be made carefully and in accordance with
 /// the configured update server's privacy policy.
 /// The request body for the patch check endpoint.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct PatchCheckRequest {
     /// The Shorebird app_id built into the shorebird.yaml in the app.
     /// app_ids are unique to each app and are used to identify the app
@@ -242,8 +307,9 @@ pub struct PatchCheckRequest {
     pub platform: String,
     /// Architecture we're running (e.g. "aarch64", "x86", "x86_64").
     pub arch: String,
-    /// The unique ID of this device. This is a random UUID generated by Shorebird and _not_ the
-    /// device's UUID or any other identifier that has meaning outside of Shorebird.
+    /// The anonymous install identifier. A random UUID generated by Shorebird,
+    /// per install rather than per device, and _not_ the device's UUID or any
+    /// other identifier that has meaning outside of Shorebird.
     pub client_id: String,
     /// The number of the patch currently running on the device, if any.
     ///
@@ -253,6 +319,34 @@ pub struct PatchCheckRequest {
     /// this field instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_patch_number: Option<usize>,
+}
+
+/// Hand-written so `client_id` cannot reach a log through a `{:?}` render of
+/// this struct. The field still serializes, since it is part of the patch
+/// check payload the server counts installs from.
+impl std::fmt::Debug for PatchCheckRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a field added to this struct fails to
+        // compile here rather than silently vanishing from the render.
+        let Self {
+            app_id,
+            channel,
+            release_version,
+            platform,
+            arch,
+            client_id: _,
+            current_patch_number,
+        } = self;
+        f.debug_struct("PatchCheckRequest")
+            .field("app_id", app_id)
+            .field("channel", channel)
+            .field("release_version", release_version)
+            .field("platform", platform)
+            .field("arch", arch)
+            .field("client_id", &"<redacted>")
+            .field("current_patch_number", current_patch_number)
+            .finish()
+    }
 }
 
 impl PatchCheckRequest {
@@ -271,6 +365,30 @@ impl PatchCheckRequest {
             current_patch_number,
         }
     }
+
+    /// The fields of this request that are safe to log, in the order
+    /// troubleshooting asks users to read them off the line.
+    ///
+    /// Split out from the log call because `shorebird_info!` expands to
+    /// `println!` under `cfg(test)`, so a test cannot assert what the macro
+    /// emitted. Returning the line lets a test check that `client_id` is
+    /// absent from it.
+    fn log_line(&self) -> String {
+        // Destructured without `..` so a field added to this struct fails to
+        // compile here rather than silently vanishing from the line.
+        let Self {
+            app_id,
+            channel,
+            release_version,
+            platform,
+            arch,
+            client_id: _,
+            current_patch_number,
+        } = self;
+        format!(
+            "app_id: {app_id}, channel: {channel}, release_version: {release_version}, platform: {platform}, arch: {arch}, current_patch_number: {current_patch_number:?}"
+        )
+    }
 }
 
 /// The request body for the create patch install event endpoint.
@@ -279,7 +397,7 @@ impl PatchCheckRequest {
 /// using something like <https://github.com/dtolnay/typetag>.
 #[derive(Debug, Serialize)]
 pub struct CreatePatchEventRequest {
-    event: PatchEvent,
+    pub(crate) event: PatchEvent,
 }
 
 /// A response from the server telling us the latest state of patches for this release.
@@ -329,6 +447,7 @@ pub fn download_to_path(
 #[cfg(test)]
 mod tests {
     use crate::{network::PatchCheckResponse, time};
+    use std::path::Path;
 
     use super::{patches_events_url, PatchEvent};
     use crate::events::EventType;
@@ -357,6 +476,61 @@ mod tests {
     }
 
     #[test]
+    fn patch_check_request_debug_masks_client_id() {
+        let request = super::PatchCheckRequest {
+            app_id: "app_id".to_string(),
+            channel: "stable".to_string(),
+            release_version: "1.0.0+1".to_string(),
+            platform: "android".to_string(),
+            arch: "aarch64".to_string(),
+            client_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            current_patch_number: Some(3),
+        };
+        let debug = format!("{:?}", request);
+        assert!(!debug.contains("11111111-2222-3333-4444-555555555555"));
+        assert!(debug.contains("client_id: \"<redacted>\""));
+        assert!(debug.contains("channel: \"stable\""));
+    }
+
+    #[test]
+    fn patch_check_request_log_line_omits_client_id() {
+        let request = super::PatchCheckRequest {
+            app_id: "app_id".to_string(),
+            channel: "stable".to_string(),
+            release_version: "1.0.0+1".to_string(),
+            platform: "android".to_string(),
+            arch: "aarch64".to_string(),
+            client_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            current_patch_number: Some(3),
+        };
+        // Pinned whole rather than by substring: the docs examples of this
+        // line are matched to it character for character.
+        assert_eq!(
+            request.log_line(),
+            "app_id: app_id, channel: stable, release_version: 1.0.0+1, platform: android, arch: aarch64, current_patch_number: Some(3)"
+        );
+        assert!(!request.log_line().contains("client_id"));
+    }
+
+    #[test]
+    fn patch_check_request_serializes_client_id() {
+        let request = super::PatchCheckRequest {
+            app_id: "app_id".to_string(),
+            channel: "stable".to_string(),
+            release_version: "1.0.0+1".to_string(),
+            platform: "android".to_string(),
+            arch: "aarch64".to_string(),
+            client_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            current_patch_number: Some(3),
+        };
+        let json_string = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json_string,
+            r#"{"app_id":"app_id","channel":"stable","release_version":"1.0.0+1","platform":"android","arch":"aarch64","client_id":"11111111-2222-3333-4444-555555555555","current_patch_number":3}"#
+        );
+    }
+
+    #[test]
     fn create_patch_install_event_request_serializes() {
         let event = PatchEvent {
             app_id: "app_id".to_string(),
@@ -368,6 +542,8 @@ mod tests {
             identifier: EventType::PatchInstallSuccess,
             timestamp: 1234,
             message: None,
+            failure_category: None,
+            event_id: None,
         };
         let request = super::CreatePatchEventRequest { event };
         let json_string = serde_json::to_string(&request).unwrap();
@@ -375,6 +551,30 @@ mod tests {
             json_string,
             r#"{"event":{"app_id":"app_id","arch":"arch","client_id":"client_id","type":"__patch_install__","patch_number":1,"platform":"platform","release_version":"release_version","timestamp":1234,"message":null}}"#
         )
+    }
+
+    #[test]
+    fn create_patch_event_request_serializes_with_failure_category() {
+        // Locks the wire key (`failure_category`) the server reads. When None,
+        // the field is omitted entirely (see the other serialization tests).
+        let event = PatchEvent {
+            app_id: "app_id".to_string(),
+            client_id: "client_id".to_string(),
+            arch: "arch".to_string(),
+            patch_number: 1,
+            platform: "platform".to_string(),
+            release_version: "release_version".to_string(),
+            identifier: EventType::PatchUpdateFailure,
+            timestamp: 1234,
+            message: Some("update_failure: patch 1 failed (...)".to_string()),
+            failure_category: Some("network".to_string()),
+            event_id: None,
+        };
+        let json_string = serde_json::to_string(&event).unwrap();
+        assert!(
+            json_string.contains(r#""failure_category":"network""#),
+            "expected failure_category in: {json_string}"
+        );
     }
 
     #[test]
@@ -389,6 +589,8 @@ mod tests {
             identifier: EventType::PatchInstallSuccess,
             timestamp: 1234,
             message: Some("hello".to_string()),
+            failure_category: None,
+            event_id: None,
         };
         let request = super::CreatePatchEventRequest { event };
         let json_string = serde_json::to_string(&request).unwrap();
@@ -461,7 +663,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Patch check request failed due to network error. Please check your internet connection."
+            "Network request failed; the server could not be reached."
         );
     }
 
@@ -488,6 +690,104 @@ mod tests {
     }
 
     #[test]
+    fn handle_network_result_keeps_transport_cause() {
+        // What ureq reports when a TLS-inspecting proxy presents a root that
+        // isn't in the updater's trust store.
+        let io = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        );
+        let err = super::handle_network_result(Err(ureq::Error::Io(io))).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<super::NetworkError>(),
+            Some(&super::NetworkError::Transport)
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "Network request failed; the server could not be reached.: \
+             io: invalid peer certificate: UnknownIssuer"
+        );
+    }
+
+    /// A body that yields `data`, then fails the way ureq does when the
+    /// server drops the connection mid-download.
+    struct DroppedBody<'a> {
+        data: &'a [u8],
+    }
+
+    impl std::io::Read for DroppedBody<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.data.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Peer disconnected",
+                ));
+            }
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// A file whose writes fail because the disk is full.
+    struct FullDisk;
+
+    impl std::io::Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn copy_body_to_file_copies_whole_body() {
+        let mut out = Vec::new();
+        super::copy_body_to_file(&mut &b"patch bytes"[..], &mut out, Path::new("dest")).unwrap();
+        assert_eq!(out, b"patch bytes");
+    }
+
+    #[test]
+    fn copy_body_to_file_dropped_connection_is_network() {
+        let mut out = Vec::new();
+        let err = super::copy_body_to_file(
+            &mut DroppedBody { data: b"partial" },
+            &mut out,
+            Path::new("dest"),
+        )
+        .unwrap_err();
+
+        // The bytes before the drop are kept, so the next attempt resumes.
+        assert_eq!(out, b"partial");
+        assert_eq!(
+            crate::updater::classify_failure(&err),
+            crate::updater::FailureCategory::Network
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "Network request failed; the server could not be reached.: Peer disconnected"
+        );
+    }
+
+    #[test]
+    fn copy_body_to_file_write_failure_is_file_error() {
+        let err =
+            super::copy_body_to_file(&mut &b"patch bytes"[..], &mut FullDisk, Path::new("dest"))
+                .unwrap_err();
+
+        assert_eq!(
+            crate::updater::classify_failure(&err),
+            crate::updater::FailureCategory::OutOfSpace
+        );
+        assert!(err
+            .to_string()
+            .starts_with("Failed to write to file 'dest'"));
+    }
+
+    #[test]
     fn handle_network_result_no_internet() {
         let event = PatchEvent {
             app_id: "app_id".to_string(),
@@ -499,6 +799,8 @@ mod tests {
             identifier: EventType::PatchInstallSuccess,
             timestamp: time::unix_timestamp(),
             message: None,
+            failure_category: None,
+            event_id: None,
         };
         let result = super::report_event_default(
             // Make the request to a non-existent URL, which will trigger the
@@ -509,7 +811,10 @@ mod tests {
 
         assert!(result.is_err());
         let error = result.err().unwrap();
-        assert_eq!(error.to_string(), "Patch check request failed due to network error. Please check your internet connection.")
+        assert_eq!(
+            error.to_string(),
+            "Network request failed; the server could not be reached."
+        )
     }
 
     #[test]
@@ -529,6 +834,8 @@ mod tests {
                     identifier: EventType::PatchInstallSuccess,
                     timestamp: time::unix_timestamp(),
                     message: None,
+                    failure_category: None,
+                    event_id: None,
                 },
             },
         );

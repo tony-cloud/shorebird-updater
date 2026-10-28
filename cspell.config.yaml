@@ -39,6 +39,7 @@ words:
   - dllexport
   - dlopen
   - dorny
+  - downcastable
   - downloadables
   - EACCES
   - EDQUOT
@@ -71,6 +72,7 @@ words:
   - pubspec
   - repr
   - reqwest
+  - retryability
   - rlib
   - roundtrips
   - rsplit
@@ -101,6 +103,7 @@ words:
   - taiki
   - Verdana
   - vmcode
+  - webpki
   - withf
   - xlink
   - zstandard

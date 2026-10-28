@@ -4,13 +4,14 @@ use std::fmt::{Debug, Display, Formatter};
 use std::fs::{self};
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
+use std::sync::Mutex;
 // PathBuf is only used by `libapp_path_from_settings`, which is itself
 // gated to non-android, non-test builds.
 #[cfg(not(any(target_os = "android", test)))]
 use std::path::PathBuf;
 
 use crate::file_errors::{FileOperation, IoResultExt};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use dyn_clone::DynClone;
 
 use crate::cache::lifecycle::{self, BadReason, DownloadAction, SkipReason};
@@ -98,6 +99,14 @@ pub enum UpdateError {
     FailedToSaveState,
     ConfigNotInitialized,
     UpdateAlreadyInProgress,
+    /// A patch was downloaded but could not be turned into a usable artifact:
+    /// its bytes failed to decompress, or the installed result did not match
+    /// the expected hash. Distinct from a transient download failure — this is
+    /// deterministic for the given patch on this device.
+    CorruptPatch,
+    /// The offered patch's signature was missing or did not verify against
+    /// the app's configured `patch_public_key`.
+    InvalidSignature,
 }
 
 impl std::error::Error for UpdateError {}
@@ -112,8 +121,115 @@ impl Display for UpdateError {
             UpdateError::UpdateAlreadyInProgress => {
                 write!(f, "Update already in progress")
             }
+            UpdateError::CorruptPatch => write!(f, "Downloaded patch was invalid"),
+            UpdateError::InvalidSignature => write!(f, "Patch signature could not be verified"),
         }
     }
+}
+
+/// A coarse, stable classification of an update failure.
+///
+/// This is internal enabling work for the categorized-failure surface planned
+/// in the `shorebird_code_push` v3 PRD (Change #7: a sealed
+/// `Failed{category, code, retryable}` with telemetry-stable `code` strings).
+/// It is deliberately kept *off* the C ABI for now: the FFI already flattens
+/// every failure to `SHOREBIRD_UPDATE_ERROR`, and v3 will expose categories via
+/// a new structured-result symbol rather than by overloading the existing one
+/// (which the PRD rules out as a transitional shape). Today this is consumed
+/// only to enrich the server-bound failure diagnostic event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCategory {
+    /// Never reached the server (offline, DNS, connection, transport IO).
+    Network,
+    /// The server was reached but responded with an error, or the response was
+    /// unusable.
+    Server,
+    /// The device is out of storage.
+    OutOfSpace,
+    /// The updater lacks a filesystem permission it needs.
+    PermissionDenied,
+    /// A filesystem error that is neither out-of-space nor permission-related.
+    Filesystem,
+    /// A downloaded patch failed to decompress or did not match its hash.
+    CorruptPatch,
+    /// The offered patch's signature was missing or did not verify.
+    InvalidSignature,
+    /// Not yet classified.
+    Unknown,
+}
+
+impl FailureCategory {
+    /// A short, stable identifier safe to use as a telemetry key. These strings
+    /// are a contract with our dashboards — treat them as append-only.
+    pub fn code(self) -> &'static str {
+        match self {
+            FailureCategory::Network => "network",
+            FailureCategory::Server => "server",
+            FailureCategory::OutOfSpace => "out_of_space",
+            FailureCategory::PermissionDenied => "permission_denied",
+            FailureCategory::Filesystem => "filesystem",
+            FailureCategory::CorruptPatch => "corrupt_patch",
+            FailureCategory::InvalidSignature => "invalid_signature",
+            FailureCategory::Unknown => "unknown",
+        }
+    }
+
+    /// Whether retrying the update later is likely to succeed without any user
+    /// or developer intervention. Transient (network/server) failures are
+    /// retryable and auto-retried on the next launch; local-state failures are
+    /// not. This is the signal behind v3's customer-facing `retryable` axis.
+    pub fn retryable(self) -> bool {
+        match self {
+            FailureCategory::Network | FailureCategory::Server => true,
+            FailureCategory::OutOfSpace
+            | FailureCategory::PermissionDenied
+            | FailureCategory::Filesystem
+            | FailureCategory::CorruptPatch
+            | FailureCategory::InvalidSignature => false,
+            // Be conservative: an unclassified failure might be transient. A
+            // genuinely permanent one will simply fail again and re-report.
+            FailureCategory::Unknown => true,
+        }
+    }
+}
+
+/// Classifies an update failure by walking the `anyhow` error chain for the
+/// typed errors our origins attach. A failed request is always `Network` or
+/// `Server`. Otherwise unambiguous OS error kinds win regardless of which
+/// layer raised them, so e.g. a disk-full while inflating a patch is reported
+/// as `OutOfSpace` rather than `CorruptPatch`.
+pub fn classify_failure(err: &anyhow::Error) -> FailureCategory {
+    // A failed request is a network failure, even when its cause is an OS
+    // error such as PermissionDenied (Android without the INTERNET
+    // permission), which step 1 would otherwise claim.
+    if let Some(net) = err.downcast_ref::<crate::network::NetworkError>() {
+        return match net {
+            crate::network::NetworkError::Server { .. } => FailureCategory::Server,
+            crate::network::NetworkError::Transport => FailureCategory::Network,
+        };
+    }
+    // 1. Unambiguous OS error kinds, wherever in the chain they occurred.
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        match io.kind() {
+            std::io::ErrorKind::StorageFull => return FailureCategory::OutOfSpace,
+            std::io::ErrorKind::PermissionDenied => return FailureCategory::PermissionDenied,
+            _ => {}
+        }
+    }
+    // 2. Our own typed errors.
+    if let Some(update_err) = err.downcast_ref::<UpdateError>() {
+        return match update_err {
+            UpdateError::BadServerResponse => FailureCategory::Server,
+            UpdateError::CorruptPatch => FailureCategory::CorruptPatch,
+            UpdateError::InvalidSignature => FailureCategory::InvalidSignature,
+            _ => FailureCategory::Unknown,
+        };
+    }
+    // 3. Any remaining IO error is a generic filesystem problem.
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        return FailureCategory::Filesystem;
+    }
+    FailureCategory::Unknown
 }
 
 // `AppConfig` is the rust API.
@@ -129,7 +245,7 @@ pub struct AppConfig {
 pub trait ReadSeek: Read + Seek {}
 
 /// Provides an interface to get an opaque ReadSeek object for a given path.
-/// This is used to provide a way to read the patch base file on iOS.
+/// This is used to provide a way to read the patch base file on iOS and macOS.
 pub trait ExternalFileProvider: Debug + Send + DynClone {
     fn open(&self) -> anyhow::Result<Box<dyn ReadSeek>>;
 }
@@ -316,9 +432,12 @@ pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bo
 
     if let Some(patch) = response.patch {
         let action = with_state(|state| {
-            Ok(state
-                .lifecycle()
-                .decide_start(patch.number, &patch.download_url, &patch.hash))
+            Ok(state.lifecycle().decide_start(
+                patch.number,
+                &patch.download_url,
+                &patch.hash,
+                patch.hash_signature.as_deref(),
+            ))
         })?;
         Ok(matches!(
             action,
@@ -341,15 +460,14 @@ fn check_hash(path: &Path, expected_string: &str) -> anyhow::Result<()> {
     // A hash mismatch usually means the same version number was reused with a
     // different app binary.
     if !hash_matches {
-        bail!(
+        // Tag as `CorruptPatch` (via context) so the failure classifier can
+        // categorize it; the detailed, developer-facing message is preserved.
+        return Err(UpdateError::CorruptPatch).context(format!(
             "Update rejected: hash mismatch. Update was downloaded but \
             contents did not match the expected hash. This is most often \
             caused by using the same version number with a different app \
-            binary. Path: {:?}, expected: {}, got: {}",
-            path,
-            expected_string,
-            hash
-        );
+            binary. Path: {path:?}, expected: {expected_string}, got: {hash}"
+        ));
     }
     shorebird_debug!("Hash match: {:?}", path);
     Ok(())
@@ -364,12 +482,43 @@ fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     crate::android::open_base_lib(&config.libapp_path, "libapp.so")
 }
 
-#[cfg(target_os = "ios")]
+// On Apple platforms the engine supplies the base: just the Dart snapshot
+// regions of the app binary, which patches are diffed against. The rest of the
+// binary (Mach-O headers, code signature) can change after release, e.g. when
+// the app is re-signed for notarization or the Mac App Store.
+#[cfg(all(not(test), target_os = "ios"))]
 fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     config.file_provider.open()
 }
 
-#[cfg(all(not(test), not(target_os = "ios"), not(target_os = "android")))]
+#[cfg(all(not(test), target_os = "macos"))]
+fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+    macos_patch_base(config.file_provider.open(), &config.libapp_path)
+}
+
+/// macOS engines from before they served the Dart snapshot base fail to open
+/// one, and the CLI diffs their patches against the whole App.framework/App,
+/// so fall back to that file. Remove once every engine with this updater
+/// serves the base.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_patch_base(
+    engine_base: anyhow::Result<Box<dyn ReadSeek>>,
+    libapp_path: &Path,
+) -> anyhow::Result<Box<dyn ReadSeek>> {
+    if let Ok(base) = engine_base {
+        return Ok(base);
+    }
+    let file =
+        fs::File::open(libapp_path).with_file_context(FileOperation::ReadFile, libapp_path)?;
+    Ok(Box::new(file))
+}
+
+#[cfg(all(
+    not(test),
+    not(target_os = "ios"),
+    not(target_os = "macos"),
+    not(target_os = "android")
+))]
 fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     let file = fs::File::open(&config.libapp_path)
         .with_file_context(FileOperation::ReadFile, &config.libapp_path)?;
@@ -405,23 +554,12 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
         config.channel = channel.to_string();
     }
 
-    // We discard any events if we have more than 3 queued to make sure
-    // we don't stall the client.
-    let events = with_state(|state| Ok(state.copy_events(3)))?;
-    for event in events {
-        let result = crate::network::send_patch_event(event, &config);
-        if let Err(err) = result {
-            shorebird_error!("Failed to report event: {:?}", err);
-        }
+    // A flush already running (one started at launch) covers the queue;
+    // don't hold up the patch check behind its network request.
+    if let Ok(flush) = EVENT_FLUSH_LOCK.try_lock() {
+        send_queued_events(&flush);
     }
-    let request = with_mut_state(|state| {
-        // This will clear any events which got queued between the time we
-        // loaded the state now, but that's OK for now.
-        let result = state.clear_events();
-        if let Err(err) = result {
-            shorebird_error!("Failed to clear events: {:?}", err);
-        }
-        // Update our outer state with the new state.
+    let request = with_state(|state| {
         Ok(PatchCheckRequest::new(
             &config,
             &state.client_id(),
@@ -445,9 +583,12 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     let patch = response.patch.ok_or(UpdateError::BadServerResponse)?;
 
     let action = with_state(|state| {
-        Ok(state
-            .lifecycle()
-            .decide_start(patch.number, &patch.download_url, &patch.hash))
+        Ok(state.lifecycle().decide_start(
+            patch.number,
+            &patch.download_url,
+            &patch.hash,
+            patch.hash_signature.as_deref(),
+        ))
     })?;
     match action {
         DownloadAction::Skip(SkipReason::KnownBad) => {
@@ -468,18 +609,17 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
         // Queue a diagnostic event for the failed update attempt.
         // This captures download failures, inflate errors, hash mismatches,
         // and install failures — all of which are otherwise invisible.
-        let message = format!(
-            "update_failure: patch {} failed ({})",
-            patch_number,
-            truncate_error_message(err)
-        );
+        // The category is sent as a structured field (not baked into the
+        // message string) so the server can consume it directly; it is derived
+        // here rather than over the FFI, so we get categorized failure
+        // reporting with no C ABI change.
         let queue_result = with_mut_state(|state| {
-            state.queue_event(PatchEvent::new(
+            state.queue_event(update_failure_event(
                 &config,
-                EventType::PatchUpdateFailure,
-                patch_number,
                 state.client_id(),
-                Some(&message),
+                "update_failure",
+                patch_number,
+                err,
             ))
         });
         if let Err(queue_err) = queue_result {
@@ -490,15 +630,228 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     result
 }
 
+/// The most queued events one flush sends, so a backlog doesn't hold up the
+/// patch check that follows it in `update()`; the rest go on later flushes.
+const MAX_EVENTS_PER_FLUSH: usize = 3;
+
+/// Held while a flush runs, so two flushes (the update thread and one after
+/// a launch) don't send the same queued event twice.
+static EVENT_FLUSH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Flushes started by [`spawn_event_flush`] that may still be running. Tests
+/// wait on them so a flush can't reach into the next test's state.
+#[cfg(any(test, feature = "test-hooks"))]
+static EVENT_FLUSH_THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Sends queued events, oldest first, removing each once the server answers
+/// 2xx. Stops at the first event the server couldn't take (offline, 5xx,
+/// most 4xx), leaving it and the rest queued for the next flush. An event the
+/// server refuses (see [`is_refused_event`]) is dropped: sending it again
+/// gets the same answer, and keeping it would block every event behind it.
+///
+/// Must not be called with the config lock held: it takes it to read and
+/// write the queue, and releases it while sending.
+fn flush_queued_events() {
+    let flush = EVENT_FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    send_queued_events(&flush);
+}
+
+/// The body of [`flush_queued_events`], for a caller already holding
+/// [`EVENT_FLUSH_LOCK`].
+fn send_queued_events(_flush: &std::sync::MutexGuard<'_, ()>) {
+    let Ok(config) = copy_update_config() else {
+        return;
+    };
+    let events = match with_state(|state| Ok(state.copy_events(MAX_EVENTS_PER_FLUSH))) {
+        Ok(events) => events,
+        Err(err) => {
+            shorebird_error!("Failed to read queued events: {:?}", err);
+            return;
+        }
+    };
+    for event in events {
+        match crate::network::send_patch_event(event.clone(), &config) {
+            Ok(()) => {}
+            Err(err) if is_refused_event(&err) => {
+                shorebird_error!("Server refused event, dropping it: {:?}", err);
+            }
+            Err(err) => {
+                shorebird_error!("Failed to report event, will retry: {:?}", err);
+                return;
+            }
+        }
+        if let Err(err) = with_mut_state(|state| state.remove_event(&event)) {
+            shorebird_error!("Failed to remove sent event: {:?}", err);
+            return;
+        }
+    }
+}
+
+/// True when the server refused the event itself (400, 413, 422), so sending
+/// it again gets the same answer. Other 4xx (401, 403, 404, 407) usually come
+/// from a proxy or a server deployed wrong rather than the event, so the event
+/// is kept.
+fn is_refused_event(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::network::NetworkError>(),
+            Some(crate::network::NetworkError::Server {
+                status: 400 | 413 | 422
+            })
+        )
+    })
+}
+
+/// Runs [`flush_queued_events`] on its own thread, so the caller doesn't wait
+/// on the network. Unit tests run it inline instead, so what a test reads
+/// from the queue never depends on how far a flush thread has got.
+fn spawn_event_flush() {
+    if cfg!(test) {
+        flush_queued_events();
+        return;
+    }
+    // Builder rather than thread::spawn, which panics (aborting the app)
+    // when the OS won't make a thread.
+    let handle = match std::thread::Builder::new().spawn(flush_queued_events) {
+        Ok(handle) => handle,
+        Err(err) => {
+            shorebird_error!("Failed to start event flush: {:?}", err);
+            return;
+        }
+    };
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    drop(handle);
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let mut threads = EVENT_FLUSH_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        threads.retain(|thread| !thread.is_finished());
+        threads.push(handle);
+    }
+}
+
+/// Queues `event` for the next flush. If the queue can't be saved (a full
+/// disk), sends `event` once on its own thread instead, as the updater did
+/// before it queued installs and downloads, rather than losing it.
+fn queue_or_send_event(state: &mut UpdaterState, config: &UpdateConfig, event: PatchEvent) {
+    if let Err(err) = state.queue_event(event.clone()) {
+        shorebird_error!("Failed to queue event, sending it once: {:?}", err);
+        let config = config.clone();
+        let spawned = std::thread::Builder::new().spawn(move || {
+            if let Err(err) = crate::network::send_patch_event(event, &config) {
+                shorebird_error!("Failed to report event: {:?}", err);
+            }
+        });
+        if let Err(err) = spawned {
+            shorebird_error!("Failed to start event send: {:?}", err);
+        }
+    }
+}
+
+/// Waits for every flush [`spawn_event_flush`] started.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn testing_wait_for_event_flushes() {
+    let threads: Vec<_> = EVENT_FLUSH_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
+    for thread in threads {
+        let _ = thread.join();
+    }
+}
+
+/// A `PatchUpdateFailure` event for `err`, its message prefixed with
+/// `context` (`update_failure`, `boot_validation`) and its category from
+/// [`classify_failure`].
+fn update_failure_event(
+    config: &UpdateConfig,
+    client_id: String,
+    context: &str,
+    patch_number: usize,
+    err: &anyhow::Error,
+) -> PatchEvent {
+    let message = format!(
+        "{context}: patch {patch_number} failed ({})",
+        event_error_message(err, config)
+    );
+    let mut event = PatchEvent::new(
+        config,
+        EventType::PatchUpdateFailure,
+        patch_number,
+        client_id,
+        Some(&message),
+    );
+    event.failure_category = Some(classify_failure(err).code().to_string());
+    event
+}
+
+/// Formats an error for an event's message: paths under the updater's own
+/// directories are made relative to them, then the result is truncated.
+fn event_error_message(err: &anyhow::Error, config: &UpdateConfig) -> String {
+    truncate_error_message(&relativize_paths(&format!("{:#}", err), config))
+}
+
+/// Replaces the absolute directories the updater works in with placeholders,
+/// so `/var/mobile/Containers/Data/Application/<uuid>/Library/.../patches/1`
+/// is reported as `<storage>/patches/1`. Those prefixes carry the Windows
+/// user name and the iOS container id, which are identifying and say nothing
+/// about why the update failed.
+fn relativize_paths(msg: &str, config: &UpdateConfig) -> String {
+    let mut roots: Vec<(&Path, &str)> = vec![(config.storage_dir.as_path(), "<storage>")];
+    if let Some(code_cache_dir) = config.download_dir.parent() {
+        roots.push((code_cache_dir, "<code_cache>"));
+    }
+    // On Android `libapp_path` is already the APK directory (see
+    // `libapp_path_from_settings`); elsewhere it is the libapp file.
+    let app_dir = if cfg!(target_os = "android") {
+        Some(config.libapp_path.as_path())
+    } else {
+        config.libapp_path.parent()
+    };
+    if let Some(app_dir) = app_dir {
+        roots.push((app_dir, "<app>"));
+    }
+    // Longest first, so a directory nested in another is replaced whole.
+    roots.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+
+    let mut msg = msg.to_string();
+    for (root, placeholder) in roots {
+        // A filesystem root prefixes everything, and a relative path (".")
+        // can match text that isn't a path at all.
+        if !root.is_absolute() || root.parent().is_none() {
+            continue;
+        }
+        // Paths reach messages both through Display and through Debug, which
+        // escapes (e.g. Windows backslashes become `\\`).
+        let displayed = root.display().to_string();
+        let debugged = format!("{:?}", root);
+        let debugged = debugged
+            .strip_prefix('"')
+            .and_then(|d| d.strip_suffix('"'))
+            .unwrap_or(&debugged);
+        msg = msg.replace(&displayed, placeholder);
+        if debugged != displayed {
+            msg = msg.replace(debugged, placeholder);
+        }
+    }
+    msg
+}
+
 /// Truncates an error message to a reasonable length for the event payload.
 /// Avoids sending excessively long messages while preserving the root cause.
-fn truncate_error_message(err: &anyhow::Error) -> String {
-    let msg = format!("{:#}", err);
-    if msg.len() > 256 {
-        format!("{}...", &msg[..253])
-    } else {
-        msg
+fn truncate_error_message(msg: &str) -> String {
+    const MAX_LEN: usize = 256;
+    if msg.len() <= MAX_LEN {
+        return msg.to_string();
     }
+    // Cut on a char boundary: slicing inside a multi-byte character panics.
+    let mut end = MAX_LEN - 3;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &msg[..end])
 }
 
 fn download_and_install_patch(
@@ -506,6 +859,34 @@ fn download_and_install_patch(
     patch: &crate::network::Patch,
     action: DownloadAction,
 ) -> anyhow::Result<UpdateStatus> {
+    // Verify the signature before anything is fetched, in every mode: it
+    // covers `patch.hash`, and the post-inflate hash check ties the
+    // installed bytes to that hash, so an unverifiable offer never reaches
+    // the network, the inflater or the lifecycle's install path. Strict
+    // mode re-verifies the installed artifact on every boot as well. The
+    // refused pair is tombstoned so later checks skip it quietly rather
+    // than re-reporting it on every launch.
+    if let Err(e) = crate::cache::check_patch_signature(
+        &patch.hash,
+        patch.hash_signature.as_deref(),
+        config.patch_public_key.as_deref(),
+    ) {
+        if let Err(state_err) = with_mut_state(|state| {
+            state.lifecycle_mut().record_signature_refused(
+                patch.number,
+                &patch.hash,
+                patch.hash_signature.as_deref(),
+            )
+        }) {
+            shorebird_error!(
+                "Failed to record signature refusal for patch {}: {:?}",
+                patch.number,
+                state_err
+            );
+        }
+        return Err(e.context(UpdateError::InvalidSignature));
+    }
+
     shorebird_info!(
         "Downloading patch {} for app {} (version {})",
         patch.number,
@@ -555,11 +936,12 @@ fn download_and_install_patch(
         if let Some(expected) = dl_result.content_length {
             if dl_result.total_bytes != expected {
                 let _ = with_mut_state(|state| state.uninstall_patch(patch.number));
-                bail!(
-                    "Download size mismatch: expected {} bytes, got {}",
-                    expected,
+                // Server declared a Content-Length it did not deliver: a server
+                // contract violation, tagged so the classifier reports `Server`.
+                return Err(UpdateError::BadServerResponse).context(format!(
+                    "Download size mismatch: expected {expected} bytes, got {}",
                     dl_result.total_bytes
-                );
+                ));
             }
         }
 
@@ -596,6 +978,9 @@ fn install_downloaded_patch(
     let patch_base_rs = patch_base(config)?;
     if let Err(e) = inflate(download_path, patch_base_rs, &installed_path) {
         // Inflate failed — bytes won't decompress. Deterministically bad.
+        // The error is returned as-is (message-preserving): content problems are
+        // already tagged `CorruptPatch` inside `validate_compressed_patch`, and a
+        // disk-full/permission IO cause stays downcastable for classification.
         mark_patch_bad(patch.number, BadReason::InvalidPatchBytes);
         return Err(e);
     }
@@ -626,24 +1011,18 @@ fn install_downloaded_patch(
             patch.number
         );
 
-        let client_id = state.client_id();
-        let config_clone = config.clone();
-        let patch_number = patch.number;
-        std::thread::spawn(move || {
-            let event = PatchEvent::new(
-                &config_clone,
-                EventType::PatchDownload,
-                patch_number,
-                client_id,
-                None,
-            );
-            if let Err(err) = crate::network::send_patch_event(event, &config_clone) {
-                shorebird_error!("Failed to report patch download: {:?}", err);
-            }
-        });
-
-        Ok(UpdateStatus::UpdateInstalled)
-    })
+        let event = PatchEvent::new(
+            config,
+            EventType::PatchDownload,
+            patch.number,
+            state.client_id(),
+            None,
+        );
+        queue_or_send_event(state, config, event);
+        Ok(())
+    })?;
+    spawn_event_flush();
+    Ok(UpdateStatus::UpdateInstalled)
 }
 
 /// Marks `patch_number` Bad{reason} and recomputes `next_boot_patch`.
@@ -702,16 +1081,19 @@ fn validate_compressed_patch(patch_path: &Path) -> anyhow::Result<()> {
     let metadata =
         fs::metadata(patch_path).with_file_context(FileOperation::GetMetadata, patch_path)?;
     let size = metadata.len();
+    // These are content-corruption failures: the bytes we received are not a
+    // usable patch. Tag each as `CorruptPatch` (as an inner marker, via
+    // `.context`) so the failure classifier can categorize it while the
+    // detailed, developer-facing message stays the top-level `Display`.
     if size == 0 {
-        bail!("Downloaded patch file is empty: {:?}", patch_path);
+        return Err(UpdateError::CorruptPatch)
+            .context(format!("Downloaded patch file is empty: {patch_path:?}"));
     }
     // A valid zstd frame is at least 4 bytes (magic number).
     if size < 4 {
-        bail!(
-            "Downloaded patch file is too small ({} bytes) to be a valid zstd archive: {:?}",
-            size,
-            patch_path
-        );
+        return Err(UpdateError::CorruptPatch).context(format!(
+            "Downloaded patch file is too small ({size} bytes) to be a valid zstd archive: {patch_path:?}"
+        ));
     }
     let mut file =
         fs::File::open(patch_path).with_file_context(FileOperation::ReadFile, patch_path)?;
@@ -719,13 +1101,10 @@ fn validate_compressed_patch(patch_path: &Path) -> anyhow::Result<()> {
     file.read_exact(&mut magic)
         .with_file_context(FileOperation::ReadFile, patch_path)?;
     if magic != ZSTD_MAGIC {
-        bail!(
+        return Err(UpdateError::CorruptPatch).context(format!(
             "Downloaded patch file does not have valid zstd magic bytes \
-            (expected {:02x?}, got {:02x?}). The download may be corrupt: {:?}",
-            ZSTD_MAGIC,
-            magic,
-            patch_path
-        );
+            (expected {ZSTD_MAGIC:02x?}, got {magic:02x?}). The download may be corrupt: {patch_path:?}"
+        ));
     }
     Ok(())
 }
@@ -1074,9 +1453,37 @@ where
 /// will be deleted and the next boot patch will be set to the last successfully booted patch or
 /// the base release if there is no last successfully booted patch.
 ///
-/// Returns an error if the patch fails integrity checks.
+/// Returns an error if the patch fails integrity checks, after queueing a
+/// `PatchUpdateFailure` event for it (`invalid_signature` when Strict mode's
+/// signature check refused it), since the engine then boots without it and
+/// nothing else would report why.
 pub fn validate_next_boot_patch() -> anyhow::Result<()> {
-    with_mut_state(|state| state.validate_next_boot_patch())
+    with_config(|config| {
+        let mut state = UpdaterState::load_or_new_on_error(
+            &config.storage_dir,
+            &config.download_dir,
+            &config.release_version,
+            config.patch_public_key.as_deref(),
+            config.patch_verification,
+        );
+        let Some(patch_number) = state.next_boot_patch().map(|p| p.number) else {
+            return Ok(());
+        };
+        let result = state.validate_next_boot_patch();
+        if let Err(ref err) = result {
+            let event = update_failure_event(
+                config,
+                state.client_id(),
+                "boot_validation",
+                patch_number,
+                err,
+            );
+            if let Err(queue_err) = state.queue_event(event) {
+                shorebird_error!("Failed to queue boot validation event: {:?}", queue_err);
+            }
+        }
+        result
+    })
 }
 
 /// The patch which will be run on next boot (which may still be the same
@@ -1137,6 +1544,9 @@ pub fn report_launch_failure() -> anyhow::Result<()> {
         if mark_result.is_err() {
             shorebird_error!("Failed to mark patch as bad: {:?}", mark_result);
         }
+        // The engine boots base code after a patch fails to load, so the
+        // patch check this launch sends must not name the failed patch.
+        state.set_running_patch(None);
         let client_id = state.client_id();
         let message = format!("engine_report: patch {} failed to launch", patch.number);
         let event = PatchEvent::new(
@@ -1155,7 +1565,7 @@ pub fn report_launch_failure() -> anyhow::Result<()> {
 pub fn report_launch_success() -> anyhow::Result<()> {
     shorebird_info!("Reporting successful launch.");
 
-    with_config(|config| {
+    let has_events = with_config(|config| {
         // We can tell the UpdaterState that we have successfully booted from the "next" patch
         // and make that the "current" patch.
         let mut state = UpdaterState::load_or_new_on_error(
@@ -1166,55 +1576,43 @@ pub fn report_launch_success() -> anyhow::Result<()> {
             config.patch_verification,
         );
 
-        let booting_patch = match state.currently_booting_patch() {
-            Some(patch) => patch,
+        // None means we didn't boot from a patch, so there's nothing to record.
+        if let Some(booting_patch) = state.currently_booting_patch() {
+            // Get the last successfully booted patch before we record the boot success.
+            let previous_boot_patch = state.last_successfully_booted_patch();
 
-            // We didn't boot from a patch, so there's nothing to do.
-            None => return Ok(()),
-        };
+            state.record_boot_success()?;
 
-        // Get the last successfully booted patch before we record the boot success.
-        let maybe_previous_boot_patch = state.last_successfully_booted_patch();
-
-        state.record_boot_success()?;
-
-        // Check whether last_successfully_booted_patch has changed. If so, we should report a
-        // PatchInstallSuccess event.
-        if let (Some(previous_boot_patch), Some(latest_boot_patch)) = (
-            maybe_previous_boot_patch,
-            state.last_successfully_booted_patch(),
-        ) {
-            // If we had previously booted from a patch and it has the same number as the
-            // patch we just booted from, then we shouldn't report a patch install.
-            if previous_boot_patch.number == latest_boot_patch.number {
-                return Ok(());
+            // A patch counts as installed the first time it boots, so a boot
+            // of the patch that last booted (including after a newer patch
+            // failed and we fell back to it) reports nothing.
+            if previous_boot_patch.map(|p| p.number) != Some(booting_patch.number) {
+                let event = PatchEvent::new(
+                    config,
+                    EventType::PatchInstallSuccess,
+                    booting_patch.number,
+                    state.client_id(),
+                    None,
+                );
+                queue_or_send_event(&mut state, config, event);
             }
         }
+        Ok(!state.copy_events(1).is_empty())
+    })?;
 
-        let config_copy = config.clone();
-        let client_id = state.client_id();
-        std::thread::spawn(move || {
-            let event = PatchEvent::new(
-                &config_copy,
-                EventType::PatchInstallSuccess,
-                booting_patch.number,
-                client_id,
-                None,
-            );
-            let report_result = crate::network::send_patch_event(event, &config_copy);
-            if let Err(err) = report_result {
-                shorebird_error!("Failed to report successful patch install: {:?}", err);
-            }
-        });
-
-        Ok(())
-    })
+    // Every launch sends what's queued, so events reach the server even when
+    // the app never calls update() (auto_update off).
+    if has_events {
+        spawn_event_flush();
+    }
+    Ok(())
 }
 
 /// This does not return status.  The only output is the change to the saved
 /// cache. The Engine calls this during boot and it will check for an update
-/// and install it if available.
-pub fn start_update_thread() {
+/// and install it if available. Returns the thread's handle, which the engine
+/// drops and tests join.
+pub fn start_update_thread() -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = update(None);
         let status = match result {
@@ -1225,23 +1623,26 @@ pub fn start_update_thread() {
             }
         };
         shorebird_info!("Update thread finished with status: {}", status);
-    });
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
+    use std::fs;
     use std::path::Path;
-    use std::{fs, thread, time::Duration};
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     use crate::{
         cache::UpdaterState,
         config::{testing_reset_config, with_config},
         events::EventType,
-        network::{testing_set_network_hooks, NetworkHooks, PatchCheckResponse},
+        network::{
+            testing_set_network_hooks, CreatePatchEventRequest, NetworkHooks, PatchCheckResponse,
+        },
         test_utils::{install_fake_patch, write_fake_apk},
-        time, with_state, ExternalFileProvider, Patch,
+        with_state, ExternalFileProvider, Patch,
     };
 
     #[derive(Debug, Clone)]
@@ -1253,12 +1654,19 @@ mod tests {
     }
 
     pub fn init_for_testing(tmp_dir: &TempDir, base_url: Option<&str>) {
+        init_for_testing_with_yaml(tmp_dir, base_url, "");
+    }
+
+    /// Like [`init_for_testing`], with `extra_yaml` appended to the
+    /// shorebird.yaml (e.g. `patch_public_key` / `patch_verification`).
+    pub fn init_for_testing_with_yaml(tmp_dir: &TempDir, base_url: Option<&str>, extra_yaml: &str) {
         testing_reset_config();
         let cache_dir = tmp_dir.path().to_str().unwrap().to_string();
         let mut yaml = "app_id: 1234".to_string();
         if let Some(url) = base_url {
             yaml += &format!("\nbase_url: {}", url);
         }
+        yaml += extra_yaml;
 
         let libapp_path = tmp_dir
             .path()
@@ -1405,6 +1813,45 @@ mod tests {
         })?;
 
         Ok(())
+    }
+
+    #[test]
+    fn macos_patch_base_prefers_engine_base() {
+        let tmp_dir = TempDir::new().unwrap();
+        let libapp_path = tmp_dir.path().join("App");
+        std::fs::write(&libapp_path, b"whole binary").unwrap();
+        let engine_base: Box<dyn crate::ReadSeek> =
+            Box::new(std::io::Cursor::new(b"dart regions".to_vec()));
+
+        let mut base = super::macos_patch_base(Ok(engine_base), &libapp_path).unwrap();
+        let mut contents = Vec::new();
+        base.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"dart regions");
+    }
+
+    #[test]
+    fn macos_patch_base_falls_back_to_whole_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let libapp_path = tmp_dir.path().join("App");
+        std::fs::write(&libapp_path, b"whole binary").unwrap();
+
+        let mut base =
+            super::macos_patch_base(Err(anyhow::anyhow!("CFile open failed")), &libapp_path)
+                .unwrap();
+        let mut contents = Vec::new();
+        base.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"whole binary");
+    }
+
+    #[test]
+    fn macos_patch_base_errors_without_engine_base_or_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let libapp_path = tmp_dir.path().join("missing");
+
+        assert!(
+            super::macos_patch_base(Err(anyhow::anyhow!("CFile open failed")), &libapp_path)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1562,17 +2009,12 @@ patch_verification: bogus_mode
         let result = super::update(None)?;
         assert_eq!(result, crate::UpdateStatus::UpdateInstalled);
 
-        // This is gross.
-        // Because we spawn a thread to report the patch download event, we need to give it time
-        // to run before we can assert that the event was sent. The more correct way to do this
-        // would be to obtain the join handle from the thread and wait for it to finish, but that
-        // would require a change to the API of the `update` function, which seems worse.
-        thread::sleep(Duration::from_millis(10));
-
-        // Assert that the patch download event was sent.
+        // Assert that the patch download event was sent and left the queue.
         event_mock.expect(1).assert();
-
-        Ok(())
+        with_state(|state| {
+            assert!(state.copy_events(10).is_empty());
+            Ok(())
+        })
     }
 
     #[serial]
@@ -1624,17 +2066,14 @@ patch_verification: bogus_mode
         let result = super::update(None)?;
         assert_eq!(result, crate::UpdateStatus::UpdateInstalled);
 
-        // This is gross.
-        // Because we spawn a thread to report the patch download event, we need to give it time
-        // to run before we can assert that the event was sent. The more correct way to do this
-        // would be to obtain the join handle from the thread and wait for it to finish, but that
-        // would require a change to the API of the `update` function, which seems worse.
-        thread::sleep(Duration::from_millis(10));
-
-        // Assert that the patch download event was sent.
+        // The download event was tried once and stays queued for a retry.
         event_mock.expect(1).assert();
-
-        Ok(())
+        with_state(|state| {
+            let events = state.copy_events(10);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].identifier, EventType::PatchDownload);
+            Ok(())
+        })
     }
 
     #[serial]
@@ -1711,6 +2150,8 @@ patch_verification: bogus_mode
             );
             // It's now bad.
             assert!(state.next_boot_patch().is_none());
+            // And no longer what this process is running.
+            assert!(state.running_patch().is_none());
             // And we've queued an event.
             let events = state.copy_events(1);
             assert_eq!(events.len(), 1);
@@ -2013,79 +2454,178 @@ patch_verification: bogus_mode
         Ok(())
     }
 
-    #[serial]
-    #[test]
-    fn events_sent_during_update() {
-        use crate::cache::UpdaterState;
-        use crate::config::{current_arch, current_platform, with_config};
-        use crate::events::{EventType, PatchEvent};
-        use crate::network::PatchCheckResponse;
-
+    /// Queues `queued` events, runs `update()` against a server that answers
+    /// every event with `event_status`, asserts `expected_sends` events were
+    /// posted, and returns how many are still queued.
+    fn update_with_queued_events(
+        event_status: usize,
+        queued: usize,
+        expected_sends: usize,
+    ) -> usize {
         let mut server = mockito::Server::new();
         let check_response = PatchCheckResponse {
             patch_available: false,
             patch: None,
             rolled_back_patch_numbers: None,
         };
-        let check_response_body = serde_json::to_string(&check_response).unwrap();
         let _ = server
             .mock("POST", "/api/v1/patches/check")
             .with_status(200)
-            .with_body(check_response_body)
+            .with_body(serde_json::to_string(&check_response).unwrap())
             .create();
         let event_mock = server
             .mock("POST", "/api/v1/patches/events")
-            .with_status(201)
+            .with_status(event_status)
             .create();
         let tmp_dir = TempDir::new().unwrap();
         init_for_testing(&tmp_dir, Some(&server.url()));
 
-        with_config(|config| {
-            let mut state = UpdaterState::load_or_new_on_error(
-                &config.storage_dir,
-                &config.download_dir,
-                &config.release_version,
-                config.patch_public_key.as_deref(),
-                config.patch_verification,
-            );
-            let fail_event = PatchEvent {
-                app_id: config.app_id.clone(),
-                client_id: "client_id".to_string(),
-                arch: current_arch().to_string(),
-                identifier: EventType::PatchInstallFailure,
-                patch_number: 1,
-                platform: current_platform().to_string(),
-                release_version: config.release_version.clone(),
-                timestamp: time::unix_timestamp(),
-                message: Some("engine_report: patch 1 failed to launch".to_string()),
-            };
-            // Queue 5 events.
-            assert!(state.queue_event(fail_event.clone()).is_ok());
-            assert!(state.queue_event(fail_event.clone()).is_ok());
-            assert!(state.queue_event(fail_event.clone()).is_ok());
-            assert!(state.queue_event(fail_event.clone()).is_ok());
-            assert!(state.queue_event(fail_event.clone()).is_ok());
+        let config = super::copy_update_config().unwrap();
+        super::with_mut_state(|state| {
+            for _ in 0..queued {
+                state.queue_event(crate::events::PatchEvent::new(
+                    &config,
+                    EventType::PatchInstallFailure,
+                    1,
+                    state.client_id(),
+                    Some("engine_report: patch 1 failed to launch"),
+                ))?;
+            }
             Ok(())
         })
         .unwrap();
 
         super::update(None).unwrap();
-        // Only 3 events should have been sent.
-        event_mock.expect(3).assert();
+        event_mock.expect(expected_sends).assert();
+        with_state(|state| Ok(state.copy_events(100).len())).unwrap()
+    }
 
-        with_config(|config| {
-            let state = UpdaterState::load_or_new_on_error(
-                &config.storage_dir,
-                &config.download_dir,
-                &config.release_version,
-                config.patch_public_key.as_deref(),
-                config.patch_verification,
-            );
-            // All 5 events should be cleared, even though only 3 were sent.
-            assert_eq!(state.copy_events(10).len(), 0);
+    #[serial]
+    #[test]
+    fn update_sends_up_to_three_queued_events_and_keeps_the_rest() {
+        assert_eq!(update_with_queued_events(201, 5, 3), 2);
+    }
+
+    #[serial]
+    #[test]
+    fn unsent_events_stay_queued_and_stop_the_flush() {
+        // A 5xx (or no network) may succeed later: keep the event, and don't
+        // send the ones behind it to a server that's failing.
+        assert_eq!(update_with_queued_events(503, 2, 1), 2);
+    }
+
+    #[serial]
+    #[test]
+    fn events_the_server_refuses_are_dropped() {
+        // A 4xx gets the same answer every time, so the event is dropped
+        // rather than blocking the queue.
+        assert_eq!(update_with_queued_events(400, 2, 2), 0);
+    }
+
+    #[serial]
+    #[test]
+    fn only_refusals_of_the_event_itself_drop_it() {
+        // A proxy's 403 or a rate limit's 429 isn't about the event, so the
+        // event is kept for the next flush.
+        assert_eq!(update_with_queued_events(403, 2, 1), 2);
+        assert_eq!(update_with_queued_events(429, 2, 1), 2);
+        assert_eq!(update_with_queued_events(422, 2, 2), 0);
+    }
+
+    #[serial]
+    #[test]
+    fn offline_events_stay_queued() {
+        let tmp_dir = TempDir::new().unwrap();
+        init_for_testing(&tmp_dir, None);
+        testing_set_network_hooks(
+            |_url, _request| {
+                Ok(PatchCheckResponse {
+                    patch_available: false,
+                    patch: None,
+                    rolled_back_patch_numbers: None,
+                })
+            },
+            crate::network::UNEXPECTED_DOWNLOAD,
+            |_url, _event| Err(crate::network::NetworkError::Transport.into()),
+        );
+        install_fake_patch(1).unwrap();
+        crate::report_launch_start().unwrap();
+        crate::report_launch_success().unwrap();
+        super::update(None).unwrap();
+
+        let events = with_state(|state| Ok(state.copy_events(10))).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].identifier, EventType::PatchInstallSuccess);
+    }
+
+    #[serial]
+    #[test]
+    fn update_skips_its_flush_while_another_is_running() {
+        // A launch flush stuck on the network must not hold up the patch
+        // check; the running flush covers the queue. 0 sends: the mock
+        // asserts update() didn't post while the lock was held.
+        let _running = super::EVENT_FLUSH_LOCK.lock().unwrap();
+        assert_eq!(update_with_queued_events(201, 2, 0), 2);
+    }
+
+    /// Every event the updater sent, in order. A static because network hooks
+    /// are `fn` pointers, which can't capture one.
+    static SENT_EVENTS: Mutex<Vec<crate::events::PatchEvent>> = Mutex::new(Vec::new());
+
+    fn record_event(_url: &str, request: CreatePatchEventRequest) -> anyhow::Result<()> {
+        SENT_EVENTS.lock().unwrap().push(request.event);
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn falling_back_to_an_installed_patch_does_not_report_it_again() -> anyhow::Result<()> {
+        // shorebird#3537: patch 1 installs, patch 2 fails to boot, the app
+        // falls back to patch 1. Billing counts install events, so patch 1
+        // must be reported once, not again on the fallback boot.
+        let tmp_dir = TempDir::new().unwrap();
+        init_for_testing(&tmp_dir, None);
+        SENT_EVENTS.lock().unwrap().clear();
+        testing_set_network_hooks(
+            |_url, _request| panic!("unexpected patch check"),
+            crate::network::UNEXPECTED_DOWNLOAD,
+            record_event,
+        );
+
+        install_fake_patch(1)?;
+        crate::report_launch_start()?;
+        crate::report_launch_success()?;
+
+        install_fake_patch(2)?;
+        crate::report_launch_start()?;
+        crate::report_launch_failure()?;
+
+        crate::report_launch_start()?;
+        assert_eq!(super::running_patch()?.map(|p| p.number), Some(1));
+        crate::report_launch_success()?;
+
+        let sent: Vec<_> = SENT_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.identifier.clone(), e.patch_number))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (EventType::PatchInstallSuccess, 1),
+                (EventType::PatchInstallFailure, 2),
+            ]
+        );
+        assert!(SENT_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.event_id.is_some()));
+        with_state(|state| {
+            assert!(state.copy_events(10).is_empty());
             Ok(())
         })
-        .unwrap();
     }
 
     #[serial]
@@ -2217,26 +2757,419 @@ patch_verification: bogus_mode
                 message.contains("Download size mismatch"),
                 "message should contain error detail: {message}"
             );
+            // A size mismatch is a server contract violation, so the event
+            // carries the structured `server` category (not baked into message).
+            assert_eq!(
+                events[0].failure_category.as_deref(),
+                Some("server"),
+                "expected server category on the failure event"
+            );
             Ok(())
         })?;
 
         Ok(())
     }
 
+    // cspell:ignore outform dgst
+    // A throwaway RSA key pair made for these tests (only the public half is
+    // kept), as `patch_public_key` expects it: base64 DER `RSAPublicKey`.
+    //   openssl genrsa -out k.pem 2048
+    //   openssl rsa -in k.pem -RSAPublicKey_out -outform DER | base64
+    const TEST_PUBLIC_KEY: &str = "MIIBCgKCAQEArCQP+TK07V2b/Oux0AlNIQQ+A4j3dY2A8ITpjrQ+g2x0uv1vTLnX/ykLPwD8LFyS2PupJYUVtG6Djm+UCdoeNCX35+Layveax1dv0p4N/R2Xnhm9DYx/WSbI5HE6hZ4okduTWlkHZXS63WK56vQFHzXkzuQqiMQmcFFv2oDF2lQ/kwHCPqhDYPH5Oy0hILBmu88xQhZUs5DqV/vJz0T+r9PYvYaAvrS1g3v+kwTG7vKUJ1HAm6mZekrUVrdNogbBtPPBVvnhnSWFDPzCZ4mQbWyQfKQVszUOCLS84QPZFgAkAzmeouYfuJnT2sIk6syEk9eVaiYhIdds5nNNZsopYwIDAQAB";
+    // Hash of "hello tests", the result of applying `HELLO_TESTS_PATCH`
+    // to the base "hello world".
+    const HELLO_TESTS_HASH: &str =
+        "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45";
+    // `printf %s $HELLO_TESTS_HASH | openssl dgst -sha256 -sign k.pem | base64`
+    const HELLO_TESTS_SIGNATURE: &str = "lzJx8h1RT9lgHU+whC15OwDVRRjPNxomt0YwNTAil69J8+SNHzrU204827GzdYy81PZMVvKLLoW6FHlHmz/fzZ+0QkXpPyg+Lln7vBn6rM2BM6F5rwacg9TPCwmQwZC0eF5g3o9of9HdIb/1M69QM8z05JcdohaV42Um7BdHNQZt9W5Td7LuYbBEfyX6q0bO8YlbXNzzyANFudD/OCJLRCiDBkSHHO6+SmQZtUlapRMf2q1/4FAVGclAtc0yfD5pdD0EURECW30UATMGRXluPn+5vf8kqn8o2whu6pvqC0PMQqBLF7MGcz3hdB+wWqERB+NLx+HqpYTpgfhlzAb/pg==";
+    // The same key's signature over a different hash (64 zeros), so it fails
+    // to verify for `HELLO_TESTS_HASH`.
+    const WRONG_MESSAGE_SIGNATURE: &str = "iybpSSyEEpwJ7ta5Tma1R/caW1bnLcijYaVpIBUdH9I7dv75M0ekPXFMpdv3NfYcptOFRhz3Ht9+qd+nCy0+9isOGHyK6piiu9VGv5ScRuk2oP5ZiSRWZTtwzbIKOQ5LysSqFsD1/+GMkzRWCAwpSQu9bD57/uPtZgs6fy0qFp7pZ+1lkXCI/d9MX7657MhdQYlrrPImBUwCTztzyJ9nDVt23xZfSBBteseXCXXhGQ8nS9CYycQSQkLwrG6hTLixO0kOAVDGN9P5mKb1EXKaEao+lSET8nBysmEqTlt40xjOHN19ymtWw5Xr2Gw2yTNDH6AIQNs7mziMDiLX+Jg7CA==";
+    // Generated by `string_patch "hello world" "hello tests"`.
+    const HELLO_TESTS_PATCH: [u8; 31] = [
+        40, 181, 47, 253, 0, 128, 177, 0, 0, 223, 177, 0, 0, 0, 16, 0, 0, 6, 0, 0, 0, 0, 0, 0, 5,
+        116, 101, 115, 116, 115, 0,
+    ];
+
+    // Network hooks are plain `fn`s, so the tests reach them through statics
+    // (these tests are `#[serial]`).
+    static OFFERED_SIGNATURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    static DOWNLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Initializes the updater with `extra_yaml` and a server offering patch
+    /// 1 ("hello world" → "hello tests") signed with `hash_signature`.
+    fn init_offering_signature(tmp_dir: &TempDir, extra_yaml: &str, hash_signature: Option<&str>) {
+        init_for_testing_with_yaml(tmp_dir, None, extra_yaml);
+        let apk_path = tmp_dir.path().join("base.apk");
+        crate::test_utils::write_fake_apk(apk_path.to_str().unwrap(), b"hello world");
+
+        *OFFERED_SIGNATURE.lock().unwrap() = hash_signature.map(String::from);
+        DOWNLOADS.store(0, std::sync::atomic::Ordering::SeqCst);
+        testing_set_network_hooks(
+            |_url, _request| {
+                Ok(PatchCheckResponse {
+                    patch_available: true,
+                    patch: Some(Patch {
+                        number: 1,
+                        hash: HELLO_TESTS_HASH.to_string(),
+                        download_url: "http://example.com/patch/1".to_string(),
+                        hash_signature: OFFERED_SIGNATURE.lock().unwrap().clone(),
+                    }),
+                    rolled_back_patch_numbers: None,
+                })
+            },
+            |_url, dest: &Path, _resume_from: u64| {
+                DOWNLOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::fs::write(dest, HELLO_TESTS_PATCH)?;
+                Ok(crate::network::DownloadResult {
+                    total_bytes: HELLO_TESTS_PATCH.len() as u64,
+                    content_length: Some(HELLO_TESTS_PATCH.len() as u64),
+                })
+            },
+            |_url, _event| Ok(()),
+        );
+    }
+
+    fn signing_yaml(mode: &str) -> String {
+        format!("\npatch_public_key: {TEST_PUBLIC_KEY}\npatch_verification: {mode}")
+    }
+
+    fn assert_installed_and_bootable() -> anyhow::Result<()> {
+        super::validate_next_boot_patch()?;
+        super::with_mut_state(|state| {
+            assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+            Ok(())
+        })
+    }
+
+    /// An unverifiable offer is refused before download, the refused pair is
+    /// tombstoned, one `invalid_signature` event is queued, and the next
+    /// check skips the same offer quietly.
+    fn assert_refused(
+        tmp_dir: &TempDir,
+        result: anyhow::Result<crate::UpdateStatus>,
+        offered: Option<&str>,
+        expected_cause: &str,
+    ) -> anyhow::Result<()> {
+        let err = result.expect_err("an unverifiable patch must not install");
+        assert_eq!(
+            super::classify_failure(&err),
+            super::FailureCategory::InvalidSignature
+        );
+        assert!(
+            format!("{err:#}").contains(expected_cause),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(DOWNLOADS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!tmp_dir.path().join("patches/1/download").exists());
+        assert!(!tmp_dir.path().join("patches/1/dlc.vmcode").exists());
+        super::with_mut_state(|state| {
+            assert_eq!(state.next_boot_patch(), None);
+            assert_eq!(
+                state.lifecycle_mut().read_state(1),
+                Some(crate::cache::lifecycle::PatchState::Bad {
+                    reason: super::BadReason::InvalidSignature,
+                    hash: Some(HELLO_TESTS_HASH.to_string()),
+                    signature: offered.map(String::from),
+                    size: None,
+                })
+            );
+            let events = state.copy_events(10);
+            assert_eq!(events.len(), 1, "expected one queued event");
+            assert_eq!(
+                events[0].failure_category.as_deref(),
+                Some("invalid_signature")
+            );
+            Ok(())
+        })?;
+
+        // The same offer again is skipped without a new failure event.
+        assert_eq!(super::update(None)?, crate::UpdateStatus::UpdateIsBadPatch);
+        assert_eq!(DOWNLOADS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        super::with_state(|state| {
+            assert!(state
+                .copy_events(10)
+                .iter()
+                .all(|e| e.failure_category.is_none()));
+            Ok(())
+        })
+    }
+
+    #[serial]
+    #[test]
+    fn signature_is_checked_at_install_in_every_mode() -> anyhow::Result<()> {
+        for mode in ["install_only", "strict"] {
+            // A valid signature installs, and boots (Strict re-verifies).
+            let tmp_dir = TempDir::new().unwrap();
+            init_offering_signature(&tmp_dir, &signing_yaml(mode), Some(HELLO_TESTS_SIGNATURE));
+            assert_eq!(
+                super::update(None)?,
+                crate::UpdateStatus::UpdateInstalled,
+                "{mode}"
+            );
+            assert_installed_and_bootable()?;
+
+            for (offered, cause) in [
+                (Some(WRONG_MESSAGE_SIGNATURE), "Patch signature is invalid"),
+                (None, "Patch signature is missing"),
+            ] {
+                let tmp_dir = TempDir::new().unwrap();
+                init_offering_signature(&tmp_dir, &signing_yaml(mode), offered);
+                let result = super::update(None);
+                assert_refused(&tmp_dir, result, offered, cause)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn signature_is_ignored_when_signing_is_off() -> anyhow::Result<()> {
+        // No `patch_public_key`: whatever the server sends is not checked.
+        let tmp_dir = TempDir::new().unwrap();
+        init_offering_signature(&tmp_dir, "", Some(WRONG_MESSAGE_SIGNATURE));
+        assert_eq!(super::update(None)?, crate::UpdateStatus::UpdateInstalled);
+        assert_installed_and_bootable()
+    }
+
+    #[serial]
+    #[test]
+    fn refusal_discards_an_earlier_download_of_the_patch() -> anyhow::Result<()> {
+        // A partial download recorded under the genuine signature is on disk
+        // when a re-offer arrives with a bad one; the refusal removes it.
+        let tmp_dir = TempDir::new().unwrap();
+        init_offering_signature(
+            &tmp_dir,
+            &signing_yaml("install_only"),
+            Some(WRONG_MESSAGE_SIGNATURE),
+        );
+        super::with_mut_state(|state| {
+            state.lifecycle_mut().record_download_started(
+                1,
+                "http://example.com/patch/1",
+                HELLO_TESTS_HASH,
+                Some(HELLO_TESTS_SIGNATURE),
+            )
+        })?;
+        let partial = tmp_dir.path().join("patches/1/download");
+        std::fs::write(&partial, &HELLO_TESTS_PATCH[..10])?;
+
+        let result = super::update(None);
+        assert_refused(
+            &tmp_dir,
+            result,
+            Some(WRONG_MESSAGE_SIGNATURE),
+            "Patch signature is invalid",
+        )
+    }
+
+    #[serial]
+    #[test]
+    fn boot_validation_reports_a_signature_refusal() -> anyhow::Result<()> {
+        // Strict mode re-verifies the installed bytes at boot. Bytes changed
+        // on disk after install fail it: the patch is dropped and one
+        // `invalid_signature` event says why, where before nothing did.
+        let tmp_dir = TempDir::new().unwrap();
+        init_offering_signature(
+            &tmp_dir,
+            &signing_yaml("strict"),
+            Some(HELLO_TESTS_SIGNATURE),
+        );
+        assert_eq!(super::update(None)?, crate::UpdateStatus::UpdateInstalled);
+        let artifact = tmp_dir.path().join("patches/1/dlc.vmcode");
+        let mut bytes = std::fs::read(&artifact)?;
+        bytes[0] ^= 0xff;
+        std::fs::write(&artifact, bytes)?;
+        super::with_mut_state(|state| state.clear_events())?;
+
+        let err = super::validate_next_boot_patch().expect_err("tampered patch must not boot");
+        assert_eq!(
+            super::classify_failure(&err),
+            super::FailureCategory::InvalidSignature
+        );
+        super::with_mut_state(|state| {
+            assert_eq!(state.next_boot_patch(), None);
+            let events = state.copy_events(10);
+            assert_eq!(events.len(), 1, "expected one queued event");
+            assert_eq!(events[0].identifier, EventType::PatchUpdateFailure);
+            assert_eq!(events[0].patch_number, 1);
+            assert_eq!(
+                events[0].failure_category.as_deref(),
+                Some("invalid_signature")
+            );
+            let message = events[0].message.as_deref().unwrap_or_default();
+            assert!(
+                message.starts_with("boot_validation: patch 1 failed"),
+                "{message}"
+            );
+            Ok(())
+        })?;
+
+        // The patch is now known bad, so the next boot validates nothing
+        // and reports nothing more.
+        super::with_mut_state(|state| state.clear_events())?;
+        super::validate_next_boot_patch()?;
+        super::with_state(|state| {
+            assert!(state.copy_events(10).is_empty());
+            Ok(())
+        })
+    }
+
+    #[serial]
+    #[test]
+    fn boot_validation_categorizes_other_failures_apart_from_signatures() -> anyhow::Result<()> {
+        // A valid patch boots without an event; a truncated one is dropped
+        // and reported, but not as a signature refusal.
+        let tmp_dir = TempDir::new().unwrap();
+        init_offering_signature(
+            &tmp_dir,
+            &signing_yaml("strict"),
+            Some(HELLO_TESTS_SIGNATURE),
+        );
+        assert_eq!(super::update(None)?, crate::UpdateStatus::UpdateInstalled);
+        super::with_mut_state(|state| state.clear_events())?;
+        super::validate_next_boot_patch()?;
+        super::with_state(|state| {
+            assert!(state.copy_events(10).is_empty());
+            Ok(())
+        })?;
+
+        let artifact = tmp_dir.path().join("patches/1/dlc.vmcode");
+        let bytes = std::fs::read(&artifact)?;
+        std::fs::write(&artifact, &bytes[..bytes.len() - 1])?;
+        assert!(super::validate_next_boot_patch().is_err());
+        super::with_state(|state| {
+            let events = state.copy_events(10);
+            assert_eq!(events.len(), 1, "expected one queued event");
+            assert_eq!(events[0].failure_category.as_deref(), Some("unknown"));
+            Ok(())
+        })
+    }
+
+    #[serial]
+    #[test]
+    fn refused_signature_does_not_block_a_genuine_patch() -> anyhow::Result<()> {
+        // Only the refused (hash, signature) pair is tombstoned: the genuine
+        // patch 1 offered afterwards installs.
+        let tmp_dir = TempDir::new().unwrap();
+        init_offering_signature(
+            &tmp_dir,
+            &signing_yaml("install_only"),
+            Some(WRONG_MESSAGE_SIGNATURE),
+        );
+        assert!(super::update(None).is_err());
+        *OFFERED_SIGNATURE.lock().unwrap() = Some(HELLO_TESTS_SIGNATURE.to_string());
+        assert_eq!(super::update(None)?, crate::UpdateStatus::UpdateInstalled);
+        assert_installed_and_bootable()
+    }
+
     #[test]
     fn truncate_error_message_short() {
-        let err = anyhow::anyhow!("short error");
-        let msg = super::truncate_error_message(&err);
+        let msg = super::truncate_error_message("short error");
         assert_eq!(msg, "short error");
     }
 
     #[test]
     fn truncate_error_message_long() {
         let long = "x".repeat(300);
-        let err = anyhow::anyhow!("{}", long);
-        let msg = super::truncate_error_message(&err);
+        let msg = super::truncate_error_message(&long);
         assert_eq!(msg.len(), 256);
         assert!(msg.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_error_message_cuts_on_char_boundary() {
+        // 'é' is two bytes, so byte 253 falls inside a character.
+        let long = "é".repeat(200);
+        assert!(!long.is_char_boundary(253));
+        let msg = super::truncate_error_message(&long);
+        assert_eq!(msg, format!("{}...", "é".repeat(126)));
+    }
+
+    fn config_with_dirs(
+        storage: &str,
+        code_cache: &str,
+        libapp: &str,
+    ) -> crate::config::UpdateConfig {
+        let tmp_dir = TempDir::new().unwrap();
+        init_for_testing(&tmp_dir, None);
+        let mut config = with_config(|config| Ok(config.clone())).unwrap();
+        config.storage_dir = std::path::PathBuf::from(storage);
+        config.download_dir = std::path::PathBuf::from(code_cache).join("downloads");
+        config.libapp_path = std::path::PathBuf::from(libapp);
+        config
+    }
+
+    // Unix paths are only absolute off Windows.
+    #[cfg(not(windows))]
+    #[serial]
+    #[test]
+    fn relativize_paths_replaces_updater_directories() {
+        let config = config_with_dirs(
+            "/var/mobile/Containers/Data/Application/ABCD-1234/Library/Application Support/shorebird",
+            "/var/mobile/Containers/Data/Application/ABCD-1234/Library/Caches",
+            "/private/var/containers/Bundle/Application/EF56-7890/Runner.app/Frameworks/App.framework/App",
+        );
+        let msg = "Failed to read file '/var/mobile/Containers/Data/Application/ABCD-1234/Library/Application Support/shorebird/patches/1/dlc.vmcode': denied; \
+            Failed to write to file '/var/mobile/Containers/Data/Application/ABCD-1234/Library/Caches/downloads/1': full; \
+            Path: \"/private/var/containers/Bundle/Application/EF56-7890/Runner.app/Frameworks/App.framework/App\"";
+        let relative = super::relativize_paths(msg, &config);
+        assert_eq!(
+            relative,
+            "Failed to read file '<storage>/patches/1/dlc.vmcode': denied; \
+            Failed to write to file '<code_cache>/downloads/1': full; \
+            Path: \"<app>/App\""
+        );
+        assert!(!relative.contains("ABCD-1234"));
+        assert!(!relative.contains("EF56-7890"));
+    }
+
+    // Windows paths are only absolute on Windows, which CI runs.
+    #[cfg(windows)]
+    #[serial]
+    #[test]
+    fn relativize_paths_replaces_windows_paths() {
+        let config = config_with_dirs(
+            r"C:\Users\jane.doe\AppData\Roaming\com.example",
+            r"C:\Users\jane.doe\AppData\Local\com.example",
+            r"C:\Program Files\Example\data\app.so",
+        );
+        let msg = r#"failed to deserialize from "C:\\Users\\jane.doe\\AppData\\Roaming\\com.example\\state.json"; Failed to read file 'C:\Users\jane.doe\AppData\Local\com.example\downloads\1'; Failed to read file 'C:\Program Files\Example\data\app.so'"#;
+        let relative = super::relativize_paths(msg, &config);
+        assert_eq!(
+            relative,
+            r#"failed to deserialize from "<storage>\\state.json"; Failed to read file '<code_cache>\downloads\1'; Failed to read file '<app>\app.so'"#
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[serial]
+    #[test]
+    fn relativize_paths_replaces_debug_escaped_paths() {
+        // Debug escapes a backslash, so the Debug form differs from Display.
+        let config = config_with_dirs(r"/home/jane\doe/storage", "/cache", "/app/libapp.so");
+        let msg = r#"failed to deserialize from "/home/jane\\doe/storage/state.json"; Failed to read file '/home/jane\doe/storage/patches/1'"#;
+        let relative = super::relativize_paths(msg, &config);
+        assert_eq!(
+            relative,
+            r#"failed to deserialize from "<storage>/state.json"; Failed to read file '<storage>/patches/1'"#
+        );
+    }
+
+    #[serial]
+    #[test]
+    fn relativize_paths_skips_filesystem_root() {
+        let config = config_with_dirs("/", "/", "/libapp.so");
+        let msg = "Failed to read file '/patches/1': denied";
+        assert_eq!(super::relativize_paths(msg, &config), msg);
+    }
+
+    #[serial]
+    #[test]
+    fn relativize_paths_skips_relative_directories() {
+        let config = config_with_dirs(".", "cache", "./libapp.so");
+        let msg = "Failed to read file '/data/app.so': x.y";
+        assert_eq!(super::relativize_paths(msg, &config), msg);
     }
 
     #[serial]
@@ -4101,9 +5034,7 @@ mod patch_check_current_patch_number_tests {
 
     use crate::{
         check_for_downloadable_update,
-        network::{
-            testing_set_network_hooks, PatchCheckResponse, UNEXPECTED_DOWNLOAD, UNEXPECTED_REPORT,
-        },
+        network::{testing_set_network_hooks, PatchCheckResponse, UNEXPECTED_DOWNLOAD},
         report_launch_start, report_launch_success,
         test_utils::install_fake_patch,
         update,
@@ -4160,9 +5091,10 @@ mod patch_check_current_patch_number_tests {
                     rolled_back_patch_numbers: None,
                 })
             },
-            // No update is offered, so neither hook should ever fire.
+            // No update is offered, so no download; booting patch 1
+            // queued its install event, which update() sends.
             UNEXPECTED_DOWNLOAD,
-            UNEXPECTED_REPORT,
+            |_url, _event| Ok(()),
         );
     }
 
@@ -4192,5 +5124,123 @@ mod patch_check_current_patch_number_tests {
         // 1 = running patch sent; -1 = field omitted (the bug); i64::MIN = hook never ran.
         assert_eq!(CAPTURED.load(Ordering::SeqCst), 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::{classify_failure, FailureCategory, UpdateError};
+    use crate::network::NetworkError;
+    use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn io_out_of_space_and_permission_win() {
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(IoError::from(ErrorKind::StorageFull))),
+            FailureCategory::OutOfSpace
+        );
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(IoError::from(
+                ErrorKind::PermissionDenied
+            ))),
+            FailureCategory::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn network_errors_classify() {
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(NetworkError::Transport)),
+            FailureCategory::Network
+        );
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(NetworkError::Server { status: 503 })),
+            FailureCategory::Server
+        );
+    }
+
+    #[test]
+    fn transport_error_with_an_os_cause_is_network() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err = anyhow::Error::new(io).context(NetworkError::Transport);
+        assert_eq!(classify_failure(&err), FailureCategory::Network);
+    }
+
+    #[test]
+    fn update_errors_classify() {
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(UpdateError::BadServerResponse)),
+            FailureCategory::Server
+        );
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(UpdateError::CorruptPatch)),
+            FailureCategory::CorruptPatch
+        );
+    }
+
+    #[test]
+    fn os_error_kind_beats_corrupt_patch_tag() {
+        // A disk-full while inflating is tagged CorruptPatch but must report
+        // OutOfSpace — the underlying OS kind takes priority.
+        let err = anyhow::Error::new(IoError::from(ErrorKind::StorageFull))
+            .context(UpdateError::CorruptPatch);
+        assert_eq!(classify_failure(&err), FailureCategory::OutOfSpace);
+    }
+
+    #[test]
+    fn generic_io_is_filesystem() {
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(IoError::from(ErrorKind::NotFound))),
+            FailureCategory::Filesystem
+        );
+    }
+
+    #[test]
+    fn untyped_error_is_unknown() {
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("something went wrong")),
+            FailureCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn context_wrapping_preserves_classification() {
+        // Extra `.context()` layers (as added at real origins) must not defeat
+        // downcast-based classification.
+        let err = anyhow::Error::new(NetworkError::Server { status: 500 })
+            .context("while checking for a patch");
+        assert_eq!(classify_failure(&err), FailureCategory::Server);
+    }
+
+    #[test]
+    fn codes_and_retryability_cover_all_categories() {
+        use FailureCategory::*;
+        // Exhaustive: every variant's stable code string and retryable flag.
+        let cases = [
+            (Network, "network", true),
+            (Server, "server", true),
+            (OutOfSpace, "out_of_space", false),
+            (PermissionDenied, "permission_denied", false),
+            (Filesystem, "filesystem", false),
+            (CorruptPatch, "corrupt_patch", false),
+            (InvalidSignature, "invalid_signature", false),
+            (Unknown, "unknown", true),
+        ];
+        for (category, code, retryable) in cases {
+            assert_eq!(category.code(), code, "code for {category:?}");
+            assert_eq!(
+                category.retryable(),
+                retryable,
+                "retryable for {category:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_patch_error_displays() {
+        assert_eq!(
+            UpdateError::CorruptPatch.to_string(),
+            "Downloaded patch was invalid"
+        );
     }
 }
