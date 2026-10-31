@@ -1,7 +1,7 @@
 //! Optional authenticated AES-GCM transport, with application-owned key lookup.
 //! Downloaded ciphertext stays resumable on disk; decrypted transport is held in
-//! a bounded, wiped buffer until inflation completes. Installed executable code
-//! is necessarily plaintext and remains protected by the usual boot signatures.
+//! a bounded, wiped buffer until inflation completes. Legacy installed executable code is plaintext; capable native
+//! integrations retain only authenticated ciphertext and prepare sealed FDs.
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::aead;
@@ -229,6 +229,46 @@ impl Drop for Plaintext {
     }
 }
 
+/// Validate signed encryption/install context and ciphertext before any key lookup.
+pub(crate) fn validate_ciphertext(
+    config: &UpdateConfig,
+    patch: &Patch,
+    client_id: &str,
+    path: &Path,
+) -> Result<u64> {
+    let metadata = patch
+        .encryption
+        .as_ref()
+        .context("Missing encryption metadata")?;
+    validate_context(
+        metadata,
+        patch,
+        &config.app_id,
+        crate::config::current_platform(),
+        crate::config::current_arch(),
+        client_id,
+    )?;
+    let size = std::fs::metadata(path)?.len();
+    ensure!(
+        (16..=MAX_CIPHERTEXT_BYTES).contains(&size),
+        "Encrypted patch exceeds supported size bounds"
+    );
+    ensure!(
+        crate::cache::hash_file(path)? == metadata.encrypted_hash,
+        "Encrypted patch hash mismatch"
+    );
+    Ok(size)
+}
+
+fn allocate_plaintext(size: usize) -> Result<Plaintext> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+    bytes.resize(size, 0);
+    Ok(Plaintext(Cursor::new(bytes)))
+}
+
 pub(crate) fn decrypt(
     config: &UpdateConfig,
     patch: &Patch,
@@ -265,7 +305,7 @@ fn decrypt_with_context(
         (16..=MAX_CIPHERTEXT_BYTES).contains(&size),
         "Encrypted patch exceeds supported size bounds"
     );
-    let mut bytes = Plaintext(Cursor::new(vec![0; size as usize]));
+    let mut bytes = allocate_plaintext(size as usize)?;
     let mut file = std::fs::File::open(path)?;
     file.read_exact(bytes.0.get_mut())?;
     let mut extra = [0; 1];
@@ -281,7 +321,8 @@ fn decrypt_with_context(
     let mut key = SecretKey([0; 32]);
     let mut written = 0;
     // No configuration/provider mutex is held here; update serialization is
-    // still held. The provider must not reenter updater operations.
+    // still held. Reentrant native preparation freezes BASE through the
+    // nonblocking updater-operation lock, without retaining Rust data locks.
     let found = unsafe {
         provider(
             key_id.as_ptr(),
@@ -376,6 +417,7 @@ mod tests {
     fn config(directory: &Path) -> UpdateConfig {
         let data = fixture();
         UpdateConfig {
+            native_options: crate::native_boot::NativeOptions::default(),
             storage_dir: directory.to_path_buf(),
             download_dir: directory.to_path_buf(),
             auto_update: false,
@@ -405,6 +447,67 @@ mod tests {
         base64::prelude::BASE64_STANDARD
             .decode(fixture()[field].as_str().unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn transport_allocation_failure_is_typed_retryable_resource_error() {
+        let error = allocate_plaintext(usize::MAX).err().unwrap();
+        assert!(crate::native_cache::is_resource_error(&error));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::OutOfMemory
+        );
+    }
+
+    #[test]
+    fn real_go_ciphertext_streams_into_bounded_hash_sink_without_plaintext_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path());
+        let response = response();
+        let request = request();
+        crate::response_auth::verify_response(&request, &response, &config).unwrap();
+        let patch = response.patch.unwrap();
+        let path = directory.path().join("transport.aesgcm");
+        std::fs::write(&path, bytes("ciphertext_base64")).unwrap();
+        for budget in [
+            bytes("target_binary_base64").len() as u64,
+            bytes("target_binary_base64").len() as u64 - 1,
+        ] {
+            let plaintext = decrypt_with_context(
+                &config,
+                &patch,
+                &request.client_id,
+                &path,
+                &request.platform,
+                &request.arch,
+            )
+            .unwrap();
+            let size = plaintext.len();
+            let mut output =
+                crate::native_cache::BoundedHashWriter::new(std::io::sink(), budget).unwrap();
+            let result = crate::updater::inflate_reader_to_writer(
+                plaintext,
+                size,
+                Cursor::new(bytes("base_binary_base64")),
+                &mut output,
+            );
+            if budget == bytes("target_binary_base64").len() as u64 {
+                result.unwrap();
+                let (_, size, hash) = output.finish();
+                assert_eq!(size, budget);
+                assert_eq!(hash, patch.hash);
+                crate::cache::check_patch_signature(
+                    &hash,
+                    patch.hash_signature.as_deref(),
+                    config.patch_public_key.as_deref(),
+                )
+                .unwrap();
+            } else {
+                assert!(crate::native_cache::is_resource_error(&result.unwrap_err()));
+            }
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(path).unwrap(), bytes("ciphertext_base64"));
     }
 
     #[test]

@@ -8,7 +8,12 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use once_cell::sync::OnceCell;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+
+static CHECKED_NATIVE_ONLY: AtomicBool = AtomicBool::new(false);
 
 // cbindgen looks for const, ignore these so it doesn't warn about them.
 
@@ -64,6 +69,8 @@ pub fn testing_reset_config() {
     });
     set_running_patch_number(None);
     crate::encrypted_patch::reset_provider();
+    crate::native_boot::reset();
+    CHECKED_NATIVE_ONLY.store(false, Ordering::Relaxed);
 }
 
 pub fn check_initialized_and_call<F, R>(
@@ -104,6 +111,7 @@ where
 // The config passed into init.  This is immutable once set and copyable.
 #[derive(Debug, Clone)]
 pub struct UpdateConfig {
+    pub(crate) native_options: crate::native_boot::NativeOptions,
     pub storage_dir: PathBuf,
     pub download_dir: PathBuf,
     pub auto_update: bool,
@@ -128,7 +136,30 @@ pub fn set_config(
     yaml: &YamlConfig,
     network_hooks: NetworkHooks,
 ) -> Result<()> {
+    set_config_with_native_options(
+        app_config,
+        file_provider,
+        libapp_path,
+        yaml,
+        network_hooks,
+        crate::native_boot::NativeOptions::default(),
+        false,
+    )
+}
+
+pub(crate) fn set_config_with_native_options(
+    app_config: AppConfig,
+    file_provider: Box<dyn ExternalFileProvider>,
+    libapp_path: PathBuf,
+    yaml: &YamlConfig,
+    network_hooks: NetworkHooks,
+    native_options: crate::native_boot::NativeOptions,
+    checked: bool,
+) -> Result<()> {
     with_config_mut(|config: &mut Option<UpdateConfig>| {
+        if !checked && CHECKED_NATIVE_ONLY.load(Ordering::Relaxed) {
+            bail!("A checked native initialization is required after encrypted native initialization was attempted");
+        }
         if config.is_some() {
             // This previously returned an error, but this happens regularly
             // with apps that use Firebase Messaging, and logging it as an error
@@ -141,6 +172,7 @@ pub fn set_config(
         let download_dir = code_cache_path;
 
         let new_config = UpdateConfig {
+            native_options,
             storage_dir: std::path::PathBuf::from(app_config.app_storage_dir),
             download_dir,
             channel: yaml
@@ -164,8 +196,26 @@ pub fn set_config(
             patch_verification: yaml.patch_verification.unwrap_or_default(),
             patch_response_verification: yaml.patch_response_verification.unwrap_or_default(),
         };
+        if CHECKED_NATIVE_ONLY.load(Ordering::Relaxed)
+            && !new_config.native_options.encrypted(&new_config)
+        {
+            bail!("Encrypted native initialization must complete before this updater can be used");
+        }
+        new_config.native_options.validate()?;
         crate::encrypted_patch::validate_config(&new_config)?;
         shorebird_debug!("Updater configured with: {:?}", new_config);
+        // Checked initialization is atomic to every API using with_config.
+        // No configuration is published until crash recovery/migration succeed.
+        if checked {
+            if new_config.native_options.encrypted(&new_config) {
+                CHECKED_NATIVE_ONLY.store(true, Ordering::Relaxed);
+            }
+            crate::updater::handle_prior_boot_failure_for_config(&new_config)?;
+            if new_config.native_options.encrypted(&new_config) {
+                let mut state = crate::native_boot::load_state(&new_config);
+                state.lifecycle_mut().retire_plaintext_installed()?;
+            }
+        }
         *config = Some(new_config);
 
         Ok(())

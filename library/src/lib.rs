@@ -15,6 +15,8 @@ mod encrypted_patch;
 mod events;
 mod file_errors;
 mod logging;
+mod native_boot;
+mod native_cache;
 mod network;
 mod time;
 mod updater;

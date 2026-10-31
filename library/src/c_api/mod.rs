@@ -19,7 +19,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-mod c_file;
+pub(crate) mod c_file;
 pub mod dart;
 pub mod engine;
 

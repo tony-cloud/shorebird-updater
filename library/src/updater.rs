@@ -235,6 +235,7 @@ pub fn classify_failure(err: &anyhow::Error) -> FailureCategory {
 // `AppConfig` is the rust API.
 // However rusty api would probably used `&str` instead of `String`,
 // but making `&str` from `CStr*` is a bit of a pain.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
     pub app_storage_dir: String,
     pub code_cache_dir: String,
@@ -258,7 +259,9 @@ dyn_clone::clone_trait_object!(ExternalFileProvider);
 // and a hard-coded name for the libapp file which we look up in the
 // split APKs in that datadir. On other platforms we just use a path.
 #[cfg(not(any(target_os = "android", test)))]
-fn libapp_path_from_settings(original_libapp_paths: &[String]) -> Result<PathBuf, InitError> {
+pub(crate) fn libapp_path_from_settings(
+    original_libapp_paths: &[String],
+) -> Result<PathBuf, InitError> {
     let first = original_libapp_paths
         .first()
         .ok_or(InitError::InvalidArgument(
@@ -339,47 +342,48 @@ pub fn init(
 /// If, at initialization time, we detect that we were in the process of booting a patch, report a
 /// failure to boot for that patch and queue an event to report the failure.
 pub fn handle_prior_boot_failure_if_necessary() -> Result<(), InitError> {
-    with_config(|config| {
-        let mut state = UpdaterState::load_or_new_on_error(
-            &config.storage_dir,
-            &config.download_dir,
-            &config.release_version,
-            config.patch_public_key.as_deref(),
-            config.patch_verification,
-        );
-        if let Some(patch) = state.currently_booting_patch() {
-            let boot_time_info = state
-                .boot_started_at()
-                .map(|ts| format!(",boot_started_at={ts}"))
-                .unwrap_or_default();
+    with_config(handle_prior_boot_failure_for_config).map_err(|e| {
+        shorebird_error!("Failed to clean up after a failed patch: {:?}", e);
+        InitError::FailedToCleanUpFailedPatch
+    })
+}
 
-            let file_info = match std::fs::metadata(&patch.path) {
-                Ok(meta) => format!("file_ok=true,file_size={}", meta.len()),
-                Err(_) => "file_ok=false,file_missing".to_string(),
-            };
+pub(crate) fn handle_prior_boot_failure_for_config(config: &UpdateConfig) -> anyhow::Result<()> {
+    let mut state = UpdaterState::load_or_new_on_error(
+        &config.storage_dir,
+        &config.download_dir,
+        &config.release_version,
+        config.patch_public_key.as_deref(),
+        config.patch_verification,
+    );
+    if let Some(patch) = state.currently_booting_patch() {
+        let boot_time_info = state
+            .boot_started_at()
+            .map(|ts| format!(",boot_started_at={ts}"))
+            .unwrap_or_default();
 
-            let now = crate::time::unix_timestamp();
-            let message = format!(
+        let file_info = match std::fs::metadata(&patch.path) {
+            Ok(meta) => format!("file_ok=true,file_size={}", meta.len()),
+            Err(_) => "file_ok=false,file_missing".to_string(),
+        };
+
+        let now = crate::time::unix_timestamp();
+        let message = format!(
                 "crash_recovery: patch {} failed to boot (detected_at={now}{boot_time_info},{file_info})",
                 patch.number
             );
 
-            state.record_boot_failure_for_patch(patch.number)?;
-            state.queue_event(PatchEvent::new(
-                config,
-                EventType::PatchInstallFailure,
-                patch.number,
-                state.client_id(),
-                Some(&message),
-            ))?;
-        }
+        state.record_boot_failure_for_patch(patch.number)?;
+        state.queue_event(PatchEvent::new(
+            config,
+            EventType::PatchInstallFailure,
+            patch.number,
+            state.client_id(),
+            Some(&message),
+        ))?;
+    }
 
-        Ok(())
-    })
-    .map_err(|e| {
-        shorebird_error!("Failed to clean up after a failed patch: {:?}", e);
-        InitError::FailedToCleanUpFailedPatch
-    })
+    Ok(())
 }
 
 /// Whether the auto-update flag is set to true in the config.
@@ -480,7 +484,7 @@ impl ReadSeek for fs::File {}
 
 // FIXME: these patch_base functions should move to platform-specific modules where they can all be tested.
 #[cfg(any(target_os = "android", test))]
-fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     crate::android::open_base_lib(&config.libapp_path, "libapp.so")
 }
 
@@ -489,12 +493,12 @@ fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
 // binary (Mach-O headers, code signature) can change after release, e.g. when
 // the app is re-signed for notarization or the Mac App Store.
 #[cfg(all(not(test), target_os = "ios"))]
-fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     config.file_provider.open()
 }
 
 #[cfg(all(not(test), target_os = "macos"))]
-fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     macos_patch_base(config.file_provider.open(), &config.libapp_path)
 }
 
@@ -521,7 +525,7 @@ fn macos_patch_base(
     not(target_os = "macos"),
     not(target_os = "android")
 ))]
-fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
     let file = fs::File::open(&config.libapp_path)
         .with_file_context(FileOperation::ReadFile, &config.libapp_path)?;
     Ok(Box::new(file))
@@ -709,7 +713,7 @@ fn is_refused_event(err: &anyhow::Error) -> bool {
 /// Runs [`flush_queued_events`] on its own thread, so the caller doesn't wait
 /// on the network. Unit tests run it inline instead, so what a test reads
 /// from the queue never depends on how far a flush thread has got.
-fn spawn_event_flush() {
+pub(crate) fn spawn_event_flush() {
     if cfg!(test) {
         flush_queued_events();
         return;
@@ -738,7 +742,11 @@ fn spawn_event_flush() {
 /// Queues `event` for the next flush. If the queue can't be saved (a full
 /// disk), sends `event` once on its own thread instead, as the updater did
 /// before it queued installs and downloads, rather than losing it.
-fn queue_or_send_event(state: &mut UpdaterState, config: &UpdateConfig, event: PatchEvent) {
+pub(crate) fn queue_or_send_event(
+    state: &mut UpdaterState,
+    config: &UpdateConfig,
+    event: PatchEvent,
+) {
     if let Err(err) = state.queue_event(event.clone()) {
         shorebird_error!("Failed to queue event, sending it once: {:?}", err);
         let config = config.clone();
@@ -769,7 +777,7 @@ pub(crate) fn testing_wait_for_event_flushes() {
 /// A `PatchUpdateFailure` event for `err`, its message prefixed with
 /// `context` (`update_failure`, `boot_validation`) and its category from
 /// [`classify_failure`].
-fn update_failure_event(
+pub(crate) fn update_failure_event(
     config: &UpdateConfig,
     client_id: String,
     context: &str,
@@ -978,6 +986,9 @@ fn install_downloaded_patch(
     patch: &crate::network::Patch,
     download_path: &Path,
 ) -> anyhow::Result<UpdateStatus> {
+    if config.native_options.encrypted(config) {
+        return crate::native_cache::install(config, patch, download_path);
+    }
     let installed_path =
         lifecycle::installed_artifact_path(Path::new(&config.storage_dir), patch.number);
 
@@ -991,7 +1002,10 @@ fn install_downloaded_patch(
             }
             // A key may become available after authenticated provisioning. Keep
             // the ciphertext resumable, but never promote an unauthenticated patch.
-            Err(error) if error.is::<crate::encrypted_patch::KeyResolutionFailed>() => {
+            Err(error)
+                if error.is::<crate::encrypted_patch::KeyResolutionFailed>()
+                    || crate::native_cache::is_resource_error(&error) =>
+            {
                 return Err(error)
             }
             Err(error) => Err(error.context(UpdateError::CorruptPatch)),
@@ -1274,14 +1288,33 @@ where
     R: Read + Send + 'static,
     RS: Read + Seek,
 {
+    let output =
+        fs::File::create(output_path).with_file_context(FileOperation::CreateFile, output_path)?;
+    inflate_reader_to_writer(
+        compressed_patch_r,
+        patch_file_size,
+        base_r,
+        std::io::BufWriter::new(output),
+    )
+    .with_context(|| format!("Writing reconstructed patch to {}", output_path.display()))
+}
+
+pub(crate) fn inflate_reader_to_writer<R, RS, W>(
+    compressed_patch_r: R,
+    patch_file_size: u64,
+    base_r: RS,
+    output: W,
+) -> anyhow::Result<()>
+where
+    R: Read + Send + 'static,
+    RS: Read + Seek,
+    W: std::io::Write,
+{
     use comde::de::Decompressor;
     use comde::zstd::ZstdDecompressor;
-    use std::io::{BufWriter, SeekFrom};
+    use std::io::{SeekFrom, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-
-    let output_file_w =
-        fs::File::create(output_path).with_file_context(FileOperation::CreateFile, output_path)?;
 
     // Probe the base size by seeking to end, then reset. This also gives us
     // the first chance to discover problems with the base reader (e.g. an iOS
@@ -1335,8 +1368,8 @@ where
     // Spawn a thread to run the decompression in parallel to the patching.
     // decompress.copy will block when the pipe buffer is full and resume
     // when the bipatch consumer drains data; when it returns the thread exits.
-    let decompress_handle =
-        std::thread::spawn(move || decompress.copy(compressed_patch_r, patch_w_counted));
+    let decompress_handle = std::thread::Builder::new()
+        .spawn(move || decompress.copy(compressed_patch_r, patch_w_counted))?;
 
     // Closure to assemble the current counter snapshot. Captured by reference
     // so we can format on demand from any error path.
@@ -1389,15 +1422,18 @@ where
     };
 
     // Write out the resulting patched file to the new location, counting
-    // bytes via the wrapper. BufWriter is on the inside so the byte count
-    // reflects bytes that left bipatch, not bytes that hit disk; that's the
-    // signal we actually want (where in the bipatch state machine were we).
+    // bytes via the wrapper. The legacy file adapter buffers its writes;
+    // native bounded sinks check each expanded write before accepting bytes.
     let mut output_w_counted = CountingWriter {
-        inner: BufWriter::new(output_file_w),
+        inner: output,
         bytes_written: Arc::clone(&output_bytes_written),
     };
     let patch_result = std::io::copy(&mut fresh_r, &mut output_w_counted)
-        .with_file_context(FileOperation::WriteFile, output_path);
+        .and_then(|count| {
+            output_w_counted.flush()?;
+            Ok(count)
+        })
+        .map_err(anyhow::Error::from);
 
     // IMPORTANT: Drop the reader side of the pipe before joining the
     // decompression thread. The pipe has a bounded buffer — if patching
@@ -1429,7 +1465,7 @@ where
             // the blob makes the line longer but enables cross-run forensic
             // comparison (e.g. "did base_size change between this user's
             // last working patch and the broken one?").
-            shorebird_info!("Patch successfully applied to {:?}. {}", output_path, diag);
+            shorebird_info!("Patch successfully applied. {}", diag);
             Ok(())
         }
         (Err(patch_err), Ok(_)) => {
@@ -1482,7 +1518,11 @@ where
 /// signature check refused it), since the engine then boots without it and
 /// nothing else would report why.
 pub fn validate_next_boot_patch() -> anyhow::Result<()> {
-    with_config(|config| {
+    // Encrypted state must never enter the legacy path validator.
+    if with_config(|c| Ok(crate::native_boot::needs_prepared_route(c)))? {
+        return crate::native_boot::prepare().map(|_| ());
+    }
+    let result = with_config(|config| {
         let mut state = UpdaterState::load_or_new_on_error(
             &config.storage_dir,
             &config.download_dir,
@@ -1492,6 +1532,14 @@ pub fn validate_next_boot_patch() -> anyhow::Result<()> {
         );
         let mut first_error = None;
         while let Some(patch) = state.next_boot_patch() {
+            if matches!(
+                state.lifecycle().read_state(patch.number),
+                Some(lifecycle::PatchState::InstalledEncryptedTransportV1 { .. })
+            ) {
+                // A legacy candidate can fail into an encrypted last-good
+                // entry. Preserve that entry for a capable process.
+                break;
+            }
             let result = crate::response_auth::verify_boot_patch(config, &patch)
                 .and_then(|_| state.validate_next_boot_patch());
             let Err(err) = result else { break };
@@ -1519,7 +1567,11 @@ pub fn validate_next_boot_patch() -> anyhow::Result<()> {
             Some(err) => Err(err),
             None => Ok(()),
         }
-    })
+    });
+    if with_config(|c| Ok(crate::native_boot::needs_prepared_route(c)))? {
+        crate::native_boot::prepare()?;
+    }
+    result
 }
 
 /// The patch which will be run on next boot (which may still be the same
@@ -1542,6 +1594,22 @@ pub fn running_patch() -> anyhow::Result<Option<PatchInfo>> {
 
 pub fn report_launch_start() -> anyhow::Result<()> {
     shorebird_info!("Reporting launch start.");
+    if let Some(id) = crate::native_boot::selection_id() {
+        anyhow::ensure!(
+            crate::native_boot::begin(id)?,
+            "Prepared boot source became stale"
+        );
+        return Ok(());
+    }
+    // A capable integration must freeze BASE explicitly before reporting it.
+    if with_config(|c| Ok(crate::native_boot::needs_prepared_route(c)))? {
+        let selection = crate::native_boot::prepare()?;
+        anyhow::ensure!(
+            crate::native_boot::begin(selection.id)?,
+            "Prepared boot source became stale"
+        );
+        return Ok(());
+    }
 
     with_mut_state(|state| {
         let next_boot_patch = state.next_boot_patch();
@@ -1561,6 +1629,13 @@ pub fn report_launch_start() -> anyhow::Result<()> {
 /// This will mark the patch as bad and activate the next best patch.
 pub fn report_launch_failure() -> anyhow::Result<()> {
     shorebird_info!("Reporting failed launch.");
+    if let Some(id) = crate::native_boot::selection_id() {
+        anyhow::ensure!(
+            crate::native_boot::abort(id, 1)?,
+            "Prepared boot source is not abortable"
+        );
+        return Ok(());
+    }
 
     with_config(|config| {
         let mut state = UpdaterState::load_or_new_on_error(
@@ -1601,41 +1676,47 @@ pub fn report_launch_failure() -> anyhow::Result<()> {
 pub fn report_launch_success() -> anyhow::Result<()> {
     shorebird_info!("Reporting successful launch.");
 
-    let has_events = with_config(|config| {
-        // We can tell the UpdaterState that we have successfully booted from the "next" patch
-        // and make that the "current" patch.
-        let mut state = UpdaterState::load_or_new_on_error(
-            &config.storage_dir,
-            &config.download_dir,
-            &config.release_version,
-            config.patch_public_key.as_deref(),
-            config.patch_verification,
-        );
+    let has_events = crate::native_boot::with_success_guard(|prepared_patch| {
+        with_config(|config| {
+            // We can tell the UpdaterState that we have successfully booted from the "next" patch
+            // and make that the "current" patch.
+            let mut state = UpdaterState::load_or_new_on_error(
+                &config.storage_dir,
+                &config.download_dir,
+                &config.release_version,
+                config.patch_public_key.as_deref(),
+                config.patch_verification,
+            );
 
-        // None means we didn't boot from a patch, so there's nothing to record.
-        if let Some(booting_patch) = state.currently_booting_patch() {
-            // Get the last successfully booted patch before we record the boot success.
-            let previous_boot_patch = state.last_successfully_booted_patch();
+            // None means we didn't boot from a patch, so there's nothing to record.
+            if let Some(booting_patch) = state.currently_booting_patch().filter(|booting| {
+                prepared_patch.is_none_or(|prepared| {
+                    prepared == Some(booting.number)
+                        && crate::config::running_patch_number() == prepared
+                })
+            }) {
+                // Get the last successfully booted patch before we record the boot success.
+                let previous_boot_patch = state.last_successfully_booted_patch();
 
-            state.record_boot_success()?;
+                state.record_boot_success()?;
 
-            // A patch counts as installed the first time it boots, so a boot
-            // of the patch that last booted (including after a newer patch
-            // failed and we fell back to it) reports nothing.
-            if previous_boot_patch.map(|p| p.number) != Some(booting_patch.number) {
-                let event = PatchEvent::new(
-                    config,
-                    EventType::PatchInstallSuccess,
-                    booting_patch.number,
-                    state.client_id(),
-                    None,
-                );
-                queue_or_send_event(&mut state, config, event);
+                // A patch counts as installed the first time it boots, so a boot
+                // of the patch that last booted (including after a newer patch
+                // failed and we fell back to it) reports nothing.
+                if previous_boot_patch.map(|p| p.number) != Some(booting_patch.number) {
+                    let event = PatchEvent::new(
+                        config,
+                        EventType::PatchInstallSuccess,
+                        booting_patch.number,
+                        state.client_id(),
+                        None,
+                    );
+                    queue_or_send_event(&mut state, config, event);
+                }
             }
-        }
-        Ok(!state.copy_events(1).is_empty())
+            Ok(!state.copy_events(1).is_empty())
+        })
     })?;
-
     // Every launch sends what's queued, so events reach the server even when
     // the app never calls update() (auto_update off).
     if has_events {
@@ -5332,7 +5413,9 @@ mod authenticated_transport_tests {
     use super::*;
     use crate::{
         network::{testing_set_network_hooks, DownloadResult, Patch, PatchCheckResponse},
-        test_utils::{response_test_public_key, sign_test_message, write_fake_apk},
+        test_utils::{
+            install_fake_patch, response_test_public_key, sign_test_message, write_fake_apk,
+        },
     };
     use serial_test::serial;
     use tempfile::TempDir;
@@ -5729,14 +5812,11 @@ mod authenticated_transport_tests {
             .unwrap()
     }
 
-    #[test]
-    #[serial]
-    fn encrypted_native_update_waits_for_key_then_installs_and_validates_boot() -> Result<()> {
+    fn setup_encrypted_native_update(directory: &TempDir) {
         use base64::Engine;
         use ring::aead;
         use sha2::{Digest, Sha256};
-        let directory = TempDir::new()?;
-        init_authenticated_boot_test(&directory);
+        init_authenticated_boot_test(directory);
         write_fake_apk(
             directory.path().join("base.apk").to_str().unwrap(),
             &native_fixture_bytes("base_binary_base64"),
@@ -5817,6 +5897,13 @@ mod authenticated_transport_tests {
             },
             |_, _| Ok(()),
         );
+    }
+
+    #[test]
+    #[serial]
+    fn encrypted_native_update_waits_for_key_then_installs_and_validates_boot() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
         let error = update(None).unwrap_err();
         assert!(error.is::<crate::encrypted_patch::KeyResolutionFailed>());
         assert!(next_boot_patch()?.is_none());
@@ -5845,6 +5932,415 @@ mod authenticated_transport_tests {
             .path()
             .join("patches/1/authentication.json")
             .exists());
+        testing_reset_config();
+        Ok(())
+    }
+
+    fn enable_native_cache_for_test(budget: u64) {
+        crate::config::with_config_mut(|config| {
+            config.as_mut().unwrap().native_options = crate::native_boot::NativeOptions {
+                capability: 1,
+                max_image_bytes: budget,
+            };
+        });
+        TRANSPORT_WRONG_KEY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    #[serial]
+    fn encrypted_native_cache_persists_only_ciphertext_and_reconstructs_offline() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        let target = native_fixture_bytes("target_binary_base64");
+        enable_native_cache_for_test(target.len() as u64);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        let config = with_config(|c| Ok(c.clone()))?;
+        let transport = crate::native_cache::transport_path(&config, 1);
+        assert_eq!(std::fs::read(&transport)?, *TRANSPORT_BYTES.lock().unwrap());
+        assert!(!directory.path().join("patches/1/dlc.vmcode").exists());
+        assert!(crate::c_api::engine::shorebird_next_boot_patch_path().is_null());
+        assert!(
+            matches!(with_state(|s| Ok(s.lifecycle().read_state(1)))?, Some(crate::cache::lifecycle::PatchState::InstalledEncryptedTransportV1 { size, .. }) if size == target.len() as u64)
+        );
+        std::fs::remove_dir_all(&config.download_dir)?;
+        let patch = crate::response_auth::load_authenticated_boot_patch(&config, 1)?;
+        let client = with_state(|s| Ok(s.client_id()))?;
+        let (actual, size) =
+            crate::native_cache::reconstruct(&config, &patch, &client, &transport, Vec::new())?;
+        assert_eq!(actual, target);
+        assert_eq!(size, actual.len() as u64);
+        let mut names = std::fs::read_dir(transport.parent().unwrap())?
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["authentication.json", "state.json", "transport.aesgcm"]
+        );
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn encrypted_native_budget_failure_keeps_download_and_never_promotes_or_tombstones(
+    ) -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(native_fixture_bytes("target_binary_base64").len() as u64 - 1);
+        let error = update(None).unwrap_err();
+        assert!(crate::native_cache::is_resource_error(&error), "{error:#}");
+        with_mut_state(|s| {
+            assert!(s.next_boot_patch().is_none());
+            assert!(!s.is_known_bad_patch(1));
+            assert!(s.lifecycle().download_artifact_path(1).exists());
+            Ok(())
+        })?;
+        assert!(!directory.path().join("patches/1/dlc.vmcode").exists());
+        assert!(!directory.path().join("patches/1/transport.aesgcm").exists());
+        enable_native_cache_for_test(native_fixture_bytes("target_binary_base64").len() as u64);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        assert_eq!(
+            TRANSPORT_DOWNLOADS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn prepared_encrypted_key_failure_freezes_base_then_fresh_process_retries() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        TRANSPORT_WRONG_KEY.store(true, std::sync::atomic::Ordering::SeqCst);
+        let base = crate::native_boot::prepare()?;
+        assert!(base.patch.is_none());
+        assert!(crate::native_boot::begin(base.id)?);
+        report_launch_start()?;
+        assert!(running_patch()?.is_none());
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert!(!with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+        TRANSPORT_WRONG_KEY.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(crate::native_boot::prepare()?.id, base.id);
+        assert!(crate::native_boot::prepare()?.patch.is_none());
+        crate::native_boot::reset(); // A fresh-process selection; persistent state remains.
+        let patch = crate::native_boot::prepare()?;
+        assert_eq!(patch.patch, Some(1));
+        assert!(patch.file.is_some());
+        assert!(crate::native_boot::begin(patch.id)?);
+        assert!(crate::native_boot::begin(patch.id)?);
+        assert_eq!(running_patch()?.unwrap().number, 1);
+        report_launch_success()?;
+        assert!(crate::native_boot::begin(patch.id)?);
+        assert!(with_state(|s| Ok(s.currently_booting_patch().is_none()))?);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn prepared_fd_survives_path_replacement_and_retryable_abort_preserves_candidate() -> Result<()>
+    {
+        use std::io::{Read, Seek};
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        let mut source = crate::native_boot::prepare()?;
+        let config = with_config(|c| Ok(c.clone()))?;
+        let mut exported = crate::c_api::engine::ShorebirdBootSource {
+            struct_size: std::mem::size_of::<crate::c_api::engine::ShorebirdBootSource>(),
+            kind: 0,
+            selection_id: 0,
+            patch_number: 0,
+            image_size: 0,
+            fd: -1,
+            path: std::ptr::null_mut(),
+        };
+        assert!(unsafe { crate::c_api::engine::shorebird_prepare_boot_source(&mut exported) });
+        let duplicate = exported.fd;
+        assert!(duplicate >= 0);
+        assert_eq!(exported.selection_id, source.id);
+        assert_ne!(
+            unsafe { libc::fcntl(duplicate, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        unsafe {
+            crate::c_api::engine::shorebird_release_boot_source(&mut exported);
+        }
+        assert_eq!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) }, -1);
+        std::fs::write(
+            crate::native_cache::transport_path(&config, 1),
+            b"changed after selection",
+        )?;
+        let mut bytes = Vec::new();
+        let file = source.file.as_mut().unwrap();
+        file.rewind()?;
+        file.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, native_fixture_bytes("target_binary_base64"));
+        assert!(crate::native_boot::begin(source.id)?);
+        assert!(crate::native_boot::abort(source.id, 0)?);
+        assert!(!crate::native_boot::begin(source.id)?);
+        assert!(running_patch()?.is_none());
+        assert!(with_state(|s| Ok(
+            s.currently_booting_patch().is_none() && !s.is_known_bad_patch(1)
+        ))?);
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert!(crate::native_boot::prepare()?.patch.is_none());
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn prepared_legacy_selection_refuses_begin_after_rollback_and_is_immutable() -> Result<()> {
+        let directory = TempDir::new()?;
+        init_authenticated_boot_test(&directory);
+        install_authenticated(1)?;
+        let source = crate::native_boot::prepare()?;
+        assert_eq!(source.patch, Some(1));
+        assert!(source.path.is_some());
+        with_mut_state(|s| s.uninstall_patch(1))?;
+        assert!(!crate::native_boot::begin(source.id)?);
+        let base = crate::native_boot::prepare()?;
+        assert!(base.patch.is_none());
+        assert_ne!(base.id, source.id);
+        install_fake_patch(2)?;
+        assert_eq!(crate::native_boot::prepare()?.id, base.id);
+        assert!(crate::native_boot::begin(base.id)?);
+        report_launch_start()?;
+        assert!(running_patch()?.is_none());
+        assert_eq!(next_boot_patch()?.unwrap().number, 2);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    static REENTERED_BASE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe extern "C" fn transport_reentrant_key(
+        id: *const libc::c_char,
+        aad: *const libc::c_char,
+        output: *mut u8,
+        capacity: usize,
+        written: *mut usize,
+    ) -> bool {
+        let mut source = crate::c_api::engine::ShorebirdBootSource {
+            struct_size: std::mem::size_of::<crate::c_api::engine::ShorebirdBootSource>(),
+            kind: 99,
+            selection_id: 0,
+            patch_number: 0,
+            image_size: 0,
+            fd: -1,
+            path: std::ptr::null_mut(),
+        };
+        let prepared = unsafe { crate::c_api::engine::shorebird_prepare_boot_source(&mut source) };
+        REENTERED_BASE.store(
+            prepared && source.kind == 0 && source.selection_id != 0,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        unsafe {
+            crate::c_api::engine::shorebird_release_boot_source(&mut source);
+        }
+        crate::c_api::engine::shorebird_report_launch_start();
+        unsafe { transport_key(id, aad, output, capacity, written) }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn application_key_callback_can_reenter_source_and_launch_apis_without_deadlock() -> Result<()>
+    {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        REENTERED_BASE.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::config::with_config_mut(|c| {
+            c.as_mut().unwrap().patch_decryption_key_provider = Some(transport_reentrant_key)
+        });
+        let selected = crate::native_boot::prepare()?;
+        assert!(REENTERED_BASE.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(selected.patch.is_none());
+        assert!(running_patch()?.is_none());
+        assert!(with_state(|s| Ok(
+            s.currently_booting_patch().is_none() && !s.is_known_bad_patch(1)
+        ))?);
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_reopen_preserves_encrypted_candidate_and_records_base() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        crate::native_boot::reset();
+        crate::config::with_config_mut(|c| {
+            let c = c.as_mut().unwrap();
+            c.native_options = crate::native_boot::NativeOptions::default();
+            c.patch_decryption_key_provider = None;
+        });
+        validate_next_boot_patch()?;
+        report_launch_start()?;
+        assert!(running_patch()?.is_none());
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert!(!with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+        assert!(directory.path().join("patches/1/transport.aesgcm").exists());
+        assert!(crate::c_api::engine::shorebird_next_boot_patch_path().is_null());
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn refused_source_never_succeeds_when_abort_cannot_clear_breadcrumb() -> Result<()> {
+        let directory = TempDir::new()?;
+        init_authenticated_boot_test(&directory);
+        install_authenticated(1)?;
+        let selected = crate::native_boot::prepare()?;
+        assert!(crate::native_boot::begin(selected.id)?);
+        // Atomic pointer-write sibling cannot be created as a file. This
+        // produces a real bookkeeping I/O error without relying on chmod/root.
+        std::fs::create_dir(directory.path().join("pointers.json.tmp"))?;
+        assert!(crate::native_boot::abort(selected.id, 0).is_err());
+        std::fs::remove_dir(directory.path().join("pointers.json.tmp"))?;
+        assert!(running_patch()?.is_none());
+        report_launch_success()?;
+        with_state(|state| {
+            assert_eq!(state.currently_booting_patch().map(|p| p.number), Some(1));
+            assert!(state
+                .copy_events(100)
+                .iter()
+                .all(|e| e.identifier != EventType::PatchInstallSuccess));
+            Ok(())
+        })?;
+        crate::native_boot::reset();
+        handle_prior_boot_failure_if_necessary()?;
+        assert!(with_state(|state| Ok(state.is_known_bad_patch(1)))?);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_invalid_candidate_preserves_encrypted_last_good_fallback() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        with_mut_state(|state| {
+            state.record_boot_start_for_patch(1)?;
+            state.record_boot_success()
+        })?;
+        install_fake_patch(2)?;
+        std::fs::remove_file(directory.path().join("patches/2/dlc.vmcode"))?;
+        crate::config::with_config_mut(|c| {
+            let c = c.as_mut().unwrap();
+            c.native_options = crate::native_boot::NativeOptions::default();
+            c.patch_decryption_key_provider = None;
+        });
+        assert!(validate_next_boot_patch().is_err());
+        report_launch_start()?;
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert!(running_patch()?.is_none());
+        assert!(!with_state(|state| Ok(state.is_known_bad_patch(1)))?);
+        assert!(directory.path().join("patches/1/transport.aesgcm").exists());
+        testing_reset_config();
+        Ok(())
+    }
+
+    static BOOT_KEY_LOOKUPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn counting_transport_key(
+        id: *const libc::c_char,
+        aad: *const libc::c_char,
+        output: *mut u8,
+        capacity: usize,
+        written: *mut usize,
+    ) -> bool {
+        BOOT_KEY_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        unsafe { transport_key(id, aad, output, capacity, written) }
+    }
+
+    #[test]
+    #[serial]
+    fn invalid_persisted_auth_or_ciphertext_retires_candidate_before_key_lookup() -> Result<()> {
+        for bad_authentication in [true, false] {
+            let directory = TempDir::new()?;
+            setup_encrypted_native_update(&directory);
+            enable_native_cache_for_test(1024 * 1024);
+            assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+            BOOT_KEY_LOOKUPS.store(0, std::sync::atomic::Ordering::SeqCst);
+            crate::config::with_config_mut(|c| {
+                c.as_mut().unwrap().patch_decryption_key_provider = Some(counting_transport_key)
+            });
+            if bad_authentication {
+                std::fs::write(
+                    directory.path().join("patches/1/authentication.json"),
+                    b"{}",
+                )?;
+            } else {
+                std::fs::write(
+                    directory.path().join("patches/1/transport.aesgcm"),
+                    b"tampered ciphertext",
+                )?;
+            }
+            let source = crate::native_boot::prepare()?;
+            assert!(source.patch.is_none());
+            assert!(next_boot_patch()?.is_none());
+            assert!(with_state(|state| Ok(state.is_known_bad_patch(1)))?);
+            assert_eq!(
+                BOOT_KEY_LOOKUPS.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert!(!directory.path().join("patches/1/dlc.vmcode").exists());
+            testing_reset_config();
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn forged_local_native_size_is_bounded_before_allocation_without_tombstone() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_native_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        with_state(|state| {
+            if let Some(mut installed) = state.lifecycle().read_state(1) {
+                if let crate::cache::lifecycle::PatchState::InstalledEncryptedTransportV1 {
+                    size,
+                    ..
+                } = &mut installed
+                {
+                    *size = u64::MAX;
+                }
+                state.lifecycle().write_state(1, &installed)?;
+            }
+            Ok(())
+        })?;
+        BOOT_KEY_LOOKUPS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::config::with_config_mut(|c| {
+            c.as_mut().unwrap().patch_decryption_key_provider = Some(counting_transport_key)
+        });
+        assert!(crate::native_boot::prepare()?.patch.is_none());
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert!(!with_state(|state| Ok(state.is_known_bad_patch(1)))?);
+        assert_eq!(
+            BOOT_KEY_LOOKUPS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         testing_reset_config();
         Ok(())
     }

@@ -28,3 +28,6 @@ after_includes = """
 
 [fn]
 prefix = "SHOREBIRD_EXPORT"
+
+[export]
+include = ["ShorebirdNativeSourceCapability", "ShorebirdBootSourceKind", "ShorebirdBootSourceFailure"]

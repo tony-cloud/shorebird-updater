@@ -98,6 +98,12 @@ pub enum PatchState {
         signature: Option<String>,
         size: u64,
     },
+    /// Authenticated server ciphertext. No executable file is persisted.
+    InstalledEncryptedTransportV1 {
+        signature: Option<String>,
+        size: u64,
+        ciphertext_size: u64,
+    },
     /// Tombstone. The patch will not be re-attempted within this release.
     /// Optional fields preserve what we knew about the patch for diagnostics
     /// and for the `PatchInstallFailure` event we queue.
@@ -107,6 +113,15 @@ pub enum PatchState {
         signature: Option<String>,
         size: Option<u64>,
     },
+}
+
+impl PatchState {
+    pub fn is_installed(&self) -> bool {
+        matches!(
+            self,
+            Self::Installed { .. } | Self::InstalledEncryptedTransportV1 { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -255,7 +270,10 @@ impl PatchLifecycle {
                 size,
                 ..
             }) => (Some(hash), signature, Some(size)),
-            Some(PatchState::Installed { signature, size }) => (None, signature, Some(size)),
+            Some(PatchState::Installed { signature, size })
+            | Some(PatchState::InstalledEncryptedTransportV1 {
+                signature, size, ..
+            }) => (None, signature, Some(size)),
             Some(PatchState::Bad {
                 hash,
                 signature,
@@ -470,9 +488,9 @@ impl PatchLifecycle {
                 }
             }
             Some(PatchState::Downloaded { .. }) => DownloadAction::Fresh,
-            Some(PatchState::Installed { .. }) => {
-                DownloadAction::Skip(SkipReason::AlreadyInstalled)
-            }
+            Some(
+                PatchState::Installed { .. } | PatchState::InstalledEncryptedTransportV1 { .. },
+            ) => DownloadAction::Skip(SkipReason::AlreadyInstalled),
             // A signature refusal condemns only the exact (hash, signature)
             // pair refused, not the patch number: anyone able to send a bad
             // offer could otherwise block the genuine patch N on this device.
@@ -580,7 +598,9 @@ impl PatchLifecycle {
     /// prior `PatchManager::record_boot_start_for_patch` had.
     pub fn record_boot_start(&mut self, n: usize) -> Result<()> {
         match self.read_state(n) {
-            Some(PatchState::Installed { .. }) => {}
+            Some(
+                PatchState::Installed { .. } | PatchState::InstalledEncryptedTransportV1 { .. },
+            ) => {}
             other => {
                 bail!("record_boot_start({n}) expected Installed, got {other:?}");
             }
@@ -707,12 +727,12 @@ impl PatchLifecycle {
         let already_valid = self
             .pointers
             .next_boot_patch
-            .is_some_and(|n| matches!(self.read_state(n), Some(PatchState::Installed { .. })));
+            .is_some_and(|n| self.read_state(n).is_some_and(|s| s.is_installed()));
         if !already_valid {
             let new_target = self
                 .pointers
                 .last_booted_patch
-                .filter(|&lb| matches!(self.read_state(lb), Some(PatchState::Installed { .. })));
+                .filter(|&lb| self.read_state(lb).is_some_and(|s| s.is_installed()));
             if self.pointers.next_boot_patch != new_target {
                 self.pointers.next_boot_patch = new_target;
                 dirty = true;
@@ -729,14 +749,17 @@ impl PatchLifecycle {
     /// are forgotten via [`cleanup`]); a Bad tombstone in that slot is
     /// preserved.
     pub fn promote_to_next_boot(&mut self, n: usize) -> Result<()> {
-        if !matches!(self.read_state(n), Some(PatchState::Installed { .. })) {
+        if !self.read_state(n).is_some_and(|s| s.is_installed()) {
             bail!("promote_to_next_boot({n}) requires Installed state");
         }
         // If we're replacing an Installed-but-never-booted previous
         // next_boot, retire it. cleanup handles tombstones correctly.
         let last_booted = self.pointers.last_booted_patch;
         if let Some(prev) = self.pointers.next_boot_patch {
-            if prev != n && Some(prev) != last_booted {
+            if prev != n
+                && Some(prev) != last_booted
+                && Some(prev) != self.pointers.currently_booting_patch
+            {
                 self.cleanup(prev)?;
             }
         }
@@ -752,6 +775,9 @@ impl PatchLifecycle {
         mode: PatchVerificationMode,
     ) -> Result<()> {
         let (expected_size, signature) = match self.read_state(n) {
+            Some(PatchState::InstalledEncryptedTransportV1 { .. }) => {
+                bail!("Encrypted native patch requires prepared source validation")
+            }
             Some(PatchState::Installed { size, signature }) => (size, signature),
             other => bail!("Patch {n} is not Installed: {other:?}"),
         };
@@ -866,6 +892,89 @@ impl PatchLifecycle {
                 shorebird_error!("Failed to remove orphan download {:?}: {:?}", path, e);
             }
         }
+    }
+
+    /// Clear this boot's breadcrumb without condemning its authenticated bytes.
+    pub fn abort_boot_retryable(&mut self, n: usize) -> Result<()> {
+        if self.pointers.currently_booting_patch == Some(n) {
+            self.pointers.currently_booting_patch = None;
+            self.pointers.boot_started_at = None;
+            self.save_pointers()?;
+        }
+        Ok(())
+    }
+
+    /// Retire all legacy executable state before encrypted native selection.
+    /// Removal errors propagate: initialization must not expose plaintext.
+    pub fn retire_plaintext_installed(&mut self) -> Result<()> {
+        match std::fs::read_dir(self.patches_root()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if let Ok(n) = entry.file_name().to_string_lossy().parse::<usize>() {
+                        if matches!(self.read_state(n), Some(PatchState::Installed { .. })) {
+                            std::fs::remove_dir_all(entry.path())?;
+                            let download = self.download_artifact_path(n);
+                            if download.exists() {
+                                std::fs::remove_file(download)?;
+                            }
+                        } else {
+                            // Legacy inflation may have crashed before its Installed
+                            // state commit. Remove plaintext even for Downloaded,
+                            // malformed/unknown state, or encrypted-state leftovers.
+                            self.remove_plaintext_artifact(n)?;
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.recompute_next_boot()
+    }
+
+    fn remove_plaintext_artifact(&self, n: usize) -> Result<()> {
+        match std::fs::remove_file(self.installed_artifact_path(n)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn record_encrypted_install_complete(
+        &self,
+        n: usize,
+        size: u64,
+        ciphertext_size: u64,
+    ) -> Result<()> {
+        let signature = match self.read_state(n) {
+            Some(PatchState::Downloaded { signature, .. }) => signature,
+            other => bail!("encrypted install requires Downloaded state, got {other:?}"),
+        };
+        // Defend the representation invariant even when resuming an old,
+        // interrupted plaintext install; deletion failures prevent promotion.
+        self.remove_plaintext_artifact(n)?;
+        self.write_state(
+            n,
+            &PatchState::InstalledEncryptedTransportV1 {
+                signature,
+                size,
+                ciphertext_size,
+            },
+        )?;
+        // Ciphertext has already been synced into persistent storage.
+        let download = self.download_artifact_path(n);
+        if let Err(error) = std::fs::remove_file(download) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                // Installation is already committed; cleanup must not strand
+                // it before pointer promotion. Only ciphertext is left behind.
+                shorebird_error!(
+                    "Could not remove installed ciphertext download: {:#}",
+                    error
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Transitions `n` from `Downloaded` to `Installed`. `installed_size`
@@ -2300,5 +2409,96 @@ mod tests {
     fn promote_to_next_boot_requires_installed() {
         let (_tmp, mut lifecycle) = fixture();
         assert!(lifecycle.promote_to_next_boot(1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_cache_tests {
+    use super::*;
+    #[test]
+    fn migration_removes_plaintext_fallback_without_a_bad_tombstone_and_keeps_ciphertext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lifecycle =
+            PatchLifecycle::load_or_default(tmp.path().to_owned(), tmp.path().join("downloads"));
+        for n in [1, 2] {
+            lifecycle
+                .write_state(
+                    n,
+                    &PatchState::Installed {
+                        signature: None,
+                        size: 3,
+                    },
+                )
+                .unwrap();
+            std::fs::write(lifecycle.installed_artifact_path(n), b"elf").unwrap();
+        }
+        lifecycle.promote_to_next_boot(1).unwrap();
+        lifecycle.record_boot_start(1).unwrap();
+        lifecycle.record_boot_success().unwrap();
+        lifecycle.promote_to_next_boot(2).unwrap();
+        lifecycle
+            .write_state(
+                3,
+                &PatchState::InstalledEncryptedTransportV1 {
+                    signature: None,
+                    size: 3,
+                    ciphertext_size: 19,
+                },
+            )
+            .unwrap();
+        lifecycle
+            .write_state(
+                4,
+                &PatchState::Downloaded {
+                    url: "encrypted".into(),
+                    hash: "hash".into(),
+                    signature: None,
+                    size: 19,
+                },
+            )
+            .unwrap();
+        std::fs::write(lifecycle.installed_artifact_path(4), b"partial plaintext").unwrap();
+        lifecycle.retire_plaintext_installed().unwrap();
+        assert!(!lifecycle.installed_artifact_path(4).exists());
+        assert!(matches!(
+            lifecycle.read_state(4),
+            Some(PatchState::Downloaded { .. })
+        ));
+        assert_eq!(lifecycle.read_state(1), None);
+        assert_eq!(lifecycle.read_state(2), None);
+        assert!(lifecycle.read_state(3).unwrap().is_installed());
+        assert!(lifecycle.pointers().next_boot_patch.is_none());
+        assert!(lifecycle.pointers().last_booted_patch.is_none());
+        assert_eq!(
+            lifecycle.decide_start(2, "new", "hash", None),
+            DownloadAction::Fresh
+        );
+        lifecycle.retire_plaintext_installed().unwrap();
+    }
+    #[test]
+    fn installing_a_new_patch_keeps_currently_booting_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lifecycle =
+            PatchLifecycle::load_or_default(tmp.path().to_owned(), tmp.path().join("downloads"));
+        for n in [1, 2] {
+            lifecycle
+                .write_state(
+                    n,
+                    &PatchState::InstalledEncryptedTransportV1 {
+                        signature: None,
+                        size: 3,
+                        ciphertext_size: 19,
+                    },
+                )
+                .unwrap();
+        }
+        lifecycle.promote_to_next_boot(1).unwrap();
+        lifecycle.record_boot_start(1).unwrap();
+        lifecycle.promote_to_next_boot(2).unwrap();
+        assert!(lifecycle.read_state(1).unwrap().is_installed());
+        assert_eq!(lifecycle.pointers().currently_booting_patch, Some(1));
+        lifecycle.abort_boot_retryable(1).unwrap();
+        assert!(lifecycle.read_state(1).unwrap().is_installed());
+        assert_eq!(lifecycle.pointers().next_boot_patch, Some(2));
     }
 }

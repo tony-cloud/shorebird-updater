@@ -202,7 +202,17 @@ pub extern "C" fn shorebird_validate_next_boot_patch() {
 pub extern "C" fn shorebird_next_boot_patch_path() -> *mut c_char {
     log_on_error(
         || {
-            let maybe_path = updater::next_boot_patch()?.map(|p| p.path);
+            let maybe_path = updater::with_mut_state(|state| {
+                Ok(state
+                    .next_boot_patch()
+                    .filter(|patch| {
+                        matches!(
+                            state.lifecycle().read_state(patch.number),
+                            Some(crate::cache::lifecycle::PatchState::Installed { .. })
+                        )
+                    })
+                    .map(|p| p.path))
+            })?;
             path_to_c_string(maybe_path)
         },
         "fetching next_boot_patch_path",
@@ -250,4 +260,298 @@ pub extern "C" fn shorebird_report_launch_success() {
         "reporting launch success",
         (),
     );
+}
+
+/// Loader capability; this is independent of application key authorization.
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum ShorebirdNativeSourceCapability {
+    SHOREBIRD_NATIVE_SOURCE_LEGACY = 0,
+    SHOREBIRD_NATIVE_SOURCE_SEALED_FD_V1 = 1,
+}
+
+/// Additive engine options. Active encrypted mode requires a release-owned,
+/// nonzero expanded-image budget. Unsupported capabilities fail explicitly.
+#[repr(C)]
+pub struct ShorebirdEngineOptions {
+    pub struct_size: libc::size_t,
+    pub native_source_capability: u32,
+    pub max_native_image_bytes: u64,
+}
+
+/// Initialize atomically with source capability and cache migration. Identical
+/// successful repeated initialization preserves the immutable process selection.
+///
+/// # Safety
+/// Input pointers must reference readable C structs/strings for the call.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_init_with_options(
+    parameters: *const AppParameters,
+    base_callbacks: FileCallbacks,
+    compiled_yaml: *const c_char,
+    options: *const ShorebirdEngineOptions,
+) -> bool {
+    log_on_error(
+        || {
+            anyhow::ensure!(!options.is_null(), "Missing engine options");
+            anyhow::ensure!(
+                unsafe { (*options).struct_size } >= std::mem::size_of::<ShorebirdEngineOptions>(),
+                "Truncated engine options"
+            );
+            let options = unsafe { &*options };
+            crate::native_boot::initialize(
+                app_config_from_c(parameters)?,
+                base_callbacks,
+                to_rust(compiled_yaml)?,
+                crate::native_boot::NativeOptions {
+                    capability: options.native_source_capability,
+                    max_image_bytes: options.max_native_image_bytes,
+                },
+            )?;
+            Ok(true)
+        },
+        "initializing prepared native updater",
+        false,
+    )
+}
+
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum ShorebirdBootSourceKind {
+    SHOREBIRD_BOOT_BASE = 0,
+    SHOREBIRD_BOOT_PATH = 1,
+    SHOREBIRD_BOOT_FD = 2,
+}
+
+/// Caller owns fd/path until release or explicit detach (fd = -1/path = NULL).
+/// Set struct_size before prepare. Every successful result has a nonzero token.
+#[repr(C)]
+pub struct ShorebirdBootSource {
+    pub struct_size: libc::size_t,
+    pub kind: u32,
+    pub selection_id: u64,
+    pub patch_number: u64,
+    pub image_size: u64,
+    pub fd: i32,
+    pub path: *mut c_char,
+}
+impl ShorebirdBootSource {
+    fn empty() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>(),
+            kind: 0,
+            selection_id: 0,
+            patch_number: 0,
+            image_size: 0,
+            fd: -1,
+            path: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Prepare exactly one immutable process source. Key/source unavailability
+/// selects BASE and retains the authenticated candidate for a fresh process.
+/// Do not pass an already-owned output without releasing it first.
+///
+/// # Safety
+/// `out` must be null or reference writable storage of its advertised size.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_prepare_boot_source(out: *mut ShorebirdBootSource) -> bool {
+    log_on_error(
+        || {
+            anyhow::ensure!(!out.is_null(), "Missing source output");
+            anyhow::ensure!(
+                unsafe { (*out).struct_size } >= std::mem::size_of::<ShorebirdBootSource>(),
+                "Truncated source output"
+            );
+            unsafe {
+                out.write(ShorebirdBootSource::empty());
+            }
+            let source = crate::native_boot::prepare()?;
+            let path = source
+                .path
+                .map(|path| {
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("Native source path is not UTF-8"))
+                })
+                .transpose()?;
+            let path = path
+                .map(|path| allocate_c_string(&path))
+                .transpose()?
+                .unwrap_or(std::ptr::null_mut());
+            #[cfg(unix)]
+            let fd = {
+                use std::os::fd::IntoRawFd;
+                source.file.map(|file| file.into_raw_fd()).unwrap_or(-1)
+            };
+            #[cfg(not(unix))]
+            let fd = {
+                anyhow::ensure!(source.file.is_none(), "Native FD export unsupported");
+                -1
+            };
+            unsafe {
+                out.write(ShorebirdBootSource {
+                    struct_size: std::mem::size_of::<ShorebirdBootSource>(),
+                    kind: if fd >= 0 {
+                        2
+                    } else if !path.is_null() {
+                        1
+                    } else {
+                        0
+                    },
+                    selection_id: source.id,
+                    patch_number: source.patch.unwrap_or(0) as u64,
+                    image_size: source.size,
+                    fd,
+                    path,
+                });
+            }
+            Ok(true)
+        },
+        "preparing native boot source",
+        false,
+    )
+}
+
+/// Release still-owned fields. Does not undo the process selection or report
+/// any boot outcome. A detached FD must be set to -1 before calling this.
+///
+/// # Safety
+/// `source` must be null or a valid output whose still-owned fields came from
+/// prepare and have not already been freed/closed outside this ownership rule.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_release_boot_source(source: *mut ShorebirdBootSource) {
+    if source.is_null() {
+        return;
+    }
+    let source = unsafe { &mut *source };
+    if source.struct_size < std::mem::size_of::<ShorebirdBootSource>() {
+        return;
+    }
+    #[cfg(unix)]
+    if source.fd >= 0 {
+        unsafe {
+            libc::close(source.fd);
+        }
+    }
+    unsafe {
+        free_c_string(source.path);
+    }
+    *source = ShorebirdBootSource::empty();
+}
+
+/// Record a breadcrumb immediately before a loader can execute instructions.
+/// A stale token returns false and must never be loaded.
+#[no_mangle]
+pub extern "C" fn shorebird_begin_boot_source(selection_id: u64) -> bool {
+    log_on_error(
+        || crate::native_boot::begin(selection_id),
+        "beginning native boot source",
+        false,
+    )
+}
+
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum ShorebirdBootSourceFailure {
+    SHOREBIRD_BOOT_SOURCE_RETRYABLE = 0,
+    SHOREBIRD_BOOT_SOURCE_INVALID_IMAGE = 1,
+}
+
+/// Refuse a selected source and freeze BASE. Only concrete invalid-image
+/// evidence justifies INVALID_IMAGE; ambiguous platform loader errors retry.
+#[no_mangle]
+pub extern "C" fn shorebird_abort_boot_source(selection_id: u64, failure: u32) -> bool {
+    log_on_error(
+        || crate::native_boot::abort(selection_id, failure),
+        "aborting native boot source",
+        false,
+    )
+}
+
+#[cfg(test)]
+mod native_source_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn rejects_truncated_options_and_output_without_touching_adjacent_memory() {
+        crate::testing_reset_config();
+        let size_only = std::mem::size_of::<usize>();
+        assert!(!unsafe {
+            shorebird_init_with_options(
+                std::ptr::null(),
+                FileCallbacks::new(),
+                std::ptr::null(),
+                (&size_only as *const usize).cast(),
+            )
+        });
+        assert!(!unsafe {
+            shorebird_prepare_boot_source((&size_only as *const usize).cast_mut().cast())
+        });
+        assert_eq!(size_only, std::mem::size_of::<usize>());
+        assert!(crate::config::with_config(|_| Ok(())).is_err());
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn failed_prepare_resets_valid_outputs_and_release_is_idempotent() {
+        crate::testing_reset_config();
+        let mut output = ShorebirdBootSource::empty();
+        output.kind = 999;
+        output.selection_id = 42;
+        output.image_size = 30;
+        assert!(!unsafe { shorebird_prepare_boot_source(&mut output) });
+        assert_eq!(output.kind, 0);
+        assert_eq!(output.selection_id, 0);
+        assert_eq!(output.fd, -1);
+        assert!(output.path.is_null());
+        unsafe {
+            shorebird_release_boot_source(&mut output);
+            shorebird_release_boot_source(&mut output);
+        }
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn repeated_base_prepare_reuses_identity_and_release_does_not_begin_boot() {
+        crate::testing_reset_config();
+        let directory = tempfile::tempdir().unwrap();
+        crate::native_boot::initialize(
+            crate::AppConfig {
+                app_storage_dir: directory.path().to_str().unwrap().to_owned(),
+                code_cache_dir: directory.path().to_str().unwrap().to_owned(),
+                release_version: "test".to_owned(),
+                original_libapp_paths: vec![directory
+                    .path()
+                    .join("lib/arch/libapp.so")
+                    .to_str()
+                    .unwrap()
+                    .to_owned()],
+            },
+            FileCallbacks::new(),
+            "app_id: test".to_owned(),
+            crate::native_boot::NativeOptions::default(),
+        )
+        .unwrap();
+        let mut first = ShorebirdBootSource::empty();
+        let mut second = ShorebirdBootSource::empty();
+        assert!(unsafe { shorebird_prepare_boot_source(&mut first) });
+        assert!(unsafe { shorebird_prepare_boot_source(&mut second) });
+        assert_ne!(first.selection_id, 0);
+        assert_eq!(first.selection_id, second.selection_id);
+        assert_eq!(first.kind, 0);
+        assert_eq!(first.patch_number, 0);
+        assert_eq!(first.fd, -1);
+        unsafe {
+            shorebird_release_boot_source(&mut first);
+            shorebird_release_boot_source(&mut second);
+        }
+        assert!(crate::with_state(|s| Ok(s.currently_booting_patch().is_none())).unwrap());
+        crate::testing_reset_config();
+    }
 }

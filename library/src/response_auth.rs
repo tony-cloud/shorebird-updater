@@ -175,11 +175,23 @@ pub fn verify_boot_patch(config: &UpdateConfig, patch: &crate::cache::PatchInfo)
 
 fn verify_boot_patch_inner(config: &UpdateConfig, patch: &crate::cache::PatchInfo) -> Result<()> {
     let path = authentication_path(config, patch.number);
-    if !path.exists() {
-        if config.patch_response_verification == PatchResponseVerificationMode::Required {
-            bail!("Installed patch authentication is missing");
-        }
+    if !path.exists()
+        && config.patch_response_verification != PatchResponseVerificationMode::Required
+    {
         return Ok(());
+    }
+    let signed_patch = load_authenticated_boot_patch(config, patch.number)?;
+    if signed_patch.hash != crate::cache::hash_file(&patch.path)? {
+        bail!("Installed patch authentication does not match selected bytes");
+    }
+    Ok(())
+}
+
+/// Recover publisher-authenticated metadata without treating ciphertext as code.
+pub(crate) fn load_authenticated_boot_patch(config: &UpdateConfig, number: usize) -> Result<Patch> {
+    let path = authentication_path(config, number);
+    if !path.exists() {
+        bail!("Installed patch authentication is missing");
     }
     let authentication: ResponseAuthentication = crate::cache::disk_io::read(&path)?;
     let key = config
@@ -193,21 +205,23 @@ fn verify_boot_patch_inner(config: &UpdateConfig, patch: &crate::cache::PatchInf
         || authenticated.platform != crate::config::current_platform()
         || authenticated.arch != crate::config::current_arch()
         || !authenticated.patch_available
-        || authenticated
-            .rolled_back_patch_numbers
-            .contains(&patch.number)
+        || authenticated.rolled_back_patch_numbers.contains(&number)
     {
         bail!("Installed patch authentication does not match current app context");
     }
     let signed_patch = authenticated
         .patch
         .context("Installed patch authentication has no patch")?;
-    if signed_patch.number != patch.number
-        || signed_patch.hash != crate::cache::hash_file(&patch.path)?
-    {
-        bail!("Installed patch authentication does not match selected patch number or bytes");
+    if signed_patch.number != number {
+        bail!("Installed patch authentication does not match selected patch number");
     }
-    Ok(())
+    Ok(Patch {
+        number: signed_patch.number,
+        hash: signed_patch.hash,
+        download_url: signed_patch.download_url,
+        hash_signature: signed_patch.hash_signature,
+        encryption: signed_patch.encryption,
+    })
 }
 
 #[cfg(test)]

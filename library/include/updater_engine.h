@@ -15,6 +15,46 @@
 
 
 /**
+ * Loader capability; this is independent of application key authorization.
+ */
+enum ShorebirdNativeSourceCapability
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  SHOREBIRD_NATIVE_SOURCE_LEGACY = 0,
+  SHOREBIRD_NATIVE_SOURCE_SEALED_FD_V1 = 1,
+};
+#ifndef __cplusplus
+typedef uint32_t ShorebirdNativeSourceCapability;
+#endif // __cplusplus
+
+enum ShorebirdBootSourceKind
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  SHOREBIRD_BOOT_BASE = 0,
+  SHOREBIRD_BOOT_PATH = 1,
+  SHOREBIRD_BOOT_FD = 2,
+};
+#ifndef __cplusplus
+typedef uint32_t ShorebirdBootSourceKind;
+#endif // __cplusplus
+
+enum ShorebirdBootSourceFailure
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  SHOREBIRD_BOOT_SOURCE_RETRYABLE = 0,
+  SHOREBIRD_BOOT_SOURCE_INVALID_IMAGE = 1,
+};
+#ifndef __cplusplus
+typedef uint32_t ShorebirdBootSourceFailure;
+#endif // __cplusplus
+
+/**
  * Struct containing configuration parameters for the updater.
  * Passed to `shorebird_init`.
  * NOTE: If this struct is changed all language bindings must be updated.
@@ -68,6 +108,30 @@ typedef struct FileCallbacks {
    */
   void (*close)(void *file_handle);
 } FileCallbacks;
+
+/**
+ * Additive engine options. Active encrypted mode requires a release-owned,
+ * nonzero expanded-image budget. Unsupported capabilities fail explicitly.
+ */
+typedef struct ShorebirdEngineOptions {
+  size_t struct_size;
+  uint32_t native_source_capability;
+  uint64_t max_native_image_bytes;
+} ShorebirdEngineOptions;
+
+/**
+ * Caller owns fd/path until release or explicit detach (fd = -1/path = NULL).
+ * Set struct_size before prepare. Every successful result has a nonzero token.
+ */
+typedef struct ShorebirdBootSource {
+  size_t struct_size;
+  uint32_t kind;
+  uint64_t selection_id;
+  uint64_t patch_number;
+  uint64_t image_size;
+  int32_t fd;
+  char *path;
+} ShorebirdBootSource;
 
 #ifdef __cplusplus
 extern "C" {
@@ -156,6 +220,55 @@ SHOREBIRD_EXPORT void shorebird_report_launch_failure(void);
  * `shorebird_report_launch_start` to mark a patch as having booted cleanly.
  */
 SHOREBIRD_EXPORT void shorebird_report_launch_success(void);
+
+/**
+ * Initialize atomically with source capability and cache migration. Identical
+ * successful repeated initialization preserves the immutable process selection.
+ *
+ * # Safety
+ * Input pointers must reference readable C structs/strings for the call.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_init_with_options(const struct AppParameters *parameters,
+                                 struct FileCallbacks base_callbacks,
+                                 const char *compiled_yaml,
+                                 const struct ShorebirdEngineOptions *options);
+
+/**
+ * Prepare exactly one immutable process source. Key/source unavailability
+ * selects BASE and retains the authenticated candidate for a fresh process.
+ * Do not pass an already-owned output without releasing it first.
+ *
+ * # Safety
+ * `out` must be null or reference writable storage of its advertised size.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_prepare_boot_source(struct ShorebirdBootSource *out);
+
+/**
+ * Release still-owned fields. Does not undo the process selection or report
+ * any boot outcome. A detached FD must be set to -1 before calling this.
+ *
+ * # Safety
+ * `source` must be null or a valid output whose still-owned fields came from
+ * prepare and have not already been freed/closed outside this ownership rule.
+ */
+SHOREBIRD_EXPORT
+void shorebird_release_boot_source(struct ShorebirdBootSource *source);
+
+/**
+ * Record a breadcrumb immediately before a loader can execute instructions.
+ * A stale token returns false and must never be loaded.
+ */
+SHOREBIRD_EXPORT bool shorebird_begin_boot_source(uint64_t selection_id);
+
+/**
+ * Refuse a selected source and freeze BASE. Only concrete invalid-image
+ * evidence justifies INVALID_IMAGE; ambiguous platform loader errors retry.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_abort_boot_source(uint64_t selection_id,
+                                 uint32_t failure);
 
 #ifdef __cplusplus
 }  // extern "C"
