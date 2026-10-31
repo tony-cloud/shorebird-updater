@@ -268,6 +268,7 @@ pub extern "C" fn shorebird_report_launch_success() {
 pub enum ShorebirdNativeSourceCapability {
     SHOREBIRD_NATIVE_SOURCE_LEGACY = 0,
     SHOREBIRD_NATIVE_SOURCE_SEALED_FD_V1 = 1,
+    SHOREBIRD_NATIVE_SOURCE_VERIFIED_MEMORY_V1 = 2,
 }
 
 /// Additive engine options. Active encrypted mode requires a release-owned,
@@ -321,6 +322,7 @@ pub enum ShorebirdBootSourceKind {
     SHOREBIRD_BOOT_BASE = 0,
     SHOREBIRD_BOOT_PATH = 1,
     SHOREBIRD_BOOT_FD = 2,
+    SHOREBIRD_BOOT_MEMORY = 3,
 }
 
 /// Caller owns fd/path until release or explicit detach (fd = -1/path = NULL).
@@ -393,7 +395,9 @@ pub unsafe extern "C" fn shorebird_prepare_boot_source(out: *mut ShorebirdBootSo
             unsafe {
                 out.write(ShorebirdBootSource {
                     struct_size: std::mem::size_of::<ShorebirdBootSource>(),
-                    kind: if fd >= 0 {
+                    kind: if source.memory.is_some() {
+                        3
+                    } else if fd >= 0 {
                         2
                     } else if !path.is_null() {
                         1
@@ -425,10 +429,10 @@ pub unsafe extern "C" fn shorebird_release_boot_source(source: *mut ShorebirdBoo
     if source.is_null() {
         return;
     }
-    let source = unsafe { &mut *source };
-    if source.struct_size < std::mem::size_of::<ShorebirdBootSource>() {
+    if unsafe { (*source).struct_size } < std::mem::size_of::<ShorebirdBootSource>() {
         return;
     }
+    let source = unsafe { &mut *source };
     #[cfg(unix)]
     if source.fd >= 0 {
         unsafe {
@@ -439,6 +443,90 @@ pub unsafe extern "C" fn shorebird_release_boot_source(source: *mut ShorebirdBoo
         free_c_string(source.path);
     }
     *source = ShorebirdBootSource::empty();
+}
+
+/// Owned lease of immutable anonymous bytes. Set struct_size before acquire.
+/// Never copy an owned lease or dereference private_owner. Bytes remain valid
+/// until release, including after selection abort; acquisition does not begin boot.
+#[repr(C)]
+pub struct ShorebirdBootMemory {
+    pub struct_size: libc::size_t,
+    pub data: *const u8,
+    pub length: u64,
+    pub private_owner: *mut libc::c_void,
+}
+impl ShorebirdBootMemory {
+    fn empty() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>(),
+            data: std::ptr::null(),
+            length: 0,
+            private_owner: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Acquire an existing memory selection without reconstructing or copying it.
+/// Stale and non-memory tokens fail with an empty output. Release any existing
+/// lease before reusing its output storage.
+///
+/// # Safety
+/// `out` must be null or reference writable storage of its advertised size.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_acquire_boot_source_memory(
+    selection_id: u64,
+    out: *mut ShorebirdBootMemory,
+) -> bool {
+    log_on_error(
+        || {
+            anyhow::ensure!(!out.is_null(), "Missing memory output");
+            anyhow::ensure!(
+                unsafe { (*out).struct_size } >= std::mem::size_of::<ShorebirdBootMemory>(),
+                "Truncated memory output"
+            );
+            unsafe { out.write(ShorebirdBootMemory::empty()) };
+            let Some(memory) = crate::native_boot::acquire_memory(selection_id) else {
+                return Ok(false);
+            };
+            let lease = ShorebirdBootMemory {
+                struct_size: std::mem::size_of::<ShorebirdBootMemory>(),
+                data: memory.bytes().as_ptr(),
+                length: memory.bytes().len() as u64,
+                private_owner: std::sync::Arc::into_raw(memory).cast_mut().cast(),
+            };
+            unsafe { out.write(lease) };
+            Ok(true)
+        },
+        "acquiring native boot memory",
+        false,
+    )
+}
+
+/// Release a lease; an already emptied result is harmless. Does not change
+/// selection or boot state.
+///
+/// # Safety
+/// `memory` must be null or a valid output whose owner came from acquire and
+/// has not been copied, freed or otherwise changed outside this ownership rule.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_release_boot_source_memory(memory: *mut ShorebirdBootMemory) {
+    if memory.is_null() {
+        return;
+    }
+    if unsafe { (*memory).struct_size } < std::mem::size_of::<ShorebirdBootMemory>() {
+        return;
+    }
+    let memory = unsafe { &mut *memory };
+    if !memory.private_owner.is_null() {
+        unsafe {
+            drop(std::sync::Arc::from_raw(
+                memory
+                    .private_owner
+                    .cast::<crate::native_cache::VerifiedMemory>(),
+            ));
+        }
+    }
+    *memory = ShorebirdBootMemory::empty();
 }
 
 /// Record a breadcrumb immediately before a loader can execute instructions.
@@ -491,6 +579,13 @@ mod native_source_tests {
         assert!(!unsafe {
             shorebird_prepare_boot_source((&size_only as *const usize).cast_mut().cast())
         });
+        assert!(!unsafe {
+            shorebird_acquire_boot_source_memory(1, (&size_only as *const usize).cast_mut().cast())
+        });
+        unsafe {
+            shorebird_release_boot_source_memory((&size_only as *const usize).cast_mut().cast());
+            shorebird_release_boot_source((&size_only as *const usize).cast_mut().cast());
+        }
         assert_eq!(size_only, std::mem::size_of::<usize>());
         assert!(crate::config::with_config(|_| Ok(())).is_err());
         crate::testing_reset_config();
@@ -512,6 +607,26 @@ mod native_source_tests {
         unsafe {
             shorebird_release_boot_source(&mut output);
             shorebird_release_boot_source(&mut output);
+        }
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn missing_memory_selection_empties_output_and_null_release_is_harmless() {
+        crate::testing_reset_config();
+        let mut output = ShorebirdBootMemory::empty();
+        output.length = 99;
+        output.data = std::ptr::dangling();
+        assert!(!unsafe { shorebird_acquire_boot_source_memory(42, &mut output) });
+        assert!(output.data.is_null());
+        assert!(output.private_owner.is_null());
+        assert_eq!(output.length, 0);
+        assert!(!unsafe { shorebird_acquire_boot_source_memory(42, std::ptr::null_mut()) });
+        unsafe {
+            shorebird_release_boot_source_memory(&mut output);
+            shorebird_release_boot_source_memory(&mut output);
+            shorebird_release_boot_source_memory(std::ptr::null_mut());
         }
         crate::testing_reset_config();
     }

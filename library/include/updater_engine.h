@@ -24,6 +24,7 @@ enum ShorebirdNativeSourceCapability
  {
   SHOREBIRD_NATIVE_SOURCE_LEGACY = 0,
   SHOREBIRD_NATIVE_SOURCE_SEALED_FD_V1 = 1,
+  SHOREBIRD_NATIVE_SOURCE_VERIFIED_MEMORY_V1 = 2,
 };
 #ifndef __cplusplus
 typedef uint32_t ShorebirdNativeSourceCapability;
@@ -37,6 +38,7 @@ enum ShorebirdBootSourceKind
   SHOREBIRD_BOOT_BASE = 0,
   SHOREBIRD_BOOT_PATH = 1,
   SHOREBIRD_BOOT_FD = 2,
+  SHOREBIRD_BOOT_MEMORY = 3,
 };
 #ifndef __cplusplus
 typedef uint32_t ShorebirdBootSourceKind;
@@ -132,6 +134,18 @@ typedef struct ShorebirdBootSource {
   int32_t fd;
   char *path;
 } ShorebirdBootSource;
+
+/**
+ * Owned lease of immutable anonymous bytes. Set struct_size before acquire.
+ * Never copy an owned lease or dereference private_owner. Bytes remain valid
+ * until release, including after selection abort; acquisition does not begin boot.
+ */
+typedef struct ShorebirdBootMemory {
+  size_t struct_size;
+  const uint8_t *data;
+  uint64_t length;
+  void *private_owner;
+} ShorebirdBootMemory;
 
 #ifdef __cplusplus
 extern "C" {
@@ -255,6 +269,29 @@ bool shorebird_prepare_boot_source(struct ShorebirdBootSource *out);
  */
 SHOREBIRD_EXPORT
 void shorebird_release_boot_source(struct ShorebirdBootSource *source);
+
+/**
+ * Acquire an existing memory selection without reconstructing or copying it.
+ * Stale and non-memory tokens fail with an empty output. Release any existing
+ * lease before reusing its output storage.
+ *
+ * # Safety
+ * `out` must be null or reference writable storage of its advertised size.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_acquire_boot_source_memory(uint64_t selection_id,
+                                          struct ShorebirdBootMemory *out);
+
+/**
+ * Release a lease; an already emptied result is harmless. Does not change
+ * selection or boot state.
+ *
+ * # Safety
+ * `memory` must be null or a valid output whose owner came from acquire and
+ * has not been copied, freed or otherwise changed outside this ownership rule.
+ */
+SHOREBIRD_EXPORT
+void shorebird_release_boot_source_memory(struct ShorebirdBootMemory *memory);
 
 /**
  * Record a breadcrumb immediately before a loader can execute instructions.

@@ -5946,6 +5946,213 @@ mod authenticated_transport_tests {
         TRANSPORT_WRONG_KEY.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    // Shared reconstruction/lease tests deliberately bypass platform admission.
+    // Production capability 2 remains Windows-only; these are not loader tests.
+    fn enable_memory_cache_for_test(budget: u64) {
+        enable_native_cache_for_test(budget);
+        crate::config::with_config_mut(|c| c.as_mut().unwrap().native_options.capability = 2);
+    }
+
+    fn empty_memory_lease() -> crate::c_api::engine::ShorebirdBootMemory {
+        crate::c_api::engine::ShorebirdBootMemory {
+            struct_size: std::mem::size_of::<crate::c_api::engine::ShorebirdBootMemory>(),
+            data: std::ptr::null(),
+            length: 0,
+            private_owner: std::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn prepared_memory_leases_share_one_image_and_survive_abort_without_reconstruction(
+    ) -> Result<()> {
+        use crate::c_api::engine::{
+            shorebird_acquire_boot_source_memory as acquire,
+            shorebird_release_boot_source_memory as release,
+        };
+        use std::sync::Arc;
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        let target = native_fixture_bytes("target_binary_base64");
+        enable_memory_cache_for_test(target.len() as u64);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        BOOT_KEY_LOOKUPS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::config::with_config_mut(|c| {
+            c.as_mut().unwrap().patch_decryption_key_provider = Some(counting_transport_key)
+        });
+        let source = crate::native_boot::prepare()?;
+        assert_eq!(source.patch, Some(1));
+        assert!(source.file.is_none() && source.path.is_none());
+        let memory = source.memory.as_ref().unwrap();
+        assert_eq!(memory.bytes(), target);
+        assert_eq!(Arc::strong_count(memory), 2); // selection + this source
+        let repeated = crate::native_boot::prepare()?;
+        assert_eq!(repeated.id, source.id);
+        assert!(Arc::ptr_eq(memory, repeated.memory.as_ref().unwrap()));
+        drop(repeated);
+        let mut first = empty_memory_lease();
+        let mut second = empty_memory_lease();
+        assert!(unsafe { acquire(source.id, &mut first) });
+        assert!(unsafe { acquire(source.id, &mut second) });
+        assert_eq!(first.data, memory.bytes().as_ptr());
+        assert_eq!(first.data, second.data);
+        assert_eq!(first.private_owner, second.private_owner);
+        assert_eq!(first.length, target.len() as u64);
+        assert_eq!(Arc::strong_count(memory), 4);
+        assert!(with_state(|s| Ok(s.currently_booting_patch().is_none()))?);
+        assert_eq!(
+            BOOT_KEY_LOOKUPS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let mut exported = crate::c_api::engine::ShorebirdBootSource {
+            struct_size: std::mem::size_of::<crate::c_api::engine::ShorebirdBootSource>(),
+            kind: 0,
+            selection_id: 0,
+            patch_number: 0,
+            image_size: 0,
+            fd: -1,
+            path: std::ptr::null_mut(),
+        };
+        assert!(unsafe { crate::c_api::engine::shorebird_prepare_boot_source(&mut exported) });
+        assert_eq!(exported.kind, 3);
+        assert_eq!(exported.selection_id, source.id);
+        assert_eq!(exported.image_size, target.len() as u64);
+        assert_eq!(exported.fd, -1);
+        assert!(exported.path.is_null());
+        unsafe { crate::c_api::engine::shorebird_release_boot_source(&mut exported) };
+        let config = with_config(|c| Ok(c.clone()))?;
+        std::fs::write(
+            crate::native_cache::transport_path(&config, 1),
+            b"replaced ciphertext",
+        )?;
+        assert!(crate::native_boot::begin(source.id)?);
+        assert!(crate::native_boot::abort(source.id, 0)?);
+        assert_eq!(Arc::strong_count(memory), 3); // original source + two leases
+        assert!(!crate::native_boot::begin(source.id)?);
+        let base = crate::native_boot::prepare()?;
+        let mut refused = empty_memory_lease();
+        for token in [0, source.id, base.id] {
+            assert!(!unsafe { acquire(token, &mut refused) });
+            assert!(refused.data.is_null() && refused.private_owner.is_null());
+            assert_eq!(refused.length, 0);
+        }
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(first.data, first.length as usize) },
+            target
+        );
+        unsafe {
+            release(&mut first);
+            release(&mut first);
+        }
+        assert_eq!(Arc::strong_count(memory), 2);
+        let weak = Arc::downgrade(memory);
+        drop(source);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(second.data, second.length as usize) },
+            target
+        );
+        unsafe { release(&mut second) };
+        assert!(weak.upgrade().is_none());
+        assert!(running_patch()?.is_none());
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert!(!with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+        assert!(!directory.path().join("patches/1/dlc.vmcode").exists());
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn prepared_memory_concurrent_readers_hold_leases_across_abort() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_memory_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        let source = crate::native_boot::prepare()?;
+        let barrier = Arc::new(Barrier::new(5));
+        let readers = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let id = source.id;
+                std::thread::spawn(move || {
+                    let mut lease = empty_memory_lease();
+                    assert!(unsafe {
+                        crate::c_api::engine::shorebird_acquire_boot_source_memory(id, &mut lease)
+                    });
+                    barrier.wait();
+                    barrier.wait();
+                    let expected = native_fixture_bytes("target_binary_base64");
+                    for _ in 0..20 {
+                        assert_eq!(
+                            unsafe {
+                                std::slice::from_raw_parts(lease.data, lease.length as usize)
+                            },
+                            expected
+                        );
+                    }
+                    unsafe {
+                        crate::c_api::engine::shorebird_release_boot_source_memory(&mut lease)
+                    };
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        assert!(crate::native_boot::abort(source.id, 0)?);
+        barrier.wait();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(Arc::strong_count(source.memory.as_ref().unwrap()), 1);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn prepared_memory_resource_and_key_refusal_freeze_base_and_retain_ciphertext() -> Result<()> {
+        for size in [0, u64::MAX, 1] {
+            let directory = TempDir::new()?;
+            setup_encrypted_native_update(&directory);
+            enable_memory_cache_for_test(1024 * 1024);
+            assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+            with_state(|state| {
+                let mut installed = state.lifecycle().read_state(1).unwrap();
+                if let crate::cache::lifecycle::PatchState::InstalledEncryptedTransportV1 {
+                    size: hint,
+                    ..
+                } = &mut installed
+                {
+                    *hint = size;
+                }
+                state.lifecycle().write_state(1, &installed)
+            })?;
+            let base = crate::native_boot::prepare()?;
+            assert!(base.patch.is_none() && base.memory.is_none());
+            assert_eq!(crate::native_boot::prepare()?.id, base.id);
+            assert!(crate::native_boot::acquire_memory(base.id).is_none());
+            assert_eq!(next_boot_patch()?.unwrap().number, 1);
+            assert!(!with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+            assert!(directory.path().join("patches/1/transport.aesgcm").exists());
+            testing_reset_config();
+        }
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_memory_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        TRANSPORT_WRONG_KEY.store(true, std::sync::atomic::Ordering::SeqCst);
+        let base = crate::native_boot::prepare()?;
+        assert!(base.patch.is_none());
+        TRANSPORT_WRONG_KEY.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(crate::native_boot::prepare()?.id, base.id);
+        crate::native_boot::reset();
+        assert!(crate::native_boot::prepare()?.memory.is_some());
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        testing_reset_config();
+        Ok(())
+    }
+
     #[test]
     #[serial]
     fn encrypted_native_cache_persists_only_ciphertext_and_reconstructs_offline() -> Result<()> {
@@ -6120,11 +6327,9 @@ mod authenticated_transport_tests {
         Ok(())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     static REENTERED_BASE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe extern "C" fn transport_reentrant_key(
         id: *const libc::c_char,
         aad: *const libc::c_char,
@@ -6174,6 +6379,52 @@ mod authenticated_transport_tests {
             s.currently_booting_patch().is_none() && !s.is_known_bad_patch(1)
         ))?);
         assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn prepared_memory_key_callback_reentry_freezes_base_without_deadlock() -> Result<()> {
+        let directory = TempDir::new()?;
+        setup_encrypted_native_update(&directory);
+        enable_memory_cache_for_test(1024 * 1024);
+        assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
+        REENTERED_BASE.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::config::with_config_mut(|c| {
+            c.as_mut().unwrap().patch_decryption_key_provider = Some(transport_reentrant_key)
+        });
+        let selected = crate::native_boot::prepare()?;
+        assert!(REENTERED_BASE.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(selected.patch.is_none() && selected.memory.is_none());
+        assert!(running_patch()?.is_none());
+        assert!(with_state(|s| Ok(
+            s.currently_booting_patch().is_none() && !s.is_known_bad_patch(1)
+        ))?);
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn prepared_memory_capability_without_provider_preserves_legacy_path_behavior() -> Result<()> {
+        let directory = TempDir::new()?;
+        init_authenticated_boot_test(&directory);
+        install_authenticated(1)?;
+        crate::config::with_config_mut(|c| {
+            c.as_mut().unwrap().native_options = crate::native_boot::NativeOptions {
+                capability: 2,
+                max_image_bytes: 0,
+            };
+        });
+        let selected = crate::native_boot::prepare()?;
+        assert_eq!(selected.patch, Some(1));
+        assert!(selected.path.is_some());
+        assert!(selected.file.is_none() && selected.memory.is_none());
+        assert!(crate::native_boot::acquire_memory(selected.id).is_none());
+        assert!(crate::native_boot::begin(selected.id)?);
+        report_launch_success()?;
         testing_reset_config();
         Ok(())
     }
@@ -6276,10 +6527,13 @@ mod authenticated_transport_tests {
     #[test]
     #[serial]
     fn invalid_persisted_auth_or_ciphertext_retires_candidate_before_key_lookup() -> Result<()> {
-        for bad_authentication in [true, false] {
+        for (capability, bad_authentication) in [(1, true), (1, false), (2, true), (2, false)] {
             let directory = TempDir::new()?;
             setup_encrypted_native_update(&directory);
             enable_native_cache_for_test(1024 * 1024);
+            crate::config::with_config_mut(|c| {
+                c.as_mut().unwrap().native_options.capability = capability
+            });
             assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
             BOOT_KEY_LOOKUPS.store(0, std::sync::atomic::Ordering::SeqCst);
             crate::config::with_config_mut(|c| {

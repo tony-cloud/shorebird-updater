@@ -21,6 +21,92 @@ impl std::fmt::Display for ResourceLimit {
 }
 impl std::error::Error for ResourceLimit {}
 
+#[cfg(target_os = "windows")]
+mod windows_memory;
+#[cfg(not(target_os = "windows"))]
+use memmap2::{Mmap as ReadOnlyMapping, MmapMut as WritableMapping};
+#[cfg(target_os = "windows")]
+use windows_memory::{ReadOnlyMapping, WritableMapping};
+
+fn writable_mapping(length: usize) -> std::io::Result<WritableMapping> {
+    #[cfg(target_os = "windows")]
+    {
+        // memmap2's Windows map_anon initially creates an executable section.
+        // This dedicated allocator only requests data-page permissions.
+        WritableMapping::new(length)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        memmap2::MmapOptions::new().len(length).map_anon()
+    }
+}
+
+/// Immutable anonymous data, never executable and never backed by a pathname.
+/// The writable mapping is consumed before authentication of these exact bytes.
+pub(crate) struct VerifiedMemory(ReadOnlyMapping);
+impl VerifiedMemory {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+struct MemoryWriter {
+    mapping: WritableMapping,
+    written: usize,
+}
+impl MemoryWriter {
+    fn new(size: u64, budget: u64) -> Result<Self> {
+        ensure!(
+            size > 0 && size <= budget && size <= isize::MAX as u64,
+            ResourceLimit
+        );
+        let length = usize::try_from(size).map_err(|_| ResourceLimit)?;
+        Ok(Self {
+            mapping: writable_mapping(length)?,
+            written: 0,
+        })
+    }
+    fn verify(self, patch: &Patch, size: u64, public_key: Option<&str>) -> Result<VerifiedMemory> {
+        ensure!(
+            size == self.mapping.len() as u64 && size == self.written as u64,
+            crate::UpdateError::CorruptPatch
+        );
+        // make_read_only consumes the only writable view; no alias is retained.
+        let mapping = self.mapping.make_read_only()?;
+        let hash = hex::encode(Sha256::digest(&mapping[..]));
+        ensure!(hash == patch.hash, crate::UpdateError::CorruptPatch);
+        crate::cache::check_patch_signature(&hash, patch.hash_signature.as_deref(), public_key)
+            .context(crate::UpdateError::InvalidSignature)?;
+        Ok(VerifiedMemory(mapping))
+    }
+}
+impl Write for MemoryWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.mapping.len() - self.written {
+            return Err(std::io::Error::other(ResourceLimit));
+        }
+        let end = self.written + bytes.len();
+        self.mapping[self.written..end].copy_from_slice(bytes);
+        self.written = end;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn reconstruct_memory(
+    config: &UpdateConfig,
+    patch: &Patch,
+    client_id: &str,
+    ciphertext: &Path,
+    size_hint: u64,
+) -> Result<VerifiedMemory> {
+    let output = MemoryWriter::new(size_hint, config.native_options.max_image_bytes)?;
+    let (output, size) = reconstruct(config, patch, client_id, ciphertext, output)?;
+    output.verify(patch, size, config.patch_public_key.as_deref())
+}
+
 pub(crate) struct BoundedHashWriter<W> {
     inner: W,
     limit: u64,
@@ -286,6 +372,58 @@ pub(crate) fn seal_and_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn anonymous_writer_rejects_invalid_sizes_and_overrun_before_mutation() {
+        for (size, budget) in [(0, 1), (2, 1), (u64::MAX, u64::MAX)] {
+            let error = MemoryWriter::new(size, budget).err().unwrap();
+            assert!(error.is::<ResourceLimit>());
+        }
+        let mut writer = MemoryWriter::new(4, 4).unwrap();
+        writer.write_all(b"abc").unwrap();
+        assert!(is_resource_error(
+            &writer.write_all(b"de").unwrap_err().into()
+        ));
+        assert_eq!(&writer.mapping[..], b"abc\0");
+        assert_eq!(writer.written, 3);
+        writer.write_all(b"d").unwrap();
+        assert_eq!(&writer.mapping[..], b"abcd");
+    }
+    #[test]
+    fn immutable_final_mapping_is_rehashed_and_publisher_signature_checked() {
+        let hash = hex::encode(Sha256::digest(b"verified"));
+        let mut patch = Patch {
+            number: 1,
+            hash_signature: Some(crate::test_utils::sign_test_message(hash.as_bytes())),
+            hash,
+            download_url: "unused".into(),
+            encryption: None,
+        };
+        let key = crate::test_utils::response_test_public_key();
+        let writer = || {
+            let mut writer = MemoryWriter::new(8, 8).unwrap();
+            writer.write_all(b"verified").unwrap();
+            writer
+        };
+        let verified = writer().verify(&patch, 8, Some(&key)).unwrap();
+        assert_eq!(verified.bytes(), b"verified");
+        let mut changed = writer();
+        changed.mapping[0] = b'x';
+        assert!(changed
+            .verify(&patch, 8, Some(&key))
+            .err()
+            .unwrap()
+            .is::<crate::UpdateError>());
+        assert!(writer().verify(&patch, 7, Some(&key)).is_err());
+        patch.hash_signature = Some(crate::test_utils::sign_test_message(b"other hash"));
+        assert!(matches!(
+            writer()
+                .verify(&patch, 8, Some(&key))
+                .err()
+                .unwrap()
+                .downcast_ref::<crate::UpdateError>(),
+            Some(crate::UpdateError::InvalidSignature)
+        ));
+    }
     #[test]
     fn bounded_writer_checks_each_write_before_sink_and_rejects_zero_limit() {
         assert!(BoundedHashWriter::new(Vec::new(), 0).is_err());

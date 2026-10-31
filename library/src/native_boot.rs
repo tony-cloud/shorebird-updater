@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
 };
 
@@ -26,23 +26,29 @@ pub(crate) struct NativeOptions {
 }
 impl NativeOptions {
     pub(crate) fn validate(self) -> Result<()> {
-        ensure!(self.capability <= 1, "Unknown native source capability");
+        ensure!(self.capability <= 2, "Unknown native source capability");
         if self.capability == 1 {
             ensure!(
                 cfg!(any(target_os = "linux", target_os = "android")),
                 "Sealed FD capability unsupported on this platform"
             );
-            if crate::encrypted_patch::provider().is_some() {
-                ensure!(
-                    self.max_image_bytes > 0,
-                    "Encrypted native mode requires a nonzero image budget"
-                );
-            }
+        }
+        if self.capability == 2 {
+            ensure!(
+                cfg!(target_os = "windows"),
+                "Verified memory capability unsupported on this platform"
+            );
+        }
+        if self.capability != 0 && crate::encrypted_patch::provider().is_some() {
+            ensure!(
+                self.max_image_bytes > 0,
+                "Encrypted native mode requires a nonzero image budget"
+            );
         }
         Ok(())
     }
     pub(crate) fn encrypted(self, config: &UpdateConfig) -> bool {
-        self.capability == 1 && config.patch_decryption_key_provider.is_some()
+        matches!(self.capability, 1 | 2) && config.patch_decryption_key_provider.is_some()
     }
 }
 
@@ -122,6 +128,7 @@ struct Selection {
     expected_state: Option<PatchState>,
     path: Option<PathBuf>,
     file: Option<File>,
+    memory: Option<Arc<native_cache::VerifiedMemory>>,
     size: u64,
     begun: bool,
     completed: bool,
@@ -141,6 +148,7 @@ impl Selection {
             expected_state: None,
             path: None,
             file: None,
+            memory: None,
             size: 0,
             begun: false,
             completed: false,
@@ -152,6 +160,7 @@ impl Selection {
             patch: self.patch,
             path: self.path.clone(),
             file: self.file.as_ref().map(duplicate).transpose()?,
+            memory: self.memory.clone(),
             size: self.size,
         })
     }
@@ -161,6 +170,7 @@ pub(crate) struct OwnedSource {
     pub patch: Option<usize>,
     pub path: Option<PathBuf>,
     pub file: Option<File>,
+    pub memory: Option<Arc<native_cache::VerifiedMemory>>,
     pub size: u64,
 }
 fn duplicate(file: &File) -> Result<File> {
@@ -201,6 +211,17 @@ pub(crate) fn selection_id() -> Option<u64> {
         .expect("Native selection lock poisoned")
         .as_ref()
         .map(|s| s.id)
+}
+
+/// Only clone the already authenticated image. No key callback, allocation of
+/// image bytes or boot-state transition occurs while acquiring a lease.
+pub(crate) fn acquire_memory(id: u64) -> Option<Arc<native_cache::VerifiedMemory>> {
+    SELECTION
+        .lock()
+        .expect("Native selection lock poisoned")
+        .as_ref()
+        .filter(|source| source.id == id)
+        .and_then(|source| source.memory.clone())
 }
 
 fn diagnostic(
@@ -299,17 +320,27 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                         *size <= config.native_options.max_image_bytes,
                         native_cache::ResourceLimit
                     );
-                    let file = native_cache::create_source()?;
-                    let (mut file, actual_size) =
-                        native_cache::reconstruct(&config, &patch, &client_id, &path, file)?;
-                    ensure!(actual_size == *size, crate::UpdateError::CorruptPatch);
-                    native_cache::seal_and_verify(&mut file, &patch, actual_size, &config)?;
+                    let (file, memory, actual_size) = if config.native_options.capability == 2 {
+                        let memory = native_cache::reconstruct_memory(
+                            &config, &patch, &client_id, &path, *size,
+                        )?;
+                        let actual_size = memory.bytes().len() as u64;
+                        (None, Some(Arc::new(memory)), actual_size)
+                    } else {
+                        let file = native_cache::create_source()?;
+                        let (mut file, actual_size) =
+                            native_cache::reconstruct(&config, &patch, &client_id, &path, file)?;
+                        ensure!(actual_size == *size, crate::UpdateError::CorruptPatch);
+                        native_cache::seal_and_verify(&mut file, &patch, actual_size, &config)?;
+                        (Some(file), None, actual_size)
+                    };
                     Ok(Selection {
                         id: next_id(),
                         patch: Some(number),
                         expected_state: state.clone(),
                         path: None,
-                        file: Some(file),
+                        file,
+                        memory,
                         size: actual_size,
                         begun: false,
                         completed: false,
@@ -330,6 +361,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                         expected_state: state.clone(),
                         path: Some(patch_info.path),
                         file: None,
+                        memory: None,
                         size: 0,
                         begun: false,
                         completed: false,
@@ -590,12 +622,27 @@ mod tests {
             crate::c_api::engine::FileCallbacks::new(),
             "app_id: test".into(),
             NativeOptions {
-                capability: 2,
+                capability: 3,
                 max_image_bytes: 1
             }
         )
         .is_err());
         assert!(config::with_config(|_| Ok(())).is_err());
+        crate::testing_reset_config();
+    }
+    #[test]
+    #[serial]
+    fn verified_memory_capability_is_windows_only_and_provider_free_budget_is_unchanged() {
+        crate::testing_reset_config();
+        assert_eq!(
+            NativeOptions {
+                capability: 2,
+                max_image_bytes: 0
+            }
+            .validate()
+            .is_ok(),
+            cfg!(target_os = "windows")
+        );
         crate::testing_reset_config();
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -611,7 +658,7 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     unsafe extern "C" fn unavailable_key(
         _: *const libc::c_char,
         _: *const libc::c_char,
@@ -622,7 +669,7 @@ mod tests {
         false
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     #[test]
     #[serial]
     fn failed_secure_migration_exposes_no_config_and_requires_secure_retry() {
@@ -637,14 +684,15 @@ mod tests {
         );
         std::fs::write(tmp.path().join("patches"), b"not a directory").unwrap();
         assert!(crate::encrypted_patch::set_provider(Some(unavailable_key)));
+        let capability = if cfg!(target_os = "windows") { 2 } else { 1 };
         assert!(NativeOptions {
-            capability: 1,
+            capability,
             max_image_bytes: 0
         }
         .validate()
         .is_err());
         let options = NativeOptions {
-            capability: 1,
+            capability,
             max_image_bytes: 1024,
         };
         let yaml = format!("app_id: test\npatch_public_key: {}\npatch_verification: strict\npatch_response_verification: required", crate::test_utils::response_test_public_key());
