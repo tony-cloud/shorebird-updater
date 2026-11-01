@@ -470,6 +470,11 @@ pub struct VerifiedSelection {
     authentication: Authentication,
 }
 impl VerifiedSelection {
+    pub fn context_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(
+            &serde_json::json!({"version":2,"selection":self.descriptor(),"selection_digest":self.digest()}),
+        )?)
+    }
     pub fn descriptor(&self) -> &Descriptor {
         &self.payload.selection
     }
@@ -1201,6 +1206,59 @@ fn installed_scope(config: &crate::config::UpdateConfig, client_id: &str) -> Res
 fn journal_for(config: &crate::config::UpdateConfig, scope: &Scope) -> Result<SelectionJournal> {
     SelectionJournal::new(&config.storage_dir, scope)
 }
+pub(crate) fn accepted_grant(
+    config: &crate::config::UpdateConfig,
+) -> Result<(VerifiedSelection, u64)> {
+    let client_id =
+        crate::cache::UpdaterState::read_client_id(&config.storage_dir, &config.release_version)?;
+    let scope = installed_scope(config, &client_id)?;
+    journal_for(config, &scope)?.load(
+        &scope,
+        config
+            .patch_public_key
+            .as_deref()
+            .context("Missing v2 pinned key")?,
+    )
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthorizationUnavailable;
+impl std::fmt::Display for AuthorizationUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Accepted selection no longer authorizes native key resolution")
+    }
+}
+impl std::error::Error for AuthorizationUnavailable {}
+
+/// Only verified, current and byte-for-byte matching delivery can release a
+/// native key. No updater/config/selection/authority lock is acquired here.
+pub(crate) fn grant_for_patch(
+    config: &crate::config::UpdateConfig,
+    patch: &crate::network::Patch,
+    client_id: &str,
+) -> Result<VerifiedSelection> {
+    let result = (|| -> Result<VerifiedSelection> {
+        let (grant, floor) = accepted_grant(config)?;
+        ensure!(
+            grant.activation(crate::time::unix_timestamp().max(floor)) == Activation::Patch,
+            "V2 grant is not usable"
+        );
+        ensure!(
+            grant.descriptor().scope == installed_scope(config, client_id)?
+                && grant.descriptor().scope.runtime_profile == "native-aot",
+            "V2 key installation scope mismatch"
+        );
+        ensure!(
+            grant
+                .delivery()
+                .is_some_and(|delivery| delivery.patch() == *patch),
+            "V2 key delivery mismatch"
+        );
+        Ok(grant)
+    })();
+    result.context(AuthorizationUnavailable)
+}
+
 /// Revalidate the accepted authority at every cold selection. A historical
 /// nonce is checked structurally and remains signed; it is not a fresh request.
 pub(crate) fn boot_grant(
@@ -1209,26 +1267,75 @@ pub(crate) fn boot_grant(
     if config.selection_scope.is_none() {
         return Ok(None);
     }
-    let state = crate::cache::UpdaterState::load_existing(
-        &config.storage_dir,
-        &config.download_dir,
-        &config.release_version,
-        config.patch_public_key.as_deref(),
-        config.patch_verification,
-    )?;
-    let scope = installed_scope(config, &state.client_id())?;
-    let journal = journal_for(config, &scope)?;
-    let (grant, floor) = journal.load(
-        &scope,
-        config
-            .patch_public_key
-            .as_deref()
-            .context("Missing v2 pinned key")?,
-    )?;
+    let (grant, floor) = accepted_grant(config)?;
     if grant.activation(crate::time::unix_timestamp().max(floor)) != Activation::Patch {
         return Ok(None);
     }
     Ok(Some(grant))
+}
+
+pub(crate) enum ContentReadiness {
+    Ready(usize),
+    Missing(usize),
+    Invalid(usize),
+    Unavailable,
+}
+/// Inspect cached content without mutating pointers, quarantine or identity.
+pub(crate) fn content_readiness(
+    config: &crate::config::UpdateConfig,
+    state: &crate::cache::UpdaterState,
+    grant: &VerifiedSelection,
+) -> Result<ContentReadiness> {
+    use crate::cache::lifecycle::PatchState;
+    let Some(delivery) = grant.delivery() else {
+        return Ok(ContentReadiness::Unavailable);
+    };
+    let number: usize = delivery.number.parse()?;
+    match state.lifecycle().read_state(number) {
+        Some(PatchState::Installed { size, .. })
+            if grant.descriptor().scope.runtime_profile != "native-aot" =>
+        {
+            let path = state.lifecycle().installed_artifact_path(number);
+            match std::fs::metadata(&path) {
+                Ok(meta)
+                    if meta.len() == size && crate::cache::hash_file(&path)? == delivery.hash =>
+                {
+                    Ok(ContentReadiness::Ready(number))
+                }
+                Ok(_) => Ok(ContentReadiness::Invalid(number)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(ContentReadiness::Missing(number))
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Some(PatchState::InstalledEncryptedTransportV1 {
+            ciphertext_size, ..
+        }) if grant.descriptor().scope.runtime_profile == "native-aot" => {
+            let path = crate::native_cache::transport_path(config, number);
+            match std::fs::metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ContentReadiness::Missing(number))
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => (),
+            }
+            match crate::encrypted_patch::validate_ciphertext(
+                config,
+                &delivery.patch(),
+                &state.client_id(),
+                &path,
+            ) {
+                Ok(actual) if actual == ciphertext_size => Ok(ContentReadiness::Ready(number)),
+                Err(error) if error.chain().any(|cause| cause.is::<std::io::Error>()) => Err(error),
+                // A refreshed signed delivery may rotate nonce/key/ciphertext
+                // without changing immutable content. Discard this transport
+                // cache for redownload; it does not prove the artifact bad.
+                _ => Ok(ContentReadiness::Missing(number)),
+            }
+        }
+        _ => Ok(ContentReadiness::Unavailable),
+    }
 }
 
 /// Recover only the journal's exact selected content. V1 pointers and stale
@@ -1237,42 +1344,24 @@ pub(crate) fn recover_target(
     config: &crate::config::UpdateConfig,
     state: &mut crate::cache::UpdaterState,
 ) -> Result<()> {
-    use crate::cache::lifecycle::{BadReason, PatchState};
-    let scope = installed_scope(config, &state.client_id())?;
-    let journal = journal_for(config, &scope)?;
-    let authority = journal.load(
-        &scope,
-        config
-            .patch_public_key
-            .as_deref()
-            .context("Missing v2 pinned key")?,
-    );
+    use crate::cache::lifecycle::BadReason;
     let mut target = None;
     let mut authorized_content = None;
-    if let Ok((grant, floor)) = authority {
+    if let Ok((grant, floor)) = accepted_grant(config) {
+        authorized_content = grant
+            .descriptor()
+            .target
+            .patch_number
+            .as_ref()
+            .map(|n| n.parse().expect("verified patch"));
         if grant.activation(crate::time::unix_timestamp().max(floor)) == Activation::Patch {
-            let delivery = grant.delivery().context("Missing selected delivery")?;
-            let number: usize = delivery.number.parse()?;
-            authorized_content = Some(number);
-            if let Some(PatchState::Installed { size, .. }) = state.lifecycle().read_state(number) {
-                let path = state.lifecycle().installed_artifact_path(number);
-                match std::fs::metadata(&path) {
-                    Ok(meta)
-                        if meta.len() == size
-                            && crate::cache::hash_file(&path)? == delivery.hash =>
-                    {
-                        target = Some(number)
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        state.lifecycle().cleanup(number)?;
-                    }
-                    Ok(_) => {
-                        state
-                            .lifecycle()
-                            .mark_bad(number, BadReason::ValidationFailed)?;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
+            match content_readiness(config, state, &grant)? {
+                ContentReadiness::Ready(number) => target = Some(number),
+                ContentReadiness::Missing(number) => state.lifecycle().cleanup(number)?,
+                ContentReadiness::Invalid(number) => state
+                    .lifecycle()
+                    .mark_bad(number, BadReason::ValidationFailed)?,
+                ContentReadiness::Unavailable => (),
             }
         }
     }
@@ -1466,6 +1555,15 @@ mod integration_tests {
         number: Option<usize>,
         bytes: &[u8],
     ) -> VerifiedSelection {
+        grant_with_encryption(config, epoch, number, bytes, None)
+    }
+    fn grant_with_encryption(
+        config: &crate::config::UpdateConfig,
+        epoch: u64,
+        number: Option<usize>,
+        bytes: &[u8],
+        encryption: Option<EncryptionMetadata>,
+    ) -> VerifiedSelection {
         let client = crate::updater::with_state(|state| Ok(state.client_id())).unwrap();
         let scope = config.selection_scope.as_ref().unwrap().for_client(&client);
         let request = RequestContext::new(&scope, None, 0, None).unwrap();
@@ -1483,12 +1581,18 @@ mod integration_tests {
                 patch_number: number.map(|n| n.to_string()),
                 artifact_hash: number.map(|_| hash.clone()),
                 encryption: if number.is_some() {
-                    "artifact-aes-256-gcm"
+                    if scope.runtime_profile == "native-aot" {
+                        "transport-aes-256-gcm"
+                    } else {
+                        "artifact-aes-256-gcm"
+                    }
                 } else {
                     "none"
                 }
                 .into(),
-                artifact_key_id: number.map(|_| "test-key".into()),
+                artifact_key_id: number
+                    .filter(|_| scope.runtime_profile != "native-aot")
+                    .map(|_| "test-key".into()),
             },
             not_before: "0".into(),
             offline_valid_until: None,
@@ -1508,7 +1612,7 @@ mod integration_tests {
                 hash,
                 download_url: format!("https://example.invalid/{n}"),
                 hash_signature,
-                encryption: None,
+                encryption,
             }),
         };
         let bytes = serde_json::to_vec(&payload).unwrap();
@@ -1593,6 +1697,12 @@ mod integration_tests {
             .unwrap();
         let free = grant(&config, 12, None, b"");
         accept(&config, &free);
+        let pointer_bytes = std::fs::read(tmp.path().join("pointers.json")).unwrap();
+        assert!(status()["next_boot"]["patch_number"].is_null());
+        assert_eq!(
+            std::fs::read(tmp.path().join("pointers.json")).unwrap(),
+            pointer_bytes
+        );
         assert!(crate::updater::next_boot_patch().unwrap().is_none());
         assert_eq!(crate::native_boot::prepare().unwrap().id, prepared.id);
         assert_eq!(
@@ -1725,6 +1835,518 @@ mod integration_tests {
                 .epoch(),
             14
         );
+        crate::testing_reset_config();
+    }
+
+    static NATIVE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static NATIVE_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static REENTRY_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    unsafe extern "C" fn native_key(
+        key_id: *const libc::c_char,
+        aad: *const libc::c_char,
+        context: *const libc::c_char,
+        output: *mut u8,
+        capacity: usize,
+        written: *mut usize,
+    ) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        NATIVE_CALLS.fetch_add(1, SeqCst);
+        let text = unsafe { std::ffi::CStr::from_ptr(context) }
+            .to_str()
+            .unwrap_or("");
+        let Some(value) = serde_json::from_str::<serde_json::Value>(text).ok() else {
+            return false;
+        };
+        if value["version"] != 2
+            || value["selection"]["scope"]["runtime_profile"] != "native-aot"
+            || value["selection"]["variant_id"] != "pro"
+            || unsafe { std::ffi::CStr::from_ptr(key_id) }.to_bytes() != b"native-key"
+            || !unsafe { std::ffi::CStr::from_ptr(aad) }
+                .to_bytes()
+                .starts_with(b"open-aot-patch-delivery-v2\n")
+        {
+            return false;
+        }
+        let mode = NATIVE_MODE.load(SeqCst);
+        if mode == 3 {
+            let id_ok = crate::updater::installation_id().is_ok_and(|id| !id.is_empty());
+            let status_ok = crate::native_boot::selection_status_json().is_ok_and(|s| s.is_some());
+            let update_ok = crate::updater::update(None)
+                .is_ok_and(|s| s == crate::UpdateStatus::UpdateInProgress);
+            let source = crate::native_boot::prepare();
+            let prepare_ok =
+                source.is_ok_and(|source| crate::native_boot::begin(source.id).unwrap_or(false));
+            REENTRY_OK.store(id_ok && status_ok && update_ok && prepare_ok, SeqCst);
+        }
+        if capacity != 32 {
+            return false;
+        }
+        unsafe {
+            std::ptr::write_bytes(output, if mode == 2 { 99 } else { 37 }, 32);
+            *written = if mode == 1 { 31 } else { 32 };
+        }
+        true
+    }
+    unsafe extern "C" fn unused_v1(
+        _: *const libc::c_char,
+        _: *const libc::c_char,
+        _: *mut u8,
+        _: usize,
+        _: *mut usize,
+    ) -> bool {
+        false
+    }
+
+    fn native_fixture(
+        config: &crate::config::UpdateConfig,
+        epoch: u64,
+    ) -> (VerifiedSelection, Vec<u8>) {
+        native_fixture_with_nonce(config, epoch, [7; 12])
+    }
+    fn native_fixture_with_nonce(
+        config: &crate::config::UpdateConfig,
+        epoch: u64,
+        nonce: [u8; 12],
+    ) -> (VerifiedSelection, Vec<u8>) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let client = crate::updater::installation_id().unwrap();
+        let scope = config.selection_scope.as_ref().unwrap().for_client(&client);
+        let target = b"native candidate bytes";
+        let hash = hex::encode(Sha256::digest(target));
+        let mut transport = std::io::Cursor::new(Vec::new());
+        patch::make_patch(
+            b"original baseline".to_vec(),
+            target.to_vec(),
+            &mut transport,
+        );
+        let transport = transport.into_inner();
+        let aad = format!("open-aot-patch-delivery-v2\napp_id={}\nrelease_id=1\npatch_number=2\npatch_hash={}\ntransport_hash={}\nplatform={}\narch={}\ndevice_id_hash={}", scope.app_id, hash, hex::encode(Sha256::digest(&transport)), scope.platform, scope.arch, scope.client_id_hash);
+        let key = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &[37; 32]).unwrap(),
+        );
+        let mut ciphertext = transport;
+        key.seal_in_place_append_tag(
+            ring::aead::Nonce::assume_unique_for_key(nonce),
+            ring::aead::Aad::from(aad.as_bytes()),
+            &mut ciphertext,
+        )
+        .unwrap();
+        let metadata = EncryptionMetadata {
+            algorithm: "AES-256-GCM".into(),
+            kdf: "HMAC-SHA256".into(),
+            key_id: "native-key".into(),
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            aad: URL_SAFE_NO_PAD.encode(aad.as_bytes()),
+            aad_hash: hex::encode(Sha256::digest(aad.as_bytes())),
+            encrypted_hash: hex::encode(Sha256::digest(&ciphertext)),
+            device_id_hash: scope.client_id_hash,
+            cache_key: "fixture".into(),
+        };
+        (
+            grant_with_encryption(config, epoch, Some(2), target, Some(metadata)),
+            ciphertext,
+        )
+    }
+    fn native_config(tmp: &tempfile::TempDir) -> crate::config::UpdateConfig {
+        setup(tmp);
+        // Exercise portable crypto/cache/source bookkeeping on the host; this
+        // does not bypass production NativeOptions platform checks in init.
+        crate::config::with_config_mut(|config| {
+            let config = config.as_mut().unwrap();
+            config.selection_scope.as_mut().unwrap().runtime_profile = "native-aot".into();
+            config.selection_baseline = None;
+            config.native_options = NativeOptions {
+                capability: 2,
+                max_image_bytes: 4096,
+            };
+            config.patch_decryption_key_provider_v2 = Some(native_key);
+        });
+        crate::config::with_config(|c| Ok(c.clone())).unwrap()
+    }
+    fn status() -> serde_json::Value {
+        serde_json::from_str(
+            &crate::native_boot::selection_status_json()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn stage_native_download(
+        config: &crate::config::UpdateConfig,
+        grant: &VerifiedSelection,
+        ciphertext: &[u8],
+    ) -> PathBuf {
+        let patch = grant.delivery().unwrap().patch();
+        let path = config.download_dir.join(patch.number.to_string());
+        crate::updater::with_mut_state(|state| {
+            state.lifecycle_mut().record_download_started(
+                patch.number,
+                &patch.download_identity(),
+                &patch.hash,
+                patch.hash_signature.as_deref(),
+            )?;
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(&path, ciphertext)?;
+            state
+                .lifecycle_mut()
+                .record_download_complete(patch.number, ciphertext.len() as u64)
+        })
+        .unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn native_v2_provider_binding_exact_key_retry_and_reentrant_source_identity() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = native_config(&tmp);
+        let (grant, ciphertext) = native_fixture(&config, 11);
+        accept(&config, &grant);
+        let patch = grant.delivery().unwrap().patch();
+        let client = crate::updater::installation_id().unwrap();
+        let path = stage_native_download(&config, &grant, &ciphertext);
+        NATIVE_CALLS.store(0, SeqCst);
+        for mode in [1, 2] {
+            NATIVE_MODE.store(mode, SeqCst);
+            let error = crate::updater_lock::with_updater_thread_lock(|_| {
+                crate::native_cache::install(&config, &patch, &path)
+            })
+            .unwrap_err();
+            assert!(error.is::<crate::encrypted_patch::KeyResolutionFailed>());
+            assert!(matches!(
+                crate::updater::load_state(&config)
+                    .unwrap()
+                    .lifecycle()
+                    .read_state(2),
+                Some(PatchState::Downloaded { .. })
+            ));
+            assert_eq!(accepted_grant(&config).unwrap().0.epoch(), 11);
+            assert!(path.exists());
+            assert_eq!(
+                crate::updater::load_state(&config)
+                    .unwrap()
+                    .lifecycle()
+                    .decide_start(
+                        2,
+                        &patch.download_identity(),
+                        &patch.hash,
+                        patch.hash_signature.as_deref()
+                    ),
+                crate::cache::lifecycle::DownloadAction::Complete
+            );
+        }
+        let calls = NATIVE_CALLS.load(SeqCst);
+        let mut wrong = patch.clone();
+        wrong.download_url.push_str("?altered=1");
+        assert!(crate::encrypted_patch::decrypt(&config, &wrong, &client, &path).is_err());
+        assert_eq!(NATIVE_CALLS.load(SeqCst), calls);
+        NATIVE_MODE.store(3, SeqCst);
+        REENTRY_OK.store(false, SeqCst);
+        crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::native_cache::install(&config, &patch, &path)
+        })
+        .unwrap();
+        assert!(REENTRY_OK.load(SeqCst));
+        assert!(crate::native_boot::prepare().unwrap().patch.is_none()); // Reentry froze this process BASE.
+        assert_eq!(status()["current"]["epoch"], "11");
+        assert!(status()["current"]["patch_number"].is_null());
+        assert_eq!(status()["next_boot"]["patch_number"], "2");
+        assert_eq!(status()["restart_required"], true);
+        assert!(!tmp.path().join("patches/2/dlc.vmcode").exists());
+        NATIVE_MODE.store(0, SeqCst);
+        crate::native_boot::reset();
+        let prepared = crate::native_boot::prepare().unwrap();
+        assert_eq!(prepared.patch, Some(2));
+        assert_eq!(
+            crate::native_boot::acquire_memory(prepared.id)
+                .unwrap()
+                .bytes(),
+            b"native candidate bytes"
+        );
+        assert!(crate::native_boot::begin(prepared.id).unwrap());
+        assert_eq!(status()["restart_required"], false);
+        let frozen = crate::native_boot::selection_context_json(prepared.id)
+            .unwrap()
+            .unwrap();
+        let (newer, _) = native_fixture(&config, 12);
+        accept(&config, &newer);
+        assert_eq!(status()["current"]["epoch"], "11");
+        assert_eq!(status()["accepted"]["epoch"], "12");
+        assert_eq!(status()["restart_required"], true);
+        NATIVE_MODE.store(3, SeqCst);
+        REENTRY_OK.store(false, SeqCst);
+        let encrypted = crate::native_cache::transport_path(&config, 2);
+        crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::encrypted_patch::decrypt(
+                &config,
+                &newer.delivery().unwrap().patch(),
+                &client,
+                &encrypted,
+            )
+        })
+        .unwrap();
+        assert!(REENTRY_OK.load(SeqCst));
+        assert_eq!(crate::native_boot::prepare().unwrap().id, prepared.id);
+        assert_eq!(
+            crate::native_boot::selection_context_json(prepared.id)
+                .unwrap()
+                .unwrap(),
+            frozen
+        );
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn provider_registration_is_mutually_exclusive_and_readonly_status_preserves_identity() {
+        crate::testing_reset_config();
+        assert!(crate::encrypted_patch::set_provider_v2(Some(native_key)));
+        assert!(!crate::encrypted_patch::set_provider(Some(unused_v1)));
+        assert!(!crate::encrypted_patch::set_provider(None));
+        assert!(crate::encrypted_patch::set_provider_v2(None));
+        assert!(crate::encrypted_patch::set_provider(Some(unused_v1)));
+        assert!(!crate::encrypted_patch::set_provider_v2(Some(native_key)));
+        crate::testing_reset_config();
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup(&tmp);
+        assert!(!crate::encrypted_patch::set_provider_v2(Some(native_key)));
+        let id = crate::updater::installation_id().unwrap();
+        let before = std::fs::read(tmp.path().join("state.json")).unwrap();
+        let snapshot = status();
+        assert_eq!(snapshot["current"]["epoch"], "0");
+        assert_eq!(snapshot["accepted"]["epoch"], "0");
+        assert_eq!(snapshot["restart_required"], false);
+        assert_eq!(crate::updater::installation_id().unwrap(), id);
+        assert_eq!(
+            std::fs::read(tmp.path().join("state.json")).unwrap(),
+            before
+        );
+        std::fs::write(tmp.path().join("state.json"), b"corrupt identity state").unwrap();
+        assert!(crate::updater::installation_id().is_err());
+        assert!(crate::native_boot::selection_status_json().is_err());
+        assert_eq!(
+            std::fs::read(tmp.path().join("state.json")).unwrap(),
+            b"corrupt identity state"
+        );
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn native_delivery_rotation_is_a_cache_miss_without_content_quarantine() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = native_config(&tmp);
+        NATIVE_MODE.store(0, SeqCst);
+        let (initial, ciphertext) = native_fixture(&config, 11);
+        accept(&config, &initial);
+        let path = stage_native_download(&config, &initial, &ciphertext);
+        crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::native_cache::install(&config, &initial.delivery().unwrap().patch(), &path)
+        })
+        .unwrap();
+        let (refreshed, rotated) = native_fixture_with_nonce(&config, 11, [8; 12]);
+        assert_eq!(refreshed.digest(), initial.digest());
+        assert_ne!(rotated, ciphertext);
+        accept(&config, &refreshed);
+        let state = crate::updater::load_state(&config).unwrap();
+        assert!(state.next_boot_patch().is_none());
+        assert!(state.lifecycle().read_state(2).is_none());
+        let patch = refreshed.delivery().unwrap().patch();
+        assert_eq!(
+            state.lifecycle().decide_start(
+                2,
+                &patch.download_identity(),
+                &patch.hash,
+                patch.hash_signature.as_deref()
+            ),
+            crate::cache::lifecycle::DownloadAction::Fresh
+        );
+        let path = stage_native_download(&config, &refreshed, &rotated);
+        crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::native_cache::install(&config, &patch, &path)
+        })
+        .unwrap();
+        assert_eq!(
+            crate::updater::next_boot_patch().unwrap().unwrap().number,
+            2
+        );
+        assert!(matches!(
+            crate::updater::load_state(&config)
+                .unwrap()
+                .lifecycle()
+                .read_state(2),
+            Some(PatchState::InstalledEncryptedTransportV1 { .. })
+        ));
+        assert_eq!(accepted_grant(&config).unwrap().0.epoch(), 11);
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn native_expiry_after_download_keeps_candidate_and_renewal_recovers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = native_config(&tmp);
+        let (mut grant, ciphertext) = native_fixture(&config, 11);
+        grant.payload.selection.offline_valid_until = Some("1".into());
+        let grant = resign(grant);
+        accept(&config, &grant);
+        let path = stage_native_download(&config, &grant, &ciphertext);
+        let journal =
+            SelectionJournal::new(&config.storage_dir, &grant.descriptor().scope).unwrap();
+        journal
+            .accept(
+                &grant,
+                &grant.descriptor().scope,
+                config.patch_public_key.as_deref().unwrap(),
+                1,
+            )
+            .unwrap();
+        NATIVE_CALLS.store(0, SeqCst);
+        NATIVE_MODE.store(0, SeqCst);
+        let error = crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::native_cache::install(&config, &grant.delivery().unwrap().patch(), &path)
+        })
+        .unwrap_err();
+        assert!(error.is::<AuthorizationUnavailable>(), "{error:#}");
+        assert_eq!(NATIVE_CALLS.load(SeqCst), 0);
+        assert!(path.exists());
+        assert!(matches!(
+            crate::updater::load_state(&config)
+                .unwrap()
+                .lifecycle()
+                .read_state(2),
+            Some(PatchState::Downloaded { .. })
+        ));
+        assert_eq!(status()["next_boot"]["reason"], "expired");
+        let (renewed, _) = native_fixture(&config, 12);
+        accept(&config, &renewed);
+        crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::native_cache::install(&config, &renewed.delivery().unwrap().patch(), &path)
+        })
+        .unwrap();
+        assert_eq!(NATIVE_CALLS.load(SeqCst), 1);
+        assert_eq!(
+            crate::updater::next_boot_patch().unwrap().unwrap().number,
+            2
+        );
+        assert_eq!(accepted_grant(&config).unwrap().0.epoch(), 12);
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn native_init_uses_original_aot_stream_and_supported_source_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut scope = setup(&tmp);
+        crate::testing_reset_config();
+        // Dedicated interpreter baseline callbacks still return different bytes.
+        // Native measurement must use the installed original AOT/APK resolver.
+        crate::test_utils::write_fake_apk(
+            tmp.path().join("base.apk").to_str().unwrap(),
+            b"original native image",
+        );
+        scope.runtime_profile = "native-aot".into();
+        scope.base_artifact_hash = hex::encode(Sha256::digest(b"original native image"));
+        assert!(crate::encrypted_patch::set_provider_v2(Some(native_key)));
+        let app = crate::AppConfig {
+            app_storage_dir: tmp.path().to_str().unwrap().into(),
+            code_cache_dir: tmp.path().to_str().unwrap().into(),
+            release_version: "1".into(),
+            original_libapp_paths: vec![tmp
+                .path()
+                .join("lib/arch/libapp.so")
+                .to_str()
+                .unwrap()
+                .into()],
+        };
+        let yaml = format!(
+            "app_id: {}\npatch_public_key: {}\npatch_response_verification: required",
+            scope.app_id,
+            crate::test_utils::response_test_public_key()
+        );
+        let options = NativeOptions {
+            capability: if cfg!(target_os = "windows") { 2 } else { 1 },
+            max_image_bytes: 4096,
+        };
+        let result = crate::native_boot::initialize_with_scope(
+            app,
+            crate::c_api::engine::FileCallbacks::new(),
+            yaml,
+            options,
+            Some(scope),
+            Some(baseline_callbacks()),
+        );
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "windows"
+        )) {
+            result.unwrap();
+            crate::config::with_config(|config| {
+                assert!(config.selection_baseline.is_none());
+                assert!(config.patch_decryption_key_provider_v2.is_some());
+                Ok(())
+            })
+            .unwrap();
+        } else {
+            assert!(result.is_err());
+            assert!(crate::config::with_config(|_| Ok(())).is_err());
+        }
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn status_snapshot_is_atomic_during_assignment_and_keeps_running_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup(&tmp);
+        let config = crate::config::with_config(|c| Ok(c.clone())).unwrap();
+        let pro = grant(&config, 11, Some(2), b"pro");
+        install(&config, &pro, b"pro");
+        accept(&config, &pro);
+        let prepared = crate::native_boot::prepare().unwrap();
+        assert!(crate::native_boot::begin(prepared.id).unwrap());
+        let grants: Vec<_> = (12..32)
+            .map(|epoch| {
+                grant(
+                    &config,
+                    epoch,
+                    if epoch % 2 == 0 { None } else { Some(2) },
+                    b"pro",
+                )
+            })
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = barrier.clone();
+        let config_copy = config.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            for grant in grants {
+                accept(&config_copy, &grant);
+            }
+        });
+        barrier.wait();
+        for _ in 0..60 {
+            let snapshot = status();
+            let epoch: u64 = snapshot["accepted"]["epoch"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(snapshot["current"]["epoch"], "11");
+            assert_eq!(snapshot["current"]["patch_number"], "2");
+            assert_eq!(
+                snapshot["next_boot"]["patch_number"].as_str(),
+                if epoch % 2 == 0 { None } else { Some("2") }
+            );
+            assert_eq!(snapshot["restart_required"], epoch != 11);
+        }
+        writer.join().unwrap();
+        assert_eq!(status()["accepted"]["epoch"], "31");
         crate::testing_reset_config();
     }
 

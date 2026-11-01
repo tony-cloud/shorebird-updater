@@ -88,6 +88,44 @@ pub extern "C" fn shorebird_next_boot_patch_number() -> usize {
     )
 }
 
+/// Copy the existing nonsecret installation ID, or NULL on error. This read
+/// never creates/replaces identity and is not an entitlement credential. Free
+/// using shorebird_free_status_string. New Dart probes symbols on old engines.
+#[no_mangle]
+pub extern "C" fn shorebird_installation_id() -> *mut c_char {
+    log_on_error(
+        || allocate_c_string(&updater::installation_id()?),
+        "reading installation id",
+        std::ptr::null_mut(),
+    )
+}
+
+/// Atomic v2 current/accepted/effective-next status JSON, or NULL for v1/error.
+/// Epoch/patch values are decimal strings. Running context stays process-pinned;
+/// greater epoch/different digest requires restart even for identical content.
+/// Free using shorebird_free_status_string. Existing patch APIs are unchanged.
+#[no_mangle]
+pub extern "C" fn shorebird_selection_status_json() -> *mut c_char {
+    log_on_error(
+        || match crate::native_boot::selection_status_json()? {
+            Some(json) => allocate_c_string(&json),
+            None => Ok(std::ptr::null_mut()),
+        },
+        "reading selection status",
+        std::ptr::null_mut(),
+    )
+}
+
+/// Free a string returned by shorebird_installation_id or
+/// shorebird_selection_status_json. NULL is accepted.
+///
+/// # Safety
+/// A non-null pointer must have been returned by these updater APIs.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_free_status_string(value: *const c_char) {
+    unsafe { free_c_string(value) }
+}
+
 /// Check for an update on the first non-null channel of:
 ///   1. `c_channel`
 ///   2. The channel specified in shorebird.yaml

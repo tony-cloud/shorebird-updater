@@ -11,7 +11,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::c_api::engine::PatchDecryptionKeyProvider;
+use crate::c_api::engine::{PatchDecryptionKeyProvider, PatchDecryptionKeyProviderV2};
 use crate::config::UpdateConfig;
 use crate::network::{Patch, PatchCheckRequest, PatchCheckResponse};
 use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode};
@@ -21,6 +21,26 @@ use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode};
 // independently authenticated ordering/context rather than bypass this bound.
 const MAX_CIPHERTEXT_BYTES: u64 = 128 * 1024 * 1024 + 16;
 static PROVIDER: Mutex<Option<PatchDecryptionKeyProvider>> = Mutex::new(None);
+static PROVIDER_V2: Mutex<Option<PatchDecryptionKeyProviderV2>> = Mutex::new(None);
+pub(crate) fn provider_v2() -> Option<PatchDecryptionKeyProviderV2> {
+    *PROVIDER_V2
+        .lock()
+        .expect("v2 patch key provider lock poisoned")
+}
+pub(crate) fn has_provider() -> bool {
+    provider().is_some() || provider_v2().is_some()
+}
+pub(crate) fn set_provider_v2(provider: Option<PatchDecryptionKeyProviderV2>) -> bool {
+    crate::config::with_config_mut(|config| {
+        if config.is_some() || self::provider().is_some() {
+            return false;
+        }
+        *PROVIDER_V2
+            .lock()
+            .expect("v2 patch key provider lock poisoned") = provider;
+        true
+    })
+}
 
 pub(crate) fn provider() -> Option<PatchDecryptionKeyProvider> {
     *PROVIDER.lock().expect("patch key provider lock poisoned")
@@ -28,7 +48,7 @@ pub(crate) fn provider() -> Option<PatchDecryptionKeyProvider> {
 
 pub(crate) fn set_provider(provider: Option<PatchDecryptionKeyProvider>) -> bool {
     crate::config::with_config_mut(|config| {
-        if config.is_some() {
+        if config.is_some() || provider_v2().is_some() {
             return false;
         }
         *PROVIDER.lock().expect("patch key provider lock poisoned") = provider;
@@ -39,6 +59,9 @@ pub(crate) fn set_provider(provider: Option<PatchDecryptionKeyProvider>) -> bool
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn reset_provider() {
     *PROVIDER.lock().expect("patch key provider lock poisoned") = None;
+    *PROVIDER_V2
+        .lock()
+        .expect("v2 patch key provider lock poisoned") = None;
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,7 +90,29 @@ impl std::fmt::Debug for EncryptionMetadata {
 }
 
 pub(crate) fn validate_config(config: &UpdateConfig) -> Result<()> {
-    if config.patch_decryption_key_provider.is_some() {
+    ensure!(
+        !(config.patch_decryption_key_provider.is_some()
+            && config.patch_decryption_key_provider_v2.is_some()),
+        "V1 and v2 patch providers are mutually exclusive"
+    );
+    if config.patch_decryption_key_provider_v2.is_some() {
+        ensure!(
+            config
+                .selection_scope
+                .as_ref()
+                .is_some_and(|s| s.runtime_profile == "native-aot"),
+            "V2 provider requires an explicit native v2 release"
+        );
+    }
+    if config.selection_scope.is_some() {
+        ensure!(
+            config.patch_decryption_key_provider.is_none(),
+            "V2 cannot use a legacy key provider"
+        );
+    }
+    if config.patch_decryption_key_provider.is_some()
+        || config.patch_decryption_key_provider_v2.is_some()
+    {
         ensure!(
             config.patch_response_verification == PatchResponseVerificationMode::Required
                 && config.patch_verification == PatchVerificationMode::Strict
@@ -346,9 +391,6 @@ fn decrypt_with_context(
         file.read(&mut extra)? == 0 && digest(bytes.0.get_ref()) == metadata.encrypted_hash,
         "Encrypted patch hash mismatch"
     );
-    let provider = config
-        .patch_decryption_key_provider
-        .context("Missing patch key provider")?;
     let key_id = std::ffi::CString::new(metadata.key_id.as_str())?;
     let aad_c = std::ffi::CString::new(aad.as_slice())?;
     let mut key = SecretKey([0; 32]);
@@ -356,14 +398,36 @@ fn decrypt_with_context(
     // No configuration/provider mutex is held here; update serialization is
     // still held. Reentrant native preparation freezes BASE through the
     // nonblocking updater-operation lock, without retaining Rust data locks.
-    let found = unsafe {
-        provider(
-            key_id.as_ptr(),
-            aad_c.as_ptr(),
-            key.0.as_mut_ptr(),
-            key.0.len(),
-            &mut written,
-        )
+    let found = if let Some(provider) = config.patch_decryption_key_provider_v2 {
+        let grant = crate::selection_v2::grant_for_patch(config, patch, client_id)?;
+        let context = std::ffi::CString::new(grant.context_json()?)?;
+        unsafe {
+            provider(
+                key_id.as_ptr(),
+                aad_c.as_ptr(),
+                context.as_ptr(),
+                key.0.as_mut_ptr(),
+                key.0.len(),
+                &mut written,
+            )
+        }
+    } else {
+        ensure!(
+            config.selection_scope.is_none(),
+            "V2 key resolution cannot fall back to v1"
+        );
+        let provider = config
+            .patch_decryption_key_provider
+            .context("Missing patch key provider")?;
+        unsafe {
+            provider(
+                key_id.as_ptr(),
+                aad_c.as_ptr(),
+                key.0.as_mut_ptr(),
+                key.0.len(),
+                &mut written,
+            )
+        }
     };
     if !found || written != key.0.len() {
         return Err(KeyResolutionFailed.into());
@@ -470,6 +534,7 @@ mod tests {
             patch_verification: PatchVerificationMode::Strict,
             patch_response_verification: PatchResponseVerificationMode::Required,
             patch_decryption_key_provider: Some(resolve_key),
+            patch_decryption_key_provider_v2: None,
         }
     }
     fn response() -> PatchCheckResponse {

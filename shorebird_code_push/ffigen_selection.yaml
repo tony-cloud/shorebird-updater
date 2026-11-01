@@ -1,0 +1,27 @@
+name: SelectionBindings
+description: Additive installation and protocol-2 selection status bindings.
+output: lib/src/generated/selection_bindings.g.dart
+headers:
+  entry-points:
+    - ../library/include/updater_dart.h
+  include-directives:
+    - ../library/include/updater_dart.h
+functions:
+  include:
+    - shorebird_installation_id
+    - shorebird_selection_status_json
+    - shorebird_free_status_string
+preamble: |
+  // ignore_for_file: unused_element, unused_field
+structs:
+  include: []
+unions:
+  include: []
+enums:
+  include: []
+typedefs:
+  include: []
+globals:
+  include: []
+macros:
+  include: []

@@ -406,6 +406,12 @@ pub fn should_auto_update() -> anyhow::Result<bool> {
     })
 }
 
+/// Read the existing nonsecret installation routing identifier without creating
+/// or resetting state. It is not a credential or proof of entitlement.
+pub fn installation_id() -> anyhow::Result<String> {
+    with_config(|config| UpdaterState::read_client_id(&config.storage_dir, &config.release_version))
+}
+
 /// Overrides the generated per-install device/client id used for patch checks
 /// and server-side device targeting. The value is persisted in updater state
 /// and survives release-version cache resets.

@@ -165,6 +165,15 @@ pub(crate) fn transport_path(config: &UpdateConfig, number: usize) -> PathBuf {
         .join("transport.aesgcm")
 }
 
+#[derive(Debug)]
+pub(crate) struct TransportUnavailable;
+impl std::fmt::Display for TransportUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Authenticated native transport is unavailable")
+    }
+}
+impl std::error::Error for TransportUnavailable {}
+
 pub(crate) fn reconstruct<W: Write>(
     config: &UpdateConfig,
     patch: &Patch,
@@ -172,7 +181,18 @@ pub(crate) fn reconstruct<W: Write>(
     ciphertext: &Path,
     output: W,
 ) -> Result<(W, u64)> {
-    let plaintext = crate::encrypted_patch::decrypt(config, patch, client_id, ciphertext)?;
+    let plaintext =
+        crate::encrypted_patch::decrypt(config, patch, client_id, ciphertext).map_err(|error| {
+            if config.selection_scope.is_some()
+                && !error.is::<crate::encrypted_patch::KeyResolutionFailed>()
+                && !error.is::<crate::selection_v2::AuthorizationUnavailable>()
+                && !is_resource_error(&error)
+            {
+                error.context(TransportUnavailable)
+            } else {
+                error
+            }
+        })?;
     let compressed_size = plaintext.len();
     let base = crate::updater::patch_base(config)?;
     let mut output = BoundedHashWriter::new(output, config.native_options.max_image_bytes)?;
@@ -240,7 +260,13 @@ pub(crate) fn install(
     let size = match reconstruct(config, patch, &client_id, download, std::io::sink()) {
         Ok((_, size)) => size,
         Err(error) => {
-            if !error.is::<crate::encrypted_patch::KeyResolutionFailed>()
+            if error.is::<TransportUnavailable>() {
+                crate::with_mut_state(|s| {
+                    s.lifecycle().cleanup(patch.number)?;
+                    s.lifecycle_mut().recompute_next_boot()
+                })?;
+            } else if !error.is::<crate::encrypted_patch::KeyResolutionFailed>()
+                && !error.is::<crate::selection_v2::AuthorizationUnavailable>()
                 && !is_resource_error(&error)
             {
                 crate::with_mut_state(|s| {

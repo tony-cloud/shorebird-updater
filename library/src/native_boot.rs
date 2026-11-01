@@ -39,7 +39,7 @@ impl NativeOptions {
                 "Verified memory capability unsupported on this platform"
             );
         }
-        if self.capability != 0 && crate::encrypted_patch::provider().is_some() {
+        if self.capability != 0 && crate::encrypted_patch::has_provider() {
             ensure!(
                 self.max_image_bytes > 0,
                 "Encrypted native mode requires a nonzero image budget"
@@ -48,7 +48,9 @@ impl NativeOptions {
         Ok(())
     }
     pub(crate) fn encrypted(self, config: &UpdateConfig) -> bool {
-        matches!(self.capability, 1 | 2) && config.patch_decryption_key_provider.is_some()
+        matches!(self.capability, 1 | 2)
+            && (config.patch_decryption_key_provider.is_some()
+                || config.patch_decryption_key_provider_v2.is_some())
     }
 }
 
@@ -58,6 +60,7 @@ struct Initialization {
     yaml: String,
     callbacks: [usize; 4],
     provider: Option<usize>,
+    provider_v2: Option<usize>,
     options: NativeOptions,
     scope: Option<crate::selection_v2::ReleaseScope>,
     baseline_callbacks: Option<[usize; 4]>,
@@ -96,6 +99,7 @@ pub(crate) fn initialize_with_scope(
             callbacks.close as usize,
         ],
         provider: crate::encrypted_patch::provider().map(|p| p as usize),
+        provider_v2: crate::encrypted_patch::provider_v2().map(|p| p as usize),
         options,
         scope: scope.clone(),
         baseline_callbacks: baseline_callbacks.map(|c| {
@@ -184,6 +188,20 @@ impl Selection {
             completed: false,
         }
     }
+    fn base_for_config(config: &UpdateConfig) -> Self {
+        let mut base = Self::base();
+        if config.selection_scope.is_some() {
+            base.verified_selection = crate::selection_v2::accepted_grant(config)
+                .ok()
+                .map(|(grant, _)| grant);
+        }
+        base
+    }
+    fn fallback_base(&self) -> Self {
+        let mut base = Self::base();
+        base.verified_selection = self.verified_selection.clone();
+        base
+    }
     fn owned(&self) -> Result<OwnedSource> {
         Ok(OwnedSource {
             id: self.id,
@@ -255,9 +273,14 @@ pub(crate) fn selection_context_json(id: u64) -> Result<Option<String>> {
             })
         })?;
     }
-    source.verified_selection.as_ref().map(|grant| {
-        serde_json::to_string(&serde_json::json!({"version": 2, "selection": grant.descriptor(), "selection_digest": grant.digest()})).map_err(Into::into)
-    }).transpose()
+    if source.patch.is_none() {
+        return Ok(None);
+    }
+    source
+        .verified_selection
+        .as_ref()
+        .map(|grant| grant.context_json())
+        .transpose()
 }
 
 fn authorization_current(config: &UpdateConfig, source: &Selection) -> bool {
@@ -357,7 +380,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                 }))
             })?;
             let Some((patch_info, state, client_id)) = candidate else {
-                break Selection::base();
+                break Selection::base_for_config(&config);
             };
             let number = patch_info.number;
             if matches!(
@@ -367,9 +390,13 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
             {
                 // An older/provider-free integration cannot consume this format.
                 // Retain it for a capable fresh process; never hash it as code.
-                break Selection::base();
+                break Selection::base_for_config(&config);
             }
             let result: Result<Selection> = (|| {
+                // Capture the grant before any external key callback. A newer
+                // authorization must invalidate this unbegun source, rather
+                // than relabel bytes/key resolution with a later descriptor.
+                let verified_selection = crate::selection_v2::boot_grant(&config)?;
                 if config.native_options.encrypted(&config) {
                     let Some(PatchState::InstalledEncryptedTransportV1 {
                         size,
@@ -411,7 +438,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                         (Some(file), None, actual_size)
                     };
                     Ok(Selection {
-                        verified_selection: crate::selection_v2::boot_grant(&config)?,
+                        verified_selection,
                         id: next_id(),
                         patch: Some(number),
                         expected_state: state.clone(),
@@ -433,7 +460,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                         current.validate_next_boot_patch()
                     })?;
                     Ok(Selection {
-                        verified_selection: crate::selection_v2::boot_grant(&config)?,
+                        verified_selection,
                         id: next_id(),
                         patch: Some(number),
                         expected_state: state.clone(),
@@ -456,10 +483,12 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                             .is_none() =>
                 {
                     // Lease/authorization refusal cannot quarantine valid content.
-                    break Selection::base();
+                    break Selection::base_for_config(&config);
                 }
                 Err(error)
                     if error.is::<crate::encrypted_patch::KeyResolutionFailed>()
+                        || error.is::<crate::selection_v2::AuthorizationUnavailable>()
+                        || error.is::<native_cache::TransportUnavailable>()
                         || native_cache::is_resource_error(&error)
                         || error.is::<native_cache::ResourceLimit>() =>
                 {
@@ -469,7 +498,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                         "native_source_unavailable"
                     };
                     diagnostic(&config, number, &error, Some(category))?;
-                    break Selection::base();
+                    break Selection::base_for_config(&config);
                 }
                 Err(error) => {
                     config::with_config(|_| {
@@ -504,7 +533,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                     *selection = Some(if still_current {
                         selected
                     } else {
-                        Selection::base()
+                        Selection::base_for_config(&config)
                     });
                     Ok(())
                 })
@@ -523,7 +552,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
         {
             let mut selection = SELECTION.lock().expect("Native selection lock poisoned");
             if selection.is_none() {
-                *selection = Some(Selection::base());
+                *selection = Some(Selection::base_for_config(&config));
             }
             export_source(&mut selection)
         }
@@ -540,7 +569,7 @@ fn export_source(selection: &mut Option<Selection>) -> Result<OwnedSource> {
                 "Could not duplicate native boot source; freezing BASE: {:#}",
                 error
             );
-            *selection = Some(Selection::base());
+            *selection = Some(source.fallback_base());
             selection.as_ref().unwrap().owned()
         }
         Err(error) => Err(error), // A running process cannot switch code on FD exhaustion.
@@ -578,7 +607,7 @@ pub(crate) fn begin(id: u64) -> Result<bool> {
         })
     })?;
     if !accepted {
-        *selection = Some(Selection::base());
+        *selection = Some(source.fallback_base());
         return Ok(false);
     }
     source.begun = true;
@@ -595,7 +624,7 @@ pub(crate) fn abort(id: u64, failure: u32) -> Result<bool> {
     let number = source.patch;
     let expected_state = source.expected_state.clone();
     // Freeze first even if bookkeeping fails. Never execute a refused source.
-    *selection = Some(Selection::base());
+    *selection = Some(source.fallback_base());
     config::with_config(|config| {
         let mut state = load_state(config)?;
         state.set_running_patch(None);
@@ -813,4 +842,104 @@ mod tests {
         assert!(config::with_config(|_| Ok(())).is_ok());
         crate::testing_reset_config();
     }
+}
+
+/// Atomic process/authorization/effective-next snapshot. Taking selection first
+/// matches begin/abort lock order; acceptance cannot change the journal while
+/// this reads the process identity and reconstructs next-boot pointers.
+pub(crate) fn selection_status_json() -> Result<Option<String>> {
+    let selected = SELECTION.lock().expect("Native selection lock poisoned");
+    config::with_config(|config| {
+        if config.selection_scope.is_none() {
+            return Ok(None);
+        }
+        crate::selection_v2::with_authority_guard(config, || {
+            let state = crate::cache::UpdaterState::load_readonly(
+                &config.storage_dir,
+                &config.download_dir,
+                &config.release_version,
+                config.patch_public_key.as_deref(),
+                config.patch_verification,
+            )?;
+            let accepted = crate::selection_v2::accepted_grant(config).ok();
+            let current = selected
+                .as_ref()
+                .filter(|source| source.begun || source.patch.is_none());
+            let current_grant = current.and_then(|source| source.verified_selection.as_ref());
+            let current_patch = current.and_then(|source| source.patch);
+            // One captured lease decision governs the complete snapshot,
+            // including when hashing cached content crosses a clock boundary.
+            let activation = accepted
+                .as_ref()
+                .map(|(grant, floor)| grant.activation(crate::time::unix_timestamp().max(*floor)));
+            let mut next_patch = None;
+            if let Some((grant, _)) = &accepted {
+                if activation == Some(crate::selection_v2::Activation::Patch) {
+                    if let crate::selection_v2::ContentReadiness::Ready(number) =
+                        crate::selection_v2::content_readiness(config, &state, grant)?
+                    {
+                        next_patch = Some(number);
+                    }
+                }
+            }
+            let identity = |grant: Option<&crate::selection_v2::VerifiedSelection>,
+                            patch: Option<usize>| {
+                let (variant, license) = match (grant, patch) {
+                    (Some(grant), Some(_)) => (
+                        grant.descriptor().variant_id.as_str(),
+                        grant.descriptor().license_type.as_str(),
+                    ),
+                    _ => ("free", "free"),
+                };
+                serde_json::json!({
+                    "epoch": grant.map_or_else(|| "0".to_owned(), |g| g.epoch().to_string()),
+                    "digest": grant.map(|g| g.digest()),
+                    "variant_id": variant,
+                    "license_type": license,
+                    "patch_number": patch.map(|n| n.to_string())
+                })
+            };
+            let accepted_grant = accepted.as_ref().map(|(grant, _)| grant);
+            let accepted_patch = accepted_grant
+                .and_then(|grant| grant.descriptor().target.patch_number.as_ref())
+                .map(|n| n.parse::<usize>().expect("verified patch"));
+            let current_json = identity(current_grant, current_patch);
+            let mut accepted_json = identity(accepted_grant, accepted_patch);
+            accepted_json["target_kind"] = serde_json::json!(if accepted_patch.is_some() {
+                "patch"
+            } else {
+                "base"
+            });
+            let reason = match activation {
+                None => "no_authorization",
+                Some(crate::selection_v2::Activation::Expired) => "expired",
+                Some(crate::selection_v2::Activation::NotYetValid) => "not_yet_valid",
+                Some(crate::selection_v2::Activation::Base) => "selected_base",
+                Some(crate::selection_v2::Activation::Patch) if next_patch.is_some() => "ready",
+                Some(crate::selection_v2::Activation::Patch) => {
+                    if accepted_patch.is_some_and(|n| {
+                        matches!(
+                            state.lifecycle().read_state(n),
+                            Some(PatchState::Bad { .. })
+                        )
+                    }) {
+                        "quarantined"
+                    } else {
+                        "content_unavailable"
+                    }
+                }
+            };
+            let next_identity = identity(accepted_grant, next_patch);
+            let restart_required = current_json["epoch"] != accepted_json["epoch"]
+                || current_json["digest"] != accepted_json["digest"]
+                || current_patch != next_patch;
+            Ok(Some(serde_json::to_string(&serde_json::json!({
+                "version": 2,
+                "current": current_json,
+                "accepted": accepted_json,
+                "next_boot": {"variant_id":next_identity["variant_id"],"license_type":next_identity["license_type"],"patch_number":next_identity["patch_number"],"reason":reason},
+                "restart_required": restart_required
+            }))?))
+        })
+    })
 }

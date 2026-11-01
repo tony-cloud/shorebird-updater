@@ -4,6 +4,7 @@ import 'dart:ffi';
 import 'package:ffi/ffi.dart';
 import 'package:mocktail/mocktail.dart';
 import 'package:shorebird_code_push/src/generated/updater_bindings.g.dart';
+import 'package:shorebird_code_push/src/selection_status.dart';
 import 'package:shorebird_code_push/src/shorebird_updater.dart';
 import 'package:shorebird_code_push/src/shorebird_updater_io.dart';
 import 'package:shorebird_code_push/src/updater.dart';
@@ -265,6 +266,51 @@ void main() {
     });
 
     group('checkForUpdate', () {
+      test('same-content higher epoch requires restart from atomic status',
+          () async {
+        when(updater.currentPatchNumber).thenReturn(2);
+        when(updater.nextPatchNumber).thenReturn(2);
+        when(() => updater.checkForDownloadableUpdate()).thenReturn(false);
+        when(updater.selectionStatus).thenReturn(
+          VariantSelectionStatus(
+            current: VariantSelection(
+              epoch: BigInt.from(11),
+              digest: 'a' * 64,
+              variantId: 'pro',
+              licenseType: 'pro',
+              patchNumber: 2,
+            ),
+            accepted: VariantSelection(
+              epoch: BigInt.from(12),
+              digest: 'b' * 64,
+              variantId: 'pro',
+              licenseType: 'pro',
+              patchNumber: 2,
+            ),
+            nextBoot: const VariantActivation(
+              variantId: 'pro',
+              licenseType: 'pro',
+              patchNumber: 2,
+              reason: 'ready',
+            ),
+            restartRequired: true,
+          ),
+        );
+        shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
+        expect(
+          await shorebirdUpdater.checkForUpdate(),
+          UpdateStatus.restartRequired,
+        );
+        verifyNever(updater.nextPatchNumber);
+      });
+
+      test('forwards readonly installation identity', () async {
+        when(updater.currentPatchNumber).thenReturn(0);
+        when(updater.installationId).thenReturn('installation-id');
+        shorebirdUpdater = ShorebirdUpdaterImpl(updater: updater, run: run);
+        expect(await shorebirdUpdater.readInstallationId(), 'installation-id');
+      });
+
       group('when updater is unavailable', () {
         setUp(() {
           when(updater.currentPatchNumber).thenThrow(Exception('oops'));

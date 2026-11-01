@@ -100,6 +100,32 @@ fn is_file_not_found(error: &anyhow::Error) -> bool {
 }
 
 impl UpdaterState {
+    pub(crate) fn load_readonly(
+        cache_dir: &Path,
+        download_dir: &Path,
+        release_version: &str,
+        public_key: Option<&str>,
+        verification: PatchVerificationMode,
+    ) -> Result<Self> {
+        let state = Self::load(cache_dir, download_dir, public_key, verification)?;
+        ensure!(
+            state.serialized_state.release_version == release_version,
+            "Installation release state mismatch"
+        );
+        Ok(state)
+    }
+
+    /// Read installation identity independently of optional patch pointers.
+    /// Never create/reset state from a read-only public/provisioning API.
+    pub(crate) fn read_client_id(cache_dir: &Path, release_version: &str) -> Result<String> {
+        let state: SerializedState = disk_io::read(&cache_dir.join(STATE_FILE_NAME))?;
+        ensure!(
+            state.release_version == release_version,
+            "Installation release state mismatch"
+        );
+        Ok(state.client_id)
+    }
+
     pub fn client_id(&self) -> String {
         self.serialized_state.client_id.clone()
     }

@@ -34,6 +34,40 @@ pub type PatchDecryptionKeyProvider = unsafe extern "C" fn(
     written: *mut usize,
 ) -> bool;
 
+/// Selection-aware application resolver. All strings are borrowed for this
+/// callback only; context is updater-verified JSON {version,selection,
+/// selection_digest}. Write exactly 32 key bytes and set written, or return
+/// false. The authenticated provisioning service must independently authorize
+/// the installation/grant; this nonsecret context is not a credential.
+pub type PatchDecryptionKeyProviderV2 = unsafe extern "C" fn(
+    key_id: *const c_char,
+    aad: *const c_char,
+    verified_selection_context_json: *const c_char,
+    key_out: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> bool;
+
+/// Register before initialization, mutually exclusive with the v1 provider.
+/// Used only for explicitly compiled native-aot protocol-2 releases. Callback
+/// may run on an updater worker and must remain valid for the process lifetime.
+/// No config, process-selection or authorization mutex spans the callback.
+#[no_mangle]
+pub extern "C" fn shorebird_set_patch_decryption_key_provider_v2(
+    provider: Option<
+        unsafe extern "C" fn(
+            key_id: *const c_char,
+            aad: *const c_char,
+            verified_selection_context_json: *const c_char,
+            key_out: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> bool,
+    >,
+) -> bool {
+    crate::encrypted_patch::set_provider_v2(provider)
+}
+
 /// Register before shorebird_init; returns false after initialization.
 /// A non-null provider requires encrypted patch delivery and strict signed
 /// response/boot policies. Null disables delivery encryption before init only.
@@ -350,8 +384,11 @@ pub unsafe extern "C" fn shorebird_init_with_options(
 /// and retained for interpreter diff reconstruction. Both callback sets must
 /// remain valid for the process lifetime; every open returns a fresh stream.
 /// Requires strict artifact verification, required response signatures and a
-/// pinned public key in compiled_yaml. Native AOT v2 is currently refused until
-/// its selection-aware key adapter is available. Existing init APIs stay v1.
+/// pinned public key in compiled_yaml. Native AOT v2 instead measures the
+/// original native AOT stream through the platform APK/snapshot base resolver;
+/// it ignores release_baseline_callbacks and requires a preregistered v2 key
+/// provider plus supported sealed FD or Windows verified-memory capability.
+/// Existing init APIs stay v1.
 ///
 /// # Safety
 /// Pointers must reference readable C structs and NUL-terminated UTF-8 strings.

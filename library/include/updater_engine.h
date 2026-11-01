@@ -152,6 +152,20 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * Register before initialization, mutually exclusive with the v1 provider.
+ * Used only for explicitly compiled native-aot protocol-2 releases. Callback
+ * may run on an updater worker and must remain valid for the process lifetime.
+ * No config, process-selection or authorization mutex spans the callback.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_set_patch_decryption_key_provider_v2(bool (*provider)(const char *key_id,
+                                                                     const char *aad,
+                                                                     const char *verified_selection_context_json,
+                                                                     uint8_t *key_out,
+                                                                     uintptr_t capacity,
+                                                                     uintptr_t *written));
+
+/**
  * Register before shorebird_init; returns false after initialization.
  * A non-null provider requires encrypted patch delivery and strict signed
  * response/boot policies. Null disables delivery encryption before init only.
@@ -270,8 +284,11 @@ bool shorebird_init_with_options(const struct AppParameters *parameters,
  * and retained for interpreter diff reconstruction. Both callback sets must
  * remain valid for the process lifetime; every open returns a fresh stream.
  * Requires strict artifact verification, required response signatures and a
- * pinned public key in compiled_yaml. Native AOT v2 is currently refused until
- * its selection-aware key adapter is available. Existing init APIs stay v1.
+ * pinned public key in compiled_yaml. Native AOT v2 instead measures the
+ * original native AOT stream through the platform APK/snapshot base resolver;
+ * it ignores release_baseline_callbacks and requires a preregistered v2 key
+ * provider plus supported sealed FD or Windows verified-memory capability.
+ * Existing init APIs stay v1.
  *
  * # Safety
  * Pointers must reference readable C structs and NUL-terminated UTF-8 strings.

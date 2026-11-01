@@ -5,13 +5,17 @@ import 'dart:isolate';
 import 'package:ffi/ffi.dart';
 import 'package:meta/meta.dart';
 import 'package:shorebird_code_push/src/generated/updater_bindings.g.dart';
+import 'package:shorebird_code_push/src/selection_status.dart';
 import 'package:shorebird_code_push/src/shorebird_updater.dart';
 import 'package:shorebird_code_push/src/updater.dart';
 
 @visibleForTesting
+
 /// Type definition for [Isolate.run].
-typedef IsolateRun =
-    Future<R> Function<R>(FutureOr<R> Function(), {String? debugName});
+typedef IsolateRun = Future<R> Function<R>(
+  FutureOr<R> Function(), {
+  String? debugName,
+});
 
 /// {@template shorebird_updater_io}
 /// The Shorebird IO Updater.
@@ -19,8 +23,8 @@ typedef IsolateRun =
 class ShorebirdUpdaterImpl implements ShorebirdUpdater {
   /// {@macro shorebird_updater_io}
   ShorebirdUpdaterImpl({Updater? updater, IsolateRun? run})
-    : _updater = updater ?? const Updater(),
-      _run = run ?? Isolate.run {
+      : _updater = updater ?? const Updater(),
+        _run = run ?? Isolate.run {
     try {
       // If the Shorebird Engine is not available, this will throw an exception.
       // FIXME: Run this in an isolate or refactor the updater to avoid risking
@@ -53,6 +57,18 @@ class ShorebirdUpdaterImpl implements ShorebirdUpdater {
   Future<Patch?> readNextPatch() => _readPatch(_updater.nextPatchNumber);
 
   @override
+  Future<String?> readInstallationId() async {
+    if (!_isAvailable) return null;
+    return _run(_updater.installationId);
+  }
+
+  @override
+  Future<VariantSelectionStatus?> readSelectionStatus() async {
+    if (!_isAvailable) return null;
+    return _run(_updater.selectionStatus);
+  }
+
+  @override
   Future<void> setDeviceIdOverride(String deviceId) async {
     if (!_isAvailable) return;
     final didSet = await _run(() => _updater.setDeviceIdOverride(deviceId));
@@ -82,6 +98,13 @@ class ShorebirdUpdaterImpl implements ShorebirdUpdater {
       () => _updater.checkForDownloadableUpdate(track: track),
     );
     if (isUpdateAvailable) return UpdateStatus.outdated;
+
+    final selection = await readSelectionStatus();
+    if (selection != null) {
+      return selection.restartRequired
+          ? UpdateStatus.restartRequired
+          : UpdateStatus.upToDate;
+    }
 
     // If no new update is available for download, see if a new patch exists
     // on disk that requires a restart.

@@ -1,3 +1,4 @@
+import 'package:shorebird_code_push/src/selection_status.dart';
 import 'package:shorebird_code_push/src/shorebird_updater_io.dart'
     if (dart.library.js_interop) './shorebird_updater_web.dart';
 
@@ -127,6 +128,17 @@ abstract class ShorebirdUpdater {
   /// Throws a [ReadPatchException] if the read is unsuccessful.
   Future<Patch?> readNextPatch();
 
+  /// Reads the existing nonsecret installation routing ID without changing it.
+  /// Returns null on older engines or when the updater is unavailable. The ID
+  /// is not a credential and does not establish a license or entitlement.
+  Future<String?> readInstallationId();
+
+  /// Atomically reads current, accepted and effective next-launch variant
+  /// state.
+  /// Returns null for v1 releases, older engines or unavailable updaters.
+  /// Epoch changes can require restart with identical content.
+  Future<VariantSelectionStatus?> readSelectionStatus();
+
   /// Overrides the generated random per-install device id used in patch
   /// checks. Call this before [checkForUpdate] or [update] if your server
   /// needs patch delivery bound to an app/account-specific identifier.
@@ -134,7 +146,8 @@ abstract class ShorebirdUpdater {
   /// The updater persists the override in its local state after a successful
   /// call. The value should be stable for this installation/account and must
   /// not contain sensitive secrets; it is sent to the update server as
-  /// `client_id`.
+  /// `client_id`. V2 installations keep their generated identity
+  /// immutable and reject overrides. Read [readInstallationId] for assignment.
   Future<void> setDeviceIdOverride(String deviceId);
 
   /// Checks for an available patch on [track] (or [UpdateTrack.stable] if no

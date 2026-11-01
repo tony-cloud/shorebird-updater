@@ -1,3 +1,4 @@
+import 'package:shorebird_code_push/src/selection_status.dart';
 import 'package:shorebird_code_push/src/shorebird_updater.dart';
 
 /// {@template shorebird_updater_web}
@@ -17,6 +18,12 @@ class ShorebirdUpdaterImpl implements ShorebirdUpdater {
 
   @override
   Future<Patch?> readNextPatch() async => null;
+
+  @override
+  Future<String?> readInstallationId() async => null;
+
+  @override
+  Future<VariantSelectionStatus?> readSelectionStatus() async => null;
 
   @override
   Future<void> setDeviceIdOverride(String deviceId) async {}

@@ -73,6 +73,30 @@ SHOREBIRD_EXPORT uintptr_t shorebird_current_boot_patch_number(void);
 SHOREBIRD_EXPORT uintptr_t shorebird_next_boot_patch_number(void);
 
 /**
+ * Copy the existing nonsecret installation ID, or NULL on error. This read
+ * never creates/replaces identity and is not an entitlement credential. Free
+ * using shorebird_free_status_string. New Dart probes symbols on old engines.
+ */
+SHOREBIRD_EXPORT char *shorebird_installation_id(void);
+
+/**
+ * Atomic v2 current/accepted/effective-next status JSON, or NULL for v1/error.
+ * Epoch/patch values are decimal strings. Running context stays process-pinned;
+ * greater epoch/different digest requires restart even for identical content.
+ * Free using shorebird_free_status_string. Existing patch APIs are unchanged.
+ */
+SHOREBIRD_EXPORT char *shorebird_selection_status_json(void);
+
+/**
+ * Free a string returned by shorebird_installation_id or
+ * shorebird_selection_status_json. NULL is accepted.
+ *
+ * # Safety
+ * A non-null pointer must have been returned by these updater APIs.
+ */
+SHOREBIRD_EXPORT void shorebird_free_status_string(const char *value);
+
+/**
  * Check for an update on the first non-null channel of:
  *   1. `c_channel`
  *   2. The channel specified in shorebird.yaml

@@ -181,6 +181,8 @@ pub struct UpdateConfig {
     pub file_provider: Box<dyn ExternalFileProvider>,
     pub patch_public_key: Option<String>,
     pub patch_decryption_key_provider: Option<crate::c_api::engine::PatchDecryptionKeyProvider>,
+    pub patch_decryption_key_provider_v2:
+        Option<crate::c_api::engine::PatchDecryptionKeyProviderV2>,
     pub patch_verification: PatchVerificationMode,
     pub patch_response_verification: PatchResponseVerificationMode,
 }
@@ -257,6 +259,14 @@ pub(crate) fn set_config_with_binding(
         code_cache_path.push("downloads");
         let download_dir = code_cache_path;
 
+        let selection_baseline = if selection_scope
+            .as_ref()
+            .is_some_and(|s| s.runtime_profile == "native-aot")
+        {
+            None
+        } else {
+            selection_baseline
+        };
         let new_config = UpdateConfig {
             selection_scope,
             selection_baseline,
@@ -281,6 +291,7 @@ pub(crate) fn set_config_with_binding(
             file_provider,
             patch_public_key: yaml.patch_public_key.to_owned(),
             patch_decryption_key_provider: crate::encrypted_patch::provider(),
+            patch_decryption_key_provider_v2: crate::encrypted_patch::provider_v2(),
             patch_verification: yaml.patch_verification.unwrap_or_default(),
             patch_response_verification: yaml.patch_response_verification.unwrap_or_default(),
         };
@@ -307,16 +318,26 @@ pub(crate) fn set_config_with_binding(
                 "V2 requires pinned signatures and strict boot verification"
             );
             anyhow::ensure!(
-                scope.runtime_profile != "native-aot",
-                "V2 native key-context adapter is not implemented"
+                new_config.patch_decryption_key_provider.is_none(),
+                "V2 cannot use legacy transport keys"
             );
-            anyhow::ensure!(new_config.patch_decryption_key_provider.is_none(), "V2 interpreter selection requires artifact encryption, not the legacy transport provider");
             use sha2::{Digest, Sha256};
-            let mut base = new_config
-                .selection_baseline
-                .as_ref()
-                .context("V2 requires independently supplied original bytecode baseline")?
-                .open()?;
+            let mut base = if scope.runtime_profile == "native-aot" {
+                anyhow::ensure!(new_config.patch_decryption_key_provider_v2.is_some() && new_config.native_options.encrypted(&new_config), "Native v2 requires a selection-aware provider and supported sealed FD/verified memory route");
+                // Android resolves the actual original libapp.so inside the
+                // installed APK; Apple/native keep their existing base stream.
+                crate::updater::patch_base(&new_config)?
+            } else {
+                anyhow::ensure!(
+                    new_config.patch_decryption_key_provider_v2.is_none(),
+                    "Interpreter v2 owns artifact keys in the engine"
+                );
+                new_config
+                    .selection_baseline
+                    .as_ref()
+                    .context("V2 requires independently supplied original bytecode baseline")?
+                    .open()?
+            };
             let mut digest = Sha256::new();
             let mut buffer = [0u8; 8192];
             loop {

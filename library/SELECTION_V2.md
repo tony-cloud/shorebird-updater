@@ -1,9 +1,9 @@
 # Protocol 2 updater integration
 
 This is an opt-in updater consumer foundation. Existing engine initializers,
-response shapes, providers and v1 release behavior remain v1. No engine or CLI
-currently calls the new initializer, so this change does not establish runnable
-v2 applications on any platform.
+response shapes, providers and v1 release behavior remain v1. Engines must
+explicitly adopt the initializer and verified context; updater implementation
+alone does not establish runnable v2 applications on any platform.
 
 `selection_v2.rs` implements the frozen workspace
 `docs/VARIANT_SELECTION_PROTOCOL.md` contract. The committed test fixture is an
@@ -51,13 +51,71 @@ relax the envelope's own expiry. Begin must succeed for the same prepared token
 before execution; a stale unbegun source becomes BASE. These engine changes and
 selection-aware interpreter key policy are still required.
 
-Native AOT v2 initialization is explicitly refused until a selection-aware
-native key adapter is implemented. The existing native v1 callback never
-receives or releases keys for a v2 grant. A future additive provider must receive
-verified descriptor/digest plus authenticated transport key ID/AAD directly from
-the verified grant, before both install and boot reconstruction. It must run
-without config/selection/journal locks. Registration, context ownership and
-remote provisioning authentication require their own integration/tests.
+Native AOT v2 requires `shorebird_set_patch_decryption_key_provider_v2` before
+initialization, mutually exclusive with the legacy provider. The callback is
+`bool(key_id, aad, verified_selection_context_json, key_out, capacity, written)`.
+All C strings are borrowed for the call only. Return exactly 32 bytes and set
+written, or return false. Short keys and authentication failures remain typed
+retryable key failures; key and plaintext buffers are wiped by their existing
+owners. No fallback to a v1 provider exists for a v2 release.
+
+For native AOT the initializer ignores the interpreter baseline callbacks and
+measures the original native AOT stream through the existing platform resolver,
+including the exact library in Android's installed APK. Native v2 requires a
+supported sealed FD route on Linux/Android or verified memory on Windows, and a
+nonzero image budget. Other native platform/capability combinations fail closed.
+The authenticated delivery/ciphertext, current usable grant and exact complete
+delivery identity are checked before passing selection JSON to the provider at
+both install and cold reconstruction. Lease refusal is typed and cannot
+quarantine an artifact; a grant expiring after download retains the staged
+candidate for a higher-epoch renewal. Signed same-epoch refreshes may rotate
+transport nonce/key/ciphertext: a mismatching cached transport is discarded and
+redownloaded without condemning the immutable artifact. Proven reconstructed
+artifact failures remain quarantined. The application's authenticated key
+service must independently authorize the account/installation and grant: public
+selection JSON and installation IDs are not credentials.
+
+The existing nonblocking updater operation guard continues to serialize native
+materialization. No config, process-selection, journal-authority or provider
+registry mutex spans an application key callback. Reentrant update refuses with
+UpdateInProgress; an unselected reentrant prepare freezes BASE; an already begun
+source/its context stays pinned. Installation/status reads and begin/prepare are
+covered by callback reentry tests. No provider callback is invoked by those
+status/identity getters.
+
+## Read-only installation and selection status
+
+The additive Dart-stable C functions `shorebird_installation_id` and
+`shorebird_selection_status_json` return owned UTF-8 strings, freed with
+`shorebird_free_status_string`. ID reads never create/reset identity. Status
+reads do not rewrite pointers, quarantine content, prune storage or reset state.
+Status is NULL for v1 or unavailable state. New Dart probes both getter and
+free symbols before allocation; older engines fall back to existing patch APIs.
+Existing symbols, result struct layouts and success codes remain unchanged.
+
+Dart exposes `readInstallationId()` and `readSelectionStatus()`. The status
+model has `current`, `accepted`, `nextBoot`, and `restartRequired`. Epochs are
+BigInt; patch numbers remain content identities. The atomic JSON form is:
+
+```json
+{
+  "version": 2,
+  "current": {"epoch":"11","digest":"<sha256>","variant_id":"pro","license_type":"pro","patch_number":"2"},
+  "accepted": {"epoch":"12","digest":"<sha256>","variant_id":"pro","license_type":"pro","patch_number":"2","target_kind":"patch"},
+  "next_boot": {"variant_id":"pro","license_type":"pro","patch_number":"2","reason":"ready"},
+  "restart_required": true
+}
+```
+
+No authorization is epoch `"0"` and null digest. Bundled BASE is null patch
+number with effective free variant/license. Accepted identity remains distinct
+from effective BASE after expiry, missing content/key or quarantine. Next reason
+is ready, selected_base, expired, not_yet_valid, content_unavailable, quarantined,
+or no_authorization; ready content still requires successful cold key lookup.
+Current identity is process-pinned, including BASE fallback authorization.
+Greater accepted epoch/different digest requests restart even for identical
+content. Dart `checkForUpdate` uses this atomic status when available and keeps
+its previous patch-number comparison on old engines/v1.
 
 ## Authority and recovery
 
@@ -93,11 +151,16 @@ vectors, strict null/duplicate/unknown/UTF-8/numeric constraints, signed payload
 schema, bounded v2 HTTP requests/responses, concurrent epoch acceptance,
 journal restart/cleanup/tampering, cached lower-number reselection, explicit
 BASE, quarantined content and immutable prepared context. Initialization tests
-reject a mismatched original baseline and v2-to-v1 fallback.
+reject a mismatched original baseline and v2-to-v1 fallback. Native-specific
+tests cover provider exclusivity, short/wrong keys, callback reentry, native
+capability gating, delivery rotation and expiry-before-reconstruction recovery.
+Status tests cover read-only identity/corrupt-state handling, assignment races,
+precise 64-bit epochs and same-content higher-epoch restart. Portable anonymous
+memory reconstruction on the test host is not native image execution.
 
-Still required: engine/CLI producers; interpreter key/envelope integration;
-native v2 provider and materialization; a public Dart variant/epoch/status
-surface; platform-specific protected clock/durability decisions; injected
+Platform support still requires matched engine/CLI producers and interpreter
+key/envelope integration, platform-specific protected clock/durability decisions,
+injected
 power-loss/fsync failure coverage; and actual repeated free/pro/enterprise
 application execution, offline/key recovery and persistent user-data evidence
 on each platform/architecture. Unit-level synthetic cache construction is not

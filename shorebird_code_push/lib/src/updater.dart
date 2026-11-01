@@ -1,9 +1,13 @@
+import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:ffi';
 
 import 'package:ffi/ffi.dart';
 import 'package:meta/meta.dart';
+import 'package:shorebird_code_push/src/generated/selection_bindings.g.dart'
+    show SelectionBindings;
 import 'package:shorebird_code_push/src/generated/updater_bindings.g.dart';
+import 'package:shorebird_code_push/src/selection_status.dart';
 import 'package:shorebird_code_push/src/shorebird_updater.dart';
 
 /// {@template updater}
@@ -19,6 +23,51 @@ class Updater {
   static UpdaterBindings bindings = UpdaterBindings(
     ffi.DynamicLibrary.process(),
   );
+
+  /// Additive selection bindings, generated separately to preserve the legacy
+  /// bindings and their independently shipped ABI.
+  @visibleForTesting
+  static SelectionBindings selectionBindings = SelectionBindings(
+    ffi.DynamicLibrary.process(),
+  );
+
+  /// Availability probe for additive symbols missing on older engines.
+  @visibleForTesting
+  static bool Function(String) supportsSymbol =
+      ffi.DynamicLibrary.process().providesSymbol;
+
+  String? _readString(String symbol, Pointer<Char> Function() read) {
+    if (!supportsSymbol(symbol) ||
+        !supportsSymbol('shorebird_free_status_string')) {
+      return null;
+    }
+    final pointer = read();
+    if (pointer == nullptr) return null;
+    try {
+      return pointer.cast<Utf8>().toDartString();
+    } finally {
+      selectionBindings.shorebird_free_status_string(pointer);
+    }
+  }
+
+  /// Existing routing ID; null on older engines or unavailable state.
+  String? installationId() => _readString(
+        'shorebird_installation_id',
+        selectionBindings.shorebird_installation_id,
+      );
+
+  /// Atomic v2 status; null on older engines, v1 or unavailable state.
+  VariantSelectionStatus? selectionStatus() {
+    final json = _readString(
+      'shorebird_selection_status_json',
+      selectionBindings.shorebird_selection_status_json,
+    );
+    return json == null
+        ? null
+        : VariantSelectionStatus.fromJson(
+            jsonDecode(json) as Map<String, dynamic>,
+          );
+  }
 
   /// The currently active patch number.
   int currentPatchNumber() => bindings.shorebird_current_boot_patch_number();
