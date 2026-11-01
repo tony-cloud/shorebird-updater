@@ -1132,14 +1132,23 @@ mod tests {
             );
         }
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/api/v1/patches/check")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"selection_protocol":2,"accepted_selection_epoch":"10","accepted_selection_digest":request.accepted_selection_digest,"base_artifact_hash":request.base_artifact_hash,"runtime_profile":"interpreter-structural","host_abi_hash":null,"client_id":"test-install","nonce":request.nonce})))
-            .with_body(serde_json::to_vec(&vector["response"]).unwrap()).create();
+        let mut expected = serde_json::to_value(&request).unwrap();
+        let fields = expected.as_object_mut().unwrap();
+        fields.remove("client_id_hash");
+        fields.insert("client_id".into(), json!("test-install"));
+        fields.insert("selection_protocol".into(), json!(2));
+        fields.insert("current_patch_number".into(), json!(3));
+        let mock = server
+            .mock("POST", "/api/v1/patches/check")
+            .match_body(mockito::Matcher::Json(expected))
+            .with_body(serde_json::to_vec(&vector["response"]).unwrap())
+            .create();
         let bytes = crate::network::patch_check_v2(
             &format!("{}/api/v1/patches/check", server.url()),
             &request,
             "test-install",
             Some(3),
+            false,
         )
         .unwrap();
         assert!(verify_response(&bytes, &request, &request.scope(), key).is_ok());
@@ -1153,7 +1162,8 @@ mod tests {
             &format!("{}/api/v1/patches/check", server.url()),
             &request,
             "test-install",
-            None
+            None,
+            false,
         )
         .is_err());
         oversized.assert();
@@ -1408,6 +1418,9 @@ fn accept_check(
         &request,
         &state.0,
         state.1,
+        scope.runtime_profile == "native-aot"
+            && config.patch_decryption_key_provider_v2.is_some()
+            && config.native_options.encrypted(config),
     )?;
     let candidate = verify_response(&response, &request, &scope, key)?;
     // Authorization commits before any content lookup, download or pointers.
@@ -2188,6 +2201,130 @@ mod integration_tests {
         });
         crate::config::with_config(|c| Ok(c.clone())).unwrap()
     }
+
+    #[test]
+    #[serial]
+    fn native_v2_patch_check_advertises_capability_and_accepts_bound_delivery() {
+        use std::sync::{atomic::Ordering::SeqCst, Arc, Mutex};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = native_config(&tmp);
+        let (grant, _) = native_fixture(&config, 11);
+        let mut server = mockito::Server::new();
+        config.base_url = server.url();
+        let observed = Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+        let payload = grant.payload.clone();
+        let mock = server
+            .mock("POST", "/api/v1/patches/check")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "accept_encrypted_patch": true,
+                "selection_protocol": 2,
+                "runtime_profile": "native-aot",
+            })))
+            .with_body_from_request(move |incoming| {
+                let wire: serde_json::Value =
+                    serde_json::from_slice(incoming.body().unwrap()).unwrap();
+                *captured.lock().unwrap() = Some(wire.clone());
+                let mut payload = payload.clone();
+                payload.request.nonce = wire["nonce"].as_str().unwrap().into();
+                let signed = serde_json::to_vec(&payload).unwrap();
+                serde_json::to_vec(&Response {
+                    version: 2,
+                    selection: payload.selection,
+                    selection_digest: payload.selection_digest,
+                    delivery: payload.delivery,
+                    authentication: Authentication {
+                        payload: BASE64_STANDARD.encode(&signed),
+                        signature: crate::test_utils::sign_test_message(&signed),
+                    },
+                })
+                .unwrap()
+            })
+            .create();
+        NATIVE_CALLS.store(0, SeqCst);
+        assert!(check(&config).unwrap());
+        mock.assert();
+        let accepted = accepted_grant(&config).unwrap().0;
+        assert_eq!(accepted.epoch(), 11);
+        assert_eq!(accepted.digest(), grant.digest());
+        assert!(accepted.delivery().unwrap().encryption.is_some());
+        let signed_request = &accepted.payload.request;
+        let mut expected = serde_json::to_value(signed_request).unwrap();
+        let fields = expected.as_object_mut().unwrap();
+        assert!(!fields.contains_key("accept_encrypted_patch"));
+        fields.remove("client_id_hash");
+        fields.insert(
+            "client_id".into(),
+            serde_json::json!(crate::updater::installation_id().unwrap()),
+        );
+        fields.insert("selection_protocol".into(), serde_json::json!(2));
+        fields.insert("accept_encrypted_patch".into(), serde_json::json!(true));
+        assert_eq!(observed.lock().unwrap().as_ref(), Some(&expected));
+        // Advertising support does not ask the provider for a key. The grant
+        // remains bound to the fresh nonce and installed scope before commit.
+        assert_eq!(NATIVE_CALLS.load(SeqCst), 0);
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn native_v2_patch_check_omits_capability_without_provider_or_source() {
+        use std::sync::{Arc, Mutex};
+        for case in [
+            "no provider",
+            "legacy provider",
+            "no source",
+            "unknown source",
+            "interpreter profile",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = native_config(&tmp);
+            if case == "interpreter profile" {
+                // Init normally refuses this provider/profile combination;
+                // it must not accidentally opt an interpreter into transport.
+                config.selection_scope.as_mut().unwrap().runtime_profile =
+                    "interpreter-structural".into();
+            }
+            let prior = grant(&config, 10, None, b"");
+            accept(&config, &prior);
+            let journal = journal_for(&config, &prior.descriptor().scope).unwrap();
+            let before = std::fs::read(journal.path()).unwrap();
+            match case {
+                "no provider" => config.patch_decryption_key_provider_v2 = None,
+                "legacy provider" => {
+                    config.patch_decryption_key_provider_v2 = None;
+                    config.patch_decryption_key_provider = Some(unused_v1);
+                }
+                "no source" => config.native_options.capability = 0,
+                "unknown source" => config.native_options.capability = 3,
+                "interpreter profile" => (),
+                _ => unreachable!(),
+            }
+            let mut server = mockito::Server::new();
+            config.base_url = server.url();
+            let observed = Arc::new(Mutex::new(None));
+            let captured = observed.clone();
+            let mock = server
+                .mock("POST", "/api/v1/patches/check")
+                .with_status(409)
+                .with_body_from_request(move |incoming| {
+                    let wire: serde_json::Value =
+                        serde_json::from_slice(incoming.body().unwrap()).unwrap();
+                    *captured.lock().unwrap() = Some(wire);
+                    br#"{"code":"selection_encryption_unavailable"}"#.to_vec()
+                })
+                .create();
+            assert!(check(&config).is_err(), "{case}");
+            mock.assert();
+            let wire = observed.lock().unwrap().clone().unwrap();
+            assert!(wire.get("accept_encrypted_patch").is_none(), "{case}");
+            assert_eq!(wire["accepted_selection_epoch"], "10");
+            assert_eq!(wire["accepted_selection_digest"], prior.digest());
+            assert_eq!(std::fs::read(journal.path()).unwrap(), before, "{case}");
+            crate::testing_reset_config();
+        }
+    }
+
     fn status() -> serde_json::Value {
         serde_json::from_str(
             &crate::native_boot::selection_status_json()

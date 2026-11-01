@@ -85,12 +85,18 @@ pub(crate) fn patch_check_v2(
     context: &crate::selection_v2::RequestContext,
     client_id: &str,
     current_patch: Option<usize>,
+    accept_encrypted_patch: bool,
 ) -> anyhow::Result<Vec<u8>> {
     let mut request = serde_json::to_value(context)?;
     let fields = request.as_object_mut().expect("Request context object");
     fields.remove("client_id_hash"); // The server hashes the exact raw ID.
     fields.insert("client_id".into(), serde_json::json!(client_id));
     fields.insert("selection_protocol".into(), serde_json::json!(2));
+    // This transport capability is not part of the server's signed request
+    // context. Keep that schema unchanged for response and journal validation.
+    if accept_encrypted_patch {
+        fields.insert("accept_encrypted_patch".into(), serde_json::json!(true));
+    }
     if let Some(number) = current_patch {
         fields.insert("current_patch_number".into(), serde_json::json!(number));
     }
