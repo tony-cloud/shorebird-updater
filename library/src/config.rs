@@ -9,11 +9,60 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use once_cell::sync::OnceCell;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Mutex,
 };
 
 static CHECKED_NATIVE_ONLY: AtomicBool = AtomicBool::new(false);
+// A key-refused interpreter boot runs BASE for the remainder of this process,
+// even if clearing its durable breadcrumb fails. Never promote that breadcrumb
+// from a later engine or a direct launch-report call.
+#[repr(u8)]
+enum LaunchOutcome {
+    Pending,
+    Completed,
+    Deferred,          // Refused source; bookkeeping has not safely cleared the breadcrumb.
+    DeferredPersisted, // BASE is running; ordinary updates may proceed.
+}
+static LAUNCH_OUTCOME: AtomicU8 = AtomicU8::new(LaunchOutcome::Pending as u8);
+
+pub(crate) fn launch_deferred() -> bool {
+    let outcome = LAUNCH_OUTCOME.load(Ordering::Acquire);
+    outcome == LaunchOutcome::Deferred as u8 || outcome == LaunchOutcome::DeferredPersisted as u8
+}
+
+pub(crate) fn ensure_launch_deferral_resolved() -> Result<()> {
+    anyhow::ensure!(
+        LAUNCH_OUTCOME.load(Ordering::Acquire) != LaunchOutcome::Deferred as u8,
+        "Interpreter launch deferral has unresolved bookkeeping"
+    );
+    Ok(())
+}
+
+pub(crate) fn mark_launch_deferral_persisted() {
+    LAUNCH_OUTCOME.store(LaunchOutcome::DeferredPersisted as u8, Ordering::Release);
+}
+
+// Outcome writes are serialized by with_config, alongside boot bookkeeping.
+pub(crate) fn begin_launch() {
+    LAUNCH_OUTCOME.store(LaunchOutcome::Pending as u8, Ordering::Release);
+}
+
+pub(crate) fn complete_launch() {
+    LAUNCH_OUTCOME.store(LaunchOutcome::Completed as u8, Ordering::Release);
+}
+
+pub(crate) fn defer_launch() -> Result<()> {
+    anyhow::ensure!(
+        LAUNCH_OUTCOME.load(Ordering::Acquire) != LaunchOutcome::Completed as u8,
+        "Cannot defer a completed launch"
+    );
+    if !launch_deferred() {
+        LAUNCH_OUTCOME.store(LaunchOutcome::Deferred as u8, Ordering::Release);
+    }
+    set_running_patch_number(None);
+    Ok(())
+}
 
 // cbindgen looks for const, ignore these so it doesn't warn about them.
 
@@ -71,6 +120,7 @@ pub fn testing_reset_config() {
     crate::encrypted_patch::reset_provider();
     crate::native_boot::reset();
     CHECKED_NATIVE_ONLY.store(false, Ordering::Relaxed);
+    LAUNCH_OUTCOME.store(LaunchOutcome::Pending as u8, Ordering::Relaxed);
 }
 
 pub fn check_initialized_and_call<F, R>(
@@ -212,7 +262,7 @@ pub(crate) fn set_config_with_native_options(
             }
             crate::updater::handle_prior_boot_failure_for_config(&new_config)?;
             if new_config.native_options.encrypted(&new_config) {
-                let mut state = crate::native_boot::load_state(&new_config);
+                let mut state = crate::updater::load_state(&new_config)?;
                 state.lifecycle_mut().retire_plaintext_installed()?;
             }
         }

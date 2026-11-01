@@ -202,7 +202,7 @@ pub extern "C" fn shorebird_validate_next_boot_patch() {
 pub extern "C" fn shorebird_next_boot_patch_path() -> *mut c_char {
     log_on_error(
         || {
-            let maybe_path = updater::with_mut_state(|state| {
+            let maybe_path = updater::with_state(|state| {
                 Ok(state
                     .next_boot_patch()
                     .filter(|patch| {
@@ -248,6 +248,29 @@ pub extern "C" fn shorebird_report_launch_failure() {
         "reporting launch failure",
         (),
     );
+}
+
+/// Retain a key-refused interpreter patch for the next process and run BASE
+/// now. Only key-resolution/authentication refusal qualifies; corrupt payloads
+/// and execution failures must use shorebird_report_launch_failure instead.
+/// False means bookkeeping failed: do not report patch success or start updates.
+///
+/// # Safety
+/// expected_patch_path must point to a valid NUL-terminated UTF-8 string for
+/// the duration of this call, or be null (which is rejected).
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_report_launch_deferred(
+    expected_patch_path: *const c_char,
+) -> bool {
+    log_on_error(
+        || {
+            let path = to_rust(expected_patch_path)?;
+            updater::report_launch_deferred(std::path::Path::new(&path))?;
+            Ok(true)
+        },
+        "deferring interpreter launch",
+        false,
+    )
 }
 
 /// Report that the app launched successfully. The Shell constructor calls

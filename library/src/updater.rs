@@ -271,18 +271,33 @@ pub(crate) fn libapp_path_from_settings(
     first.map(PathBuf::from)
 }
 
-pub fn with_state<F, R>(f: F) -> anyhow::Result<R>
-where
-    F: FnOnce(&UpdaterState) -> anyhow::Result<R>,
-{
-    with_config(|config| {
-        let state = UpdaterState::load_or_new_on_error(
+/// All runtime state access shares this policy, including native-source APIs.
+/// Call with the config lock held so a deferral cannot race a destructive reset.
+pub(crate) fn load_state(config: &UpdateConfig) -> anyhow::Result<UpdaterState> {
+    if crate::config::launch_deferred() {
+        return UpdaterState::load_existing(
             &config.storage_dir,
             &config.download_dir,
             &config.release_version,
             config.patch_public_key.as_deref(),
             config.patch_verification,
         );
+    }
+    Ok(UpdaterState::load_or_new_on_error(
+        &config.storage_dir,
+        &config.download_dir,
+        &config.release_version,
+        config.patch_public_key.as_deref(),
+        config.patch_verification,
+    ))
+}
+
+pub fn with_state<F, R>(f: F) -> anyhow::Result<R>
+where
+    F: FnOnce(&UpdaterState) -> anyhow::Result<R>,
+{
+    with_config(|config| {
+        let state = load_state(config)?;
         f(&state)
     })
 }
@@ -292,13 +307,8 @@ where
     F: FnOnce(&mut UpdaterState) -> anyhow::Result<R>,
 {
     with_config(|config| {
-        let mut state = UpdaterState::load_or_new_on_error(
-            &config.storage_dir,
-            &config.download_dir,
-            &config.release_version,
-            config.patch_public_key.as_deref(),
-            config.patch_verification,
-        );
+        crate::config::ensure_launch_deferral_resolved()?;
+        let mut state = load_state(config)?;
         f(&mut state)
     })
 }
@@ -349,13 +359,10 @@ pub fn handle_prior_boot_failure_if_necessary() -> Result<(), InitError> {
 }
 
 pub(crate) fn handle_prior_boot_failure_for_config(config: &UpdateConfig) -> anyhow::Result<()> {
-    let mut state = UpdaterState::load_or_new_on_error(
-        &config.storage_dir,
-        &config.download_dir,
-        &config.release_version,
-        config.patch_public_key.as_deref(),
-        config.patch_verification,
-    );
+    if crate::config::launch_deferred() {
+        return Ok(());
+    }
+    let mut state = load_state(config)?;
     if let Some(patch) = state.currently_booting_patch() {
         let boot_time_info = state
             .boot_started_at()
@@ -388,7 +395,9 @@ pub(crate) fn handle_prior_boot_failure_for_config(config: &UpdateConfig) -> any
 
 /// Whether the auto-update flag is set to true in the config.
 pub fn should_auto_update() -> anyhow::Result<bool> {
-    with_config(|config| Ok(config.auto_update))
+    with_config(|config| {
+        Ok(config.auto_update && crate::config::ensure_launch_deferral_resolved().is_ok())
+    })
 }
 
 /// Overrides the generated per-install device/client id used for patch checks
@@ -407,6 +416,7 @@ pub fn set_client_id_override(client_id: &str) -> anyhow::Result<()> {
 /// downloaded and ready to install.
 pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bool> {
     let (client_id, current_patch_number) = with_state(|state| {
+        crate::config::ensure_launch_deferral_resolved()?;
         Ok((
             state.client_id().to_string(),
             state.running_patch().map(|p| p.number),
@@ -555,7 +565,10 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     // Takes Config lock and installs patch.
     // Saves state to disk (holds Config lock while writing).
 
-    let mut config = copy_update_config()?;
+    let mut config = with_config(|config| {
+        crate::config::ensure_launch_deferral_resolved()?;
+        Ok(config.clone())
+    })?;
     if let Some(channel) = channel {
         config.channel = channel.to_string();
     }
@@ -566,6 +579,7 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
         send_queued_events(&flush);
     }
     let request = with_state(|state| {
+        crate::config::ensure_launch_deferral_resolved()?;
         Ok(PatchCheckRequest::new(
             &config,
             &state.client_id(),
@@ -590,6 +604,7 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     let patch = response.patch.ok_or(UpdateError::BadServerResponse)?;
 
     let action = with_state(|state| {
+        crate::config::ensure_launch_deferral_resolved()?;
         Ok(state.lifecycle().decide_start(
             patch.number,
             &patch.download_identity(),
@@ -670,7 +685,10 @@ fn send_queued_events(_flush: &std::sync::MutexGuard<'_, ()>) {
     let Ok(config) = copy_update_config() else {
         return;
     };
-    let events = match with_state(|state| Ok(state.copy_events(MAX_EVENTS_PER_FLUSH))) {
+    let events = match with_state(|state| {
+        crate::config::ensure_launch_deferral_resolved()?;
+        Ok(state.copy_events(MAX_EVENTS_PER_FLUSH))
+    }) {
         Ok(events) => events,
         Err(err) => {
             shorebird_error!("Failed to read queued events: {:?}", err);
@@ -1518,18 +1536,18 @@ where
 /// signature check refused it), since the engine then boots without it and
 /// nothing else would report why.
 pub fn validate_next_boot_patch() -> anyhow::Result<()> {
+    if with_config(|_| Ok(crate::config::launch_deferred()))? {
+        return Ok(());
+    }
     // Encrypted state must never enter the legacy path validator.
-    if with_config(|c| Ok(crate::native_boot::needs_prepared_route(c)))? {
+    if with_config(crate::native_boot::needs_prepared_route)? {
         return crate::native_boot::prepare().map(|_| ());
     }
     let result = with_config(|config| {
-        let mut state = UpdaterState::load_or_new_on_error(
-            &config.storage_dir,
-            &config.download_dir,
-            &config.release_version,
-            config.patch_public_key.as_deref(),
-            config.patch_verification,
-        );
+        if crate::config::launch_deferred() {
+            return Ok(());
+        }
+        let mut state = load_state(config)?;
         let mut first_error = None;
         while let Some(patch) = state.next_boot_patch() {
             if matches!(
@@ -1568,7 +1586,7 @@ pub fn validate_next_boot_patch() -> anyhow::Result<()> {
             None => Ok(()),
         }
     });
-    if with_config(|c| Ok(crate::native_boot::needs_prepared_route(c)))? {
+    if with_config(crate::native_boot::needs_prepared_route)? {
         crate::native_boot::prepare()?;
     }
     result
@@ -1581,7 +1599,7 @@ pub fn validate_next_boot_patch() -> anyhow::Result<()> {
 ///  2. `start_update_thread()`
 ///  3. `report_launch_failure()`
 pub fn next_boot_patch() -> anyhow::Result<Option<PatchInfo>> {
-    with_mut_state(|state| Ok(state.next_boot_patch()))
+    with_state(|state| Ok(state.next_boot_patch()))
 }
 
 /// The patch this process is using, set at `report_launch_start` and
@@ -1594,6 +1612,9 @@ pub fn running_patch() -> anyhow::Result<Option<PatchInfo>> {
 
 pub fn report_launch_start() -> anyhow::Result<()> {
     shorebird_info!("Reporting launch start.");
+    if crate::config::launch_deferred() {
+        return Ok(());
+    }
     if let Some(id) = crate::native_boot::selection_id() {
         anyhow::ensure!(
             crate::native_boot::begin(id)?,
@@ -1602,7 +1623,7 @@ pub fn report_launch_start() -> anyhow::Result<()> {
         return Ok(());
     }
     // A capable integration must freeze BASE explicitly before reporting it.
-    if with_config(|c| Ok(crate::native_boot::needs_prepared_route(c)))? {
+    if with_config(crate::native_boot::needs_prepared_route)? {
         let selection = crate::native_boot::prepare()?;
         anyhow::ensure!(
             crate::native_boot::begin(selection.id)?,
@@ -1611,7 +1632,12 @@ pub fn report_launch_start() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    with_mut_state(|state| {
+    with_config(|config| {
+        if crate::config::launch_deferred() {
+            return Ok(());
+        }
+        let mut state = load_state(config)?;
+        crate::config::begin_launch();
         let next_boot_patch = state.next_boot_patch();
         // Capture what this run is using. None means we're booting the base
         // release. Backed by a session-scoped global, not by PatchesState
@@ -1629,6 +1655,9 @@ pub fn report_launch_start() -> anyhow::Result<()> {
 /// This will mark the patch as bad and activate the next best patch.
 pub fn report_launch_failure() -> anyhow::Result<()> {
     shorebird_info!("Reporting failed launch.");
+    if crate::config::launch_deferred() {
+        return Ok(());
+    }
     if let Some(id) = crate::native_boot::selection_id() {
         anyhow::ensure!(
             crate::native_boot::abort(id, 1)?,
@@ -1638,13 +1667,10 @@ pub fn report_launch_failure() -> anyhow::Result<()> {
     }
 
     with_config(|config| {
-        let mut state = UpdaterState::load_or_new_on_error(
-            &config.storage_dir,
-            &config.download_dir,
-            &config.release_version,
-            config.patch_public_key.as_deref(),
-            config.patch_verification,
-        );
+        if crate::config::launch_deferred() {
+            return Ok(());
+        }
+        let mut state = load_state(config)?;
 
         let patch = state.currently_booting_patch().ok_or(anyhow::Error::from(
             UpdateError::InvalidState("currently_booting_patch is None".to_string()),
@@ -1658,6 +1684,7 @@ pub fn report_launch_failure() -> anyhow::Result<()> {
         // The engine boots base code after a patch fails to load, so the
         // patch check this launch sends must not name the failed patch.
         state.set_running_patch(None);
+        crate::config::complete_launch();
         let client_id = state.client_id();
         let message = format!("engine_report: patch {} failed to launch", patch.number);
         let event = PatchEvent::new(
@@ -1673,20 +1700,68 @@ pub fn report_launch_failure() -> anyhow::Result<()> {
     })
 }
 
+/// An authenticated interpreter candidate could not resolve its application
+/// key. Freeze BASE for this process and retain the candidate for a fresh boot.
+/// The path binds this report to the candidate actually attempted by the engine;
+/// never clear another patch's breadcrumb or restore a rolled-back candidate.
+pub fn report_launch_deferred(expected_patch_path: &Path) -> anyhow::Result<()> {
+    with_config(|config| {
+        let already_deferred = crate::config::launch_deferred();
+        let running = crate::config::running_patch_number();
+        // Freeze before any fallible disk access. The engine has refused this
+        // source; read/parse failures must not reset the cache or allow a later
+        // generic failure/BASE success to consume the unresolved breadcrumb.
+        crate::config::defer_launch()?;
+        let mut state = load_state(config)?;
+        if already_deferred {
+            crate::config::ensure_launch_deferral_resolved()?;
+            anyhow::ensure!(
+                state.currently_booting_patch().is_none(),
+                "Deferred interpreter boot still has an unresolved breadcrumb"
+            );
+            return Ok(());
+        }
+        let patch = state
+            .currently_booting_patch()
+            .context("No interpreter boot to defer")?;
+        anyhow::ensure!(
+            running == Some(patch.number) && patch.path == expected_patch_path,
+            "Deferred interpreter source does not match the current boot"
+        );
+        state.lifecycle_mut().abort_boot_retryable(patch.number)?;
+        crate::config::mark_launch_deferral_persisted();
+        let error = anyhow::anyhow!("Application interpreter key unavailable or refused");
+        let mut event = update_failure_event(
+            config,
+            state.client_id(),
+            "interpreter_boot",
+            patch.number,
+            &error,
+        );
+        event.failure_category = Some("key_resolution_failed".to_owned());
+        if let Err(error) = state.queue_event(event) {
+            shorebird_error!("Could not queue interpreter key diagnostic: {:#}", error);
+        }
+        Ok(())
+    })
+}
+
 pub fn report_launch_success() -> anyhow::Result<()> {
     shorebird_info!("Reporting successful launch.");
+    if crate::config::launch_deferred() {
+        return Ok(());
+    }
 
     let has_events = crate::native_boot::with_success_guard(|prepared_patch| {
         with_config(|config| {
+            // Recheck under the config lock: deferral may have won while this
+            // report waited. Do not even open/reset state after a refused key.
+            if crate::config::launch_deferred() {
+                return Ok(false);
+            }
             // We can tell the UpdaterState that we have successfully booted from the "next" patch
             // and make that the "current" patch.
-            let mut state = UpdaterState::load_or_new_on_error(
-                &config.storage_dir,
-                &config.download_dir,
-                &config.release_version,
-                config.patch_public_key.as_deref(),
-                config.patch_verification,
-            );
+            let mut state = load_state(config)?;
 
             // None means we didn't boot from a patch, so there's nothing to record.
             if let Some(booting_patch) = state.currently_booting_patch().filter(|booting| {
@@ -1714,6 +1789,7 @@ pub fn report_launch_success() -> anyhow::Result<()> {
                     queue_or_send_event(&mut state, config, event);
                 }
             }
+            crate::config::complete_launch();
             Ok(!state.copy_events(1).is_empty())
         })
     })?;
@@ -1897,7 +1973,7 @@ mod tests {
 
         install_fake_patch(1)?;
         with_config(|config| {
-            let mut state = UpdaterState::load_or_new_on_error(
+            let state = UpdaterState::load_or_new_on_error(
                 &config.storage_dir,
                 &config.download_dir,
                 &config.release_version,
@@ -2262,7 +2338,7 @@ patch_verification: bogus_mode
         super::report_launch_failure().unwrap();
 
         with_config(|config| {
-            let mut state = UpdaterState::load_or_new_on_error(
+            let state = UpdaterState::load_or_new_on_error(
                 &config.storage_dir,
                 &config.download_dir,
                 &config.release_version,
@@ -2518,7 +2594,7 @@ patch_verification: bogus_mode
         let tmp_dir = TempDir::new().unwrap();
         init_for_testing(&tmp_dir, Some(&server.url()));
 
-        let mut updater_state = with_config(|config| {
+        let updater_state = with_config(|config| {
             let mut state = UpdaterState::load_or_new_on_error(
                 &config.storage_dir,
                 &config.download_dir,
@@ -5666,6 +5742,417 @@ mod authenticated_transport_tests {
         BOOT_OFFER.store(number, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(update(None)?, UpdateStatus::UpdateInstalled);
         validate_next_boot_patch()
+    }
+
+    fn check_deferred_public_apis(expected_next_patch: usize) -> Result<()> {
+        use crate::c_api::{dart, engine};
+        // Exercise the actual Dart/engine ABI, including another engine's
+        // configure/validation path and manual updates from bundled BASE.
+        assert_eq!(dart::shorebird_current_boot_patch_number(), 0);
+        assert_eq!(
+            dart::shorebird_next_boot_patch_number(),
+            expected_next_patch
+        );
+        engine::shorebird_validate_next_boot_patch();
+        let path = engine::shorebird_next_boot_patch_path();
+        assert_eq!(path.is_null(), expected_next_patch == 0);
+        unsafe { engine::shorebird_free_string(path) };
+        assert!(!dart::shorebird_check_for_downloadable_update(
+            std::ptr::null()
+        ));
+        assert!(!dart::shorebird_set_device_id_override(
+            c"replacement-id".as_ptr()
+        ));
+        let result = dart::shorebird_update_with_result(std::ptr::null());
+        assert!(!result.is_null());
+        unsafe {
+            assert_eq!((*result).status, dart::SHOREBIRD_UPDATE_ERROR);
+            dart::shorebird_free_update_result(result.cast_mut());
+        }
+        start_update_thread().join().unwrap();
+        flush_queued_events();
+        handle_prior_boot_failure_if_necessary()?;
+
+        let mut source = engine::ShorebirdBootSource {
+            struct_size: std::mem::size_of::<engine::ShorebirdBootSource>(),
+            kind: 0,
+            selection_id: 0,
+            patch_number: 0,
+            image_size: 0,
+            fd: -1,
+            path: std::ptr::null_mut(),
+        };
+        assert!(!unsafe { engine::shorebird_prepare_boot_source(&mut source) });
+        assert!(source.path.is_null());
+        assert_eq!(source.fd, -1);
+        Ok(())
+    }
+
+    fn queue_retention_event() -> Result<()> {
+        let config = copy_update_config()?;
+        with_mut_state(|state| {
+            state.queue_event(update_failure_event(
+                &config,
+                state.client_id(),
+                "retention_test",
+                1,
+                &anyhow::anyhow!("queued before key refusal"),
+            ))
+        })
+    }
+
+    fn refuse_deferred_network_work() {
+        testing_set_network_hooks(
+            |_, _| panic!("unresolved or unreadable deferred state must not check for patches"),
+            |_, _, _| panic!("unresolved or unreadable deferred state must not download"),
+            |_, _| panic!("unresolved or unreadable deferred state must not flush events"),
+        );
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_preserves_authenticated_candidate_across_restart() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        report_launch_success()?;
+        init_authenticated_boot_test(&tmp); // Successful U, then a fresh key-less boot.
+        validate_next_boot_patch()?;
+        report_launch_start()?;
+        let patch = next_boot_patch()?.unwrap();
+        let authentication = patch.path.parent().unwrap().join("authentication.json");
+        let bytes = std::fs::read(&patch.path)?;
+        let auth_bytes = std::fs::read(&authentication)?;
+        let path = std::ffi::CString::new(patch.path.to_str().unwrap())?;
+        assert!(unsafe { crate::c_api::engine::shorebird_report_launch_deferred(path.as_ptr()) });
+        // RuntimeController's generic failure and BASE success cannot change
+        // the key deferral, nor can another engine begin the candidate again.
+        report_launch_failure()?;
+        report_launch_start()?;
+        report_launch_success()?;
+        assert!(unsafe { crate::c_api::engine::shorebird_report_launch_deferred(path.as_ptr()) });
+        assert!(running_patch()?.is_none());
+        assert_eq!(next_boot_patch()?.unwrap().number, 1);
+        assert_eq!(std::fs::read(&patch.path)?, bytes);
+        assert_eq!(std::fs::read(&authentication)?, auth_bytes);
+        with_state(|s| {
+            assert!(!s.is_known_bad_patch(1));
+            assert!(s.currently_booting_patch().is_none());
+            assert_eq!(s.last_successfully_booted_patch().unwrap().number, 1);
+            Ok(())
+        })?;
+        // Reopen the actual persisted state without an online offer/download.
+        init_authenticated_boot_test(&tmp);
+        testing_set_network_hooks(
+            |_, _| panic!("offline recovery must not check for patches"),
+            |_, _, _| panic!("offline recovery must not download"),
+            |_, _| Ok(()),
+        );
+        validate_next_boot_patch()?;
+        report_launch_start()?;
+        report_launch_success()?;
+        assert_eq!(running_patch()?.unwrap().number, 1);
+        assert!(!with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_preserves_new_next_patch_and_server_rollback() -> Result<()> {
+        for rollback in [false, true] {
+            let tmp = TempDir::new()?;
+            init_authenticated_boot_test(&tmp);
+            install_authenticated(1)?;
+            report_launch_start()?;
+            report_launch_success()?;
+            init_authenticated_boot_test(&tmp);
+            report_launch_start()?;
+            let patch = running_patch()?.unwrap();
+            if rollback {
+                with_mut_state(|s| s.uninstall_patch(1))?;
+            } else {
+                install_authenticated(2)?;
+            }
+            report_launch_deferred(&patch.path)?;
+            report_launch_start()?;
+            report_launch_failure()?;
+            assert!(running_patch()?.is_none());
+            assert_eq!(
+                next_boot_patch()?.map(|p| p.number),
+                if rollback { None } else { Some(2) }
+            );
+            assert!(with_state(|s| Ok(s.currently_booting_patch().is_none()))?);
+            if rollback {
+                assert!(!patch.path.exists());
+            } else {
+                assert!(!with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+            }
+        }
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_persisted_deferral_allows_authenticated_update_and_rollback() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        let patch = running_patch()?.unwrap();
+        report_launch_deferred(&patch.path)?;
+        assert!(crate::c_api::engine::shorebird_should_auto_update());
+        install_authenticated(2)?;
+        assert_eq!(crate::c_api::dart::shorebird_current_boot_patch_number(), 0);
+        assert_eq!(crate::c_api::dart::shorebird_next_boot_patch_number(), 2);
+        BOOT_OFFER.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(update(None)?, UpdateStatus::NoUpdate);
+        assert!(next_boot_patch()?.is_none());
+        assert!(running_patch()?.is_none());
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_read_errors_never_reset_cached_candidate() -> Result<()> {
+        // Directory reads fail independently of permissions (including when
+        // tests run as root). Invalid JSON covers a successful read/failed parse.
+        for file_name in ["state.json", "pointers.json"] {
+            for unreadable in [false, true] {
+                let tmp = TempDir::new()?;
+                init_authenticated_boot_test(&tmp);
+                install_authenticated(1)?;
+                report_launch_start()?;
+                let patch = running_patch()?.unwrap();
+                queue_retention_event()?;
+                let auth = patch.path.parent().unwrap().join("authentication.json");
+                let patch_state = patch.path.parent().unwrap().join("state.json");
+                let retained =
+                    [&patch.path, &auth, &patch_state].map(|path| std::fs::read(path).unwrap());
+                let state_path = tmp.path().join(file_name);
+                let original = std::fs::read(&state_path)?;
+                std::fs::remove_file(&state_path)?;
+                if unreadable {
+                    std::fs::create_dir(&state_path)?;
+                } else {
+                    std::fs::write(&state_path, b"invalid json")?;
+                }
+
+                assert!(report_launch_deferred(&patch.path).is_err());
+                assert!(crate::config::launch_deferred());
+                assert_eq!(crate::config::running_patch_number(), None);
+                // These are the real duplicate/fallback reports. In particular
+                // success must not call the reset-on-error loader before its
+                // deferred guard, and repeats must not hide the read failure.
+                report_launch_start()?;
+                report_launch_failure()?;
+                report_launch_success()?;
+                assert!(report_launch_deferred(&patch.path).is_err());
+                refuse_deferred_network_work();
+                check_deferred_public_apis(0)?;
+                for (path, bytes) in [&patch.path, &auth, &patch_state].into_iter().zip(retained) {
+                    assert_eq!(std::fs::read(path)?, bytes);
+                }
+                if unreadable {
+                    assert!(state_path.is_dir());
+                    std::fs::remove_dir(&state_path)?;
+                } else {
+                    assert_eq!(std::fs::read(&state_path)?, b"invalid json");
+                }
+                std::fs::write(&state_path, original)?;
+                with_state(|state| {
+                    assert_eq!(state.currently_booting_patch().unwrap().number, 1);
+                    assert_eq!(state.lifecycle().pointers().next_boot_patch, Some(1));
+                    assert!(state.last_successfully_booted_patch().is_none());
+                    assert!(!state.is_known_bad_patch(1));
+                    assert_eq!(state.copy_events(100).len(), 1);
+                    Ok(())
+                })?;
+            }
+        }
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_persisted_deferral_read_error_during_event_flush_retains_cache() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        let patch = running_patch()?.unwrap();
+        let bytes = std::fs::read(&patch.path)?;
+        let auth = patch.path.parent().unwrap().join("authentication.json");
+        let auth_bytes = std::fs::read(&auth)?;
+        queue_retention_event()?;
+        testing_set_network_hooks(
+            |_, _| panic!("event flushing must not check for patches"),
+            |_, _, _| panic!("event flushing must not download"),
+            |_, _| {
+                // The flush has read its queue and released the config lock.
+                // Deferral and a read fault now occur before remove_event.
+                let patch = running_patch()?.unwrap();
+                report_launch_deferred(&patch.path)?;
+                with_config(|config| {
+                    let path = config.storage_dir.join("state.json");
+                    std::fs::copy(&path, config.storage_dir.join("state.before_fault"))?;
+                    std::fs::write(path, b"invalid json")?;
+                    Ok(())
+                })
+            },
+        );
+        flush_queued_events();
+        assert!(crate::config::launch_deferred());
+        assert!(crate::config::ensure_launch_deferral_resolved().is_ok());
+        refuse_deferred_network_work();
+        check_deferred_public_apis(0)?;
+        assert_eq!(std::fs::read(&patch.path)?, bytes);
+        assert_eq!(std::fs::read(&auth)?, auth_bytes);
+        assert_eq!(
+            std::fs::read(tmp.path().join("state.json"))?,
+            b"invalid json"
+        );
+        std::fs::rename(
+            tmp.path().join("state.before_fault"),
+            tmp.path().join("state.json"),
+        )?;
+        with_state(|state| {
+            assert!(state.currently_booting_patch().is_none());
+            assert_eq!(state.next_boot_patch().unwrap().number, 1);
+            assert_eq!(state.copy_events(100).len(), 2);
+            assert!(!state.is_known_bad_patch(1));
+            Ok(())
+        })?;
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_release_mismatch_does_not_reset_cache() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        let patch = running_patch()?.unwrap();
+        let bytes = std::fs::read(&patch.path)?;
+        let state_path = tmp.path().join("state.json");
+        let original = std::fs::read(&state_path)?;
+        let mut state: serde_json::Value = serde_json::from_slice(&original)?;
+        state["release_version"] = "different-release".into();
+        let changed = serde_json::to_vec(&state)?;
+        std::fs::write(&state_path, &changed)?;
+        assert!(report_launch_deferred(&patch.path).is_err());
+        report_launch_success()?;
+        refuse_deferred_network_work();
+        check_deferred_public_apis(0)?;
+        assert_eq!(std::fs::read(&state_path)?, changed);
+        assert_eq!(std::fs::read(&patch.path)?, bytes);
+        std::fs::write(&state_path, original)?;
+        assert!(with_state(|s| Ok(s.currently_booting_patch().is_some()))?);
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_write_failure_cannot_become_success() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        let patch = running_patch()?.unwrap();
+        let authentication = patch.path.parent().unwrap().join("authentication.json");
+        let bytes = std::fs::read(&patch.path)?;
+        let auth_bytes = std::fs::read(&authentication)?;
+        queue_retention_event()?;
+        std::fs::create_dir(tmp.path().join("pointers.json.tmp"))?;
+        assert!(report_launch_deferred(&patch.path).is_err());
+        assert!(report_launch_deferred(&patch.path).is_err());
+        report_launch_start()?;
+        report_launch_failure()?;
+        report_launch_success()?;
+        refuse_deferred_network_work();
+        check_deferred_public_apis(1)?;
+        assert!(!crate::c_api::engine::shorebird_should_auto_update());
+        assert!(running_patch()?.is_none());
+        assert_eq!(std::fs::read(&patch.path)?, bytes);
+        assert_eq!(std::fs::read(&authentication)?, auth_bytes);
+        with_state(|s| {
+            assert_eq!(s.currently_booting_patch().unwrap().number, 1);
+            assert!(s.last_successfully_booted_patch().is_none());
+            assert!(!s.is_known_bad_patch(1));
+            assert_eq!(s.lifecycle().pointers().next_boot_patch, Some(1));
+            assert_eq!(s.copy_events(100).len(), 1);
+            assert!(s
+                .copy_events(100)
+                .iter()
+                .all(|event| event.identifier != EventType::PatchInstallSuccess));
+            Ok(())
+        })?;
+        std::fs::remove_dir(tmp.path().join("pointers.json.tmp"))?;
+        init_authenticated_boot_test(&tmp);
+        assert!(with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+        assert!(next_boot_patch()?.is_none());
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_rejects_mismatched_boot_identity() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        assert!(report_launch_deferred(&tmp.path().join("another-patch")).is_err());
+        report_launch_success()?;
+        assert!(running_patch()?.is_none());
+        with_state(|s| {
+            assert_eq!(s.currently_booting_patch().unwrap().number, 1);
+            assert!(s.last_successfully_booted_patch().is_none());
+            Ok(())
+        })?;
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_genuine_launch_failure_still_retires_candidate() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        let patch = running_patch()?.unwrap();
+        report_launch_failure()?;
+        assert!(with_state(|s| Ok(s.is_known_bad_patch(1)))?);
+        assert!(!patch.path.exists());
+        assert!(next_boot_patch()?.is_none());
+        init_authenticated_boot_test(&tmp);
+        assert!(next_boot_patch()?.is_none());
+        testing_reset_config();
+        Ok(())
+    }
+
+    #[serial]
+    #[test]
+    fn interpreter_key_deferral_cannot_change_successfully_running_patch() -> Result<()> {
+        let tmp = TempDir::new()?;
+        init_authenticated_boot_test(&tmp);
+        install_authenticated(1)?;
+        report_launch_start()?;
+        report_launch_success()?;
+        let patch = running_patch()?.unwrap();
+        assert!(report_launch_deferred(&patch.path).is_err());
+        assert!(!crate::config::launch_deferred());
+        assert_eq!(running_patch()?.unwrap().number, 1);
+        testing_reset_config();
+        Ok(())
     }
 
     #[serial]

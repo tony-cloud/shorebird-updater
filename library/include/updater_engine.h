@@ -229,6 +229,19 @@ SHOREBIRD_EXPORT void shorebird_report_launch_start(void);
 SHOREBIRD_EXPORT void shorebird_report_launch_failure(void);
 
 /**
+ * Retain a key-refused interpreter patch for the next process and run BASE
+ * now. Only key-resolution/authentication refusal qualifies; corrupt payloads
+ * and execution failures must use shorebird_report_launch_failure instead.
+ * False means bookkeeping failed: do not report patch success or start updates.
+ *
+ * # Safety
+ * expected_patch_path must point to a valid NUL-terminated UTF-8 string for
+ * the duration of this call, or be null (which is rejected).
+ */
+SHOREBIRD_EXPORT
+bool shorebird_report_launch_deferred(const char *expected_patch_path);
+
+/**
  * Report that the app launched successfully. The Shell constructor calls
  * this once per process when the VM has finished booting; it pairs with
  * `shorebird_report_launch_start` to mark a patch as having booted cleanly.

@@ -268,6 +268,32 @@ impl UpdaterState {
         }
     }
 
+    /// Load a known launch's state without resetting or deleting any cache
+    /// files. A refused key is not evidence that the cached patch is invalid.
+    pub(crate) fn load_existing(
+        cache_dir: &Path,
+        download_dir: &Path,
+        release_version: &str,
+        patch_public_key: Option<&str>,
+        verification_mode: PatchVerificationMode,
+    ) -> Result<Self> {
+        let serialized_state: SerializedState = disk_io::read(&cache_dir.join(STATE_FILE_NAME))?;
+        ensure!(
+            serialized_state.release_version == release_version,
+            "Existing updater state belongs to a different release"
+        );
+        Ok(Self {
+            cache_dir: cache_dir.to_owned(),
+            lifecycle: PatchLifecycle::load_existing(
+                cache_dir.to_owned(),
+                download_dir.to_owned(),
+            )?,
+            patch_public_key: patch_public_key.map(str::to_owned),
+            verification_mode,
+            serialized_state,
+        })
+    }
+
     /// Saves the top-level (non-patch) state to disk.
     pub fn save(&self) -> Result<()> {
         disk_io::write(
@@ -343,7 +369,7 @@ impl UpdaterState {
         crate::config::set_running_patch_number(patch_number);
     }
 
-    pub fn next_boot_patch(&mut self) -> Option<PatchInfo> {
+    pub fn next_boot_patch(&self) -> Option<PatchInfo> {
         self.lifecycle
             .pointers()
             .next_boot_patch
@@ -450,7 +476,7 @@ mod tests {
         state.save().unwrap();
         assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
 
-        let mut next = load(&tmp, "1.0.0+2");
+        let next = load(&tmp, "1.0.0+2");
         assert!(next.next_boot_patch().is_none());
     }
 
@@ -587,7 +613,7 @@ mod tests {
 
         std::fs::write(tmp.path().join(STATE_FILE_NAME), "garbage").unwrap();
 
-        let mut reloaded = load(&tmp, "1.0.0+2");
+        let reloaded = load(&tmp, "1.0.0+2");
         assert!(reloaded.next_boot_patch().is_none());
     }
 

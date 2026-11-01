@@ -180,6 +180,17 @@ pub struct PatchLifecycle {
 }
 
 impl PatchLifecycle {
+    /// Read existing pointers without substituting defaults. Boot-outcome
+    /// bookkeeping must not mistake an unreadable breadcrumb for BASE.
+    pub(crate) fn load_existing(state_root: PathBuf, download_root: PathBuf) -> Result<Self> {
+        let pointers = disk_io::read(&state_root.join(POINTERS_FILE))?;
+        Ok(Self {
+            state_root,
+            download_root,
+            pointers,
+        })
+    }
+
     /// Loads the lifecycle from disk. `state_root` is the persistent
     /// app-storage dir; `download_root` is the OS-managed cache dir
     /// (typically `{code_cache_dir}/downloads`). Missing or

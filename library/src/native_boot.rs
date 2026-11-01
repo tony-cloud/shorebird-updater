@@ -112,14 +112,12 @@ pub(crate) fn initialize(
     Ok(())
 }
 
-pub(crate) fn load_state(c: &UpdateConfig) -> UpdaterState {
-    UpdaterState::load_or_new_on_error(
-        &c.storage_dir,
-        &c.download_dir,
-        &c.release_version,
-        c.patch_public_key.as_deref(),
-        c.patch_verification,
-    )
+fn load_state(c: &UpdateConfig) -> Result<UpdaterState> {
+    ensure!(
+        !config::launch_deferred(),
+        "A deferred interpreter launch cannot select native boot sources"
+    );
+    crate::updater::load_state(c)
 }
 
 struct Selection {
@@ -188,12 +186,15 @@ fn duplicate(file: &File) -> Result<File> {
         Ok(file.try_clone()?)
     }
 }
-pub(crate) fn needs_prepared_route(config: &UpdateConfig) -> bool {
-    if config.native_options.encrypted(config) {
-        return true;
+pub(crate) fn needs_prepared_route(config: &UpdateConfig) -> Result<bool> {
+    if config::launch_deferred() {
+        return Ok(false);
     }
-    let state = load_state(config);
-    state
+    if config.native_options.encrypted(config) {
+        return Ok(true);
+    }
+    let state = load_state(config)?;
+    Ok(state
         .lifecycle()
         .pointers()
         .next_boot_patch
@@ -202,7 +203,7 @@ pub(crate) fn needs_prepared_route(config: &UpdateConfig) -> bool {
                 state.lifecycle().read_state(n),
                 Some(PatchState::InstalledEncryptedTransportV1 { .. })
             )
-        })
+        }))
 }
 
 pub(crate) fn selection_id() -> Option<u64> {
@@ -231,7 +232,7 @@ fn diagnostic(
     category: Option<&str>,
 ) -> Result<()> {
     let result = config::with_config(|_| {
-        let mut state = load_state(config);
+        let mut state = load_state(config)?;
         let mut event = crate::updater::update_failure_event(
             config,
             state.client_id(),
@@ -257,7 +258,10 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
     {
         let mut selection = SELECTION.lock().expect("Native selection lock poisoned");
         if selection.is_some() {
-            return export_source(&mut selection);
+            return config::with_config(|_| {
+                ensure!(!config::launch_deferred(), "Interpreter launch is deferred");
+                export_source(&mut selection)
+            });
         }
     }
     let config = config::with_config(|c| Ok(c.clone()))?;
@@ -265,7 +269,10 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
         {
             let mut selection = SELECTION.lock().expect("Native selection lock poisoned");
             if selection.is_some() {
-                return export_source(&mut selection);
+                return config::with_config(|_| {
+                    ensure!(!config::launch_deferred(), "Interpreter launch is deferred");
+                    export_source(&mut selection)
+                });
             }
         }
         // Do not retain the selection/config mutex across the application key
@@ -274,7 +281,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
         // Publication below then respects whichever source froze first.
         let selected = loop {
             let candidate = config::with_config(|_| {
-                let mut state = load_state(&config);
+                let state = load_state(&config)?;
                 Ok(state.next_boot_patch().map(|p| {
                     let number = p.number;
                     (p, state.lifecycle().read_state(number), state.client_id())
@@ -351,7 +358,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                         "Legacy loader refuses encrypted native cache"
                     );
                     config::with_config(|_| {
-                        let mut current = load_state(&config);
+                        let mut current = load_state(&config)?;
                         crate::response_auth::verify_boot_patch(&config, &patch_info)?;
                         current.validate_next_boot_patch()
                     })?;
@@ -385,7 +392,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
                 }
                 Err(error) => {
                     config::with_config(|_| {
-                        let mut current = load_state(&config);
+                        let mut current = load_state(&config)?;
                         // Rollback/replacement must not condemn another live candidate.
                         if current.lifecycle().pointers().next_boot_patch == Some(number)
                             && current.lifecycle().read_state(number) == state
@@ -404,7 +411,7 @@ pub(crate) fn prepare() -> Result<OwnedSource> {
         let mut selection = SELECTION.lock().expect("Native selection lock poisoned");
         if selection.is_none() {
             config::with_config(|_| {
-                let current = load_state(&config);
+                let current = load_state(&config)?;
                 let still_current = selected.patch.is_none_or(|number| {
                     current.lifecycle().pointers().next_boot_patch == Some(number)
                         && current.lifecycle().read_state(number) == selected.expected_state
@@ -463,10 +470,13 @@ pub(crate) fn begin(id: u64) -> Result<bool> {
         return Ok(false);
     }
     if source.begun {
-        return Ok(true);
+        return config::with_config(|_| {
+            ensure!(!config::launch_deferred(), "Interpreter launch is deferred");
+            Ok(true)
+        });
     }
     let accepted = config::with_config(|config| {
-        let mut state = load_state(config);
+        let mut state = load_state(config)?;
         if let Some(number) = source.patch {
             if state.lifecycle().pointers().next_boot_patch != Some(number)
                 || state.lifecycle().read_state(number) != source.expected_state
@@ -498,7 +508,7 @@ pub(crate) fn abort(id: u64, failure: u32) -> Result<bool> {
     // Freeze first even if bookkeeping fails. Never execute a refused source.
     *selection = Some(Selection::base());
     config::with_config(|config| {
-        let mut state = load_state(config);
+        let mut state = load_state(config)?;
         state.set_running_patch(None);
         if let Some(number) = number {
             if failure == 0 {
