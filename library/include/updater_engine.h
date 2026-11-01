@@ -262,6 +262,38 @@ bool shorebird_init_with_options(const struct AppParameters *parameters,
                                  const struct ShorebirdEngineOptions *options);
 
 /**
+ * Opt into protocol 2 using a strict JSON ReleaseScope compiled into the host.
+ * The scope includes app_id, release_version, platform, arch,
+ * base_artifact_hash, required nullable host_abi_hash, and runtime_profile.
+ * release_baseline_callbacks opens the bundled original BYTECODE baseline,
+ * independently of native base_callbacks. It is measured before publication
+ * and retained for interpreter diff reconstruction. Both callback sets must
+ * remain valid for the process lifetime; every open returns a fresh stream.
+ * Requires strict artifact verification, required response signatures and a
+ * pinned public key in compiled_yaml. Native AOT v2 is currently refused until
+ * its selection-aware key adapter is available. Existing init APIs stay v1.
+ *
+ * # Safety
+ * Pointers must reference readable C structs and NUL-terminated UTF-8 strings.
+ */
+SHOREBIRD_EXPORT
+bool shorebird_init_selection_v2(const struct AppParameters *parameters,
+                                 struct FileCallbacks base_callbacks,
+                                 const char *compiled_yaml,
+                                 const struct ShorebirdEngineOptions *options,
+                                 const char *compiled_release_scope_json,
+                                 struct FileCallbacks release_baseline_callbacks);
+
+/**
+ * Copy verified v2 descriptor/digest for the prepared source token. NULL for
+ * BASE/v1 or error. The engine must validate interpreter envelope flavor,
+ * license, key ID, expiry and original-baseline/runtime constraints against
+ * this context before executing it or releasing a key. Free with
+ * shorebird_free_string. Never obtain licensing context from caller strings.
+ */
+SHOREBIRD_EXPORT char *shorebird_boot_selection_context_json(uint64_t token);
+
+/**
  * Prepare exactly one immutable process source. Key/source unavailability
  * selects BASE and retains the authenticated candidate for a fresh process.
  * Do not pass an already-owned output without releasing it first.

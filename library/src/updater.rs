@@ -274,22 +274,28 @@ pub(crate) fn libapp_path_from_settings(
 /// All runtime state access shares this policy, including native-source APIs.
 /// Call with the config lock held so a deferral cannot race a destructive reset.
 pub(crate) fn load_state(config: &UpdateConfig) -> anyhow::Result<UpdaterState> {
-    if crate::config::launch_deferred() {
-        return UpdaterState::load_existing(
+    let mut state = if crate::config::launch_deferred() {
+        UpdaterState::load_existing(
             &config.storage_dir,
             &config.download_dir,
             &config.release_version,
             config.patch_public_key.as_deref(),
             config.patch_verification,
-        );
+        )?
+    } else {
+        UpdaterState::load_or_new_on_error(
+            &config.storage_dir,
+            &config.download_dir,
+            &config.release_version,
+            config.patch_public_key.as_deref(),
+            config.patch_verification,
+        )
+    };
+    if config.selection_scope.is_some() {
+        state.lifecycle_mut().enable_explicit_selection();
+        crate::selection_v2::recover_target(config, &mut state)?;
     }
-    Ok(UpdaterState::load_or_new_on_error(
-        &config.storage_dir,
-        &config.download_dir,
-        &config.release_version,
-        config.patch_public_key.as_deref(),
-        config.patch_verification,
-    ))
+    Ok(state)
 }
 
 pub fn with_state<F, R>(f: F) -> anyhow::Result<R>
@@ -404,6 +410,13 @@ pub fn should_auto_update() -> anyhow::Result<bool> {
 /// and server-side device targeting. The value is persisted in updater state
 /// and survives release-version cache resets.
 pub fn set_client_id_override(client_id: &str) -> anyhow::Result<()> {
+    with_config(|config| {
+        anyhow::ensure!(
+            config.selection_scope.is_none(),
+            "V2 installation identity is immutable"
+        );
+        Ok(())
+    })?;
     with_mut_state(|state| state.set_client_id_override(client_id))
 }
 
@@ -415,6 +428,15 @@ pub fn set_client_id_override(client_id: &str) -> anyhow::Result<()> {
 /// Returns true if an update is available for download. Will return false if the update is already
 /// downloaded and ready to install.
 pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bool> {
+    let selection_config = with_config(|c| Ok(c.selection_scope.as_ref().map(|_| c.clone())))?;
+    if let Some(mut config) = selection_config {
+        if let Some(channel) = channel {
+            config.channel = channel.to_owned();
+        }
+        return crate::updater_lock::with_updater_thread_lock(|_| {
+            crate::selection_v2::check(&config)
+        });
+    }
     let (client_id, current_patch_number) = with_state(|state| {
         crate::config::ensure_launch_deferral_resolved()?;
         Ok((
@@ -495,6 +517,9 @@ impl ReadSeek for fs::File {}
 // FIXME: these patch_base functions should move to platform-specific modules where they can all be tested.
 #[cfg(any(target_os = "android", test))]
 pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+    if let Some(baseline) = &config.selection_baseline {
+        return baseline.open();
+    }
     crate::android::open_base_lib(&config.libapp_path, "libapp.so")
 }
 
@@ -504,11 +529,17 @@ pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSe
 // the app is re-signed for notarization or the Mac App Store.
 #[cfg(all(not(test), target_os = "ios"))]
 pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+    if let Some(baseline) = &config.selection_baseline {
+        return baseline.open();
+    }
     config.file_provider.open()
 }
 
 #[cfg(all(not(test), target_os = "macos"))]
 pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+    if let Some(baseline) = &config.selection_baseline {
+        return baseline.open();
+    }
     macos_patch_base(config.file_provider.open(), &config.libapp_path)
 }
 
@@ -536,6 +567,9 @@ fn macos_patch_base(
     not(target_os = "android")
 ))]
 pub(crate) fn patch_base(config: &UpdateConfig) -> anyhow::Result<Box<dyn ReadSeek>> {
+    if let Some(baseline) = &config.selection_baseline {
+        return baseline.open();
+    }
     let file = fs::File::open(&config.libapp_path)
         .with_file_context(FileOperation::ReadFile, &config.libapp_path)?;
     Ok(Box::new(file))
@@ -571,6 +605,10 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
     })?;
     if let Some(channel) = channel {
         config.channel = channel.to_string();
+    }
+
+    if config.selection_scope.is_some() {
+        return crate::selection_v2::update(&config);
     }
 
     // A flush already running (one started at launch) covers the queue;
@@ -884,7 +922,7 @@ fn truncate_error_message(msg: &str) -> String {
     format!("{}...", &msg[..end])
 }
 
-fn download_and_install_patch(
+pub(crate) fn download_and_install_patch(
     config: &UpdateConfig,
     patch: &crate::network::Patch,
     action: DownloadAction,

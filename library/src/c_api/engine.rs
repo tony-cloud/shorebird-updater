@@ -202,6 +202,9 @@ pub extern "C" fn shorebird_validate_next_boot_patch() {
 pub extern "C" fn shorebird_next_boot_patch_path() -> *mut c_char {
     log_on_error(
         || {
+            if crate::config::with_config(|c| Ok(c.selection_scope.is_some()))? {
+                return Ok(std::ptr::null_mut());
+            }
             let maybe_path = updater::with_state(|state| {
                 Ok(state
                     .next_boot_patch()
@@ -336,6 +339,75 @@ pub unsafe extern "C" fn shorebird_init_with_options(
         },
         "initializing prepared native updater",
         false,
+    )
+}
+
+/// Opt into protocol 2 using a strict JSON ReleaseScope compiled into the host.
+/// The scope includes app_id, release_version, platform, arch,
+/// base_artifact_hash, required nullable host_abi_hash, and runtime_profile.
+/// release_baseline_callbacks opens the bundled original BYTECODE baseline,
+/// independently of native base_callbacks. It is measured before publication
+/// and retained for interpreter diff reconstruction. Both callback sets must
+/// remain valid for the process lifetime; every open returns a fresh stream.
+/// Requires strict artifact verification, required response signatures and a
+/// pinned public key in compiled_yaml. Native AOT v2 is currently refused until
+/// its selection-aware key adapter is available. Existing init APIs stay v1.
+///
+/// # Safety
+/// Pointers must reference readable C structs and NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn shorebird_init_selection_v2(
+    parameters: *const AppParameters,
+    base_callbacks: FileCallbacks,
+    compiled_yaml: *const c_char,
+    options: *const ShorebirdEngineOptions,
+    compiled_release_scope_json: *const c_char,
+    release_baseline_callbacks: FileCallbacks,
+) -> bool {
+    crate::config::require_selection_v2_initialization();
+    log_on_error(
+        || {
+            anyhow::ensure!(!options.is_null(), "Missing engine options");
+            anyhow::ensure!(
+                unsafe { (*options).struct_size } >= std::mem::size_of::<ShorebirdEngineOptions>(),
+                "Truncated engine options"
+            );
+            let options = unsafe { &*options };
+            let scope = crate::selection_v2::ReleaseScope::from_json(
+                to_rust(compiled_release_scope_json)?.as_bytes(),
+            )?;
+            crate::native_boot::initialize_with_scope(
+                app_config_from_c(parameters)?,
+                base_callbacks,
+                to_rust(compiled_yaml)?,
+                crate::native_boot::NativeOptions {
+                    capability: options.native_source_capability,
+                    max_image_bytes: options.max_native_image_bytes,
+                },
+                Some(scope),
+                Some(release_baseline_callbacks),
+            )?;
+            Ok(true)
+        },
+        "initializing v2 selection updater",
+        false,
+    )
+}
+
+/// Copy verified v2 descriptor/digest for the prepared source token. NULL for
+/// BASE/v1 or error. The engine must validate interpreter envelope flavor,
+/// license, key ID, expiry and original-baseline/runtime constraints against
+/// this context before executing it or releasing a key. Free with
+/// shorebird_free_string. Never obtain licensing context from caller strings.
+#[no_mangle]
+pub extern "C" fn shorebird_boot_selection_context_json(token: u64) -> *mut c_char {
+    log_on_error(
+        || match crate::native_boot::selection_context_json(token)? {
+            Some(json) => allocate_c_string(&json),
+            None => Ok(std::ptr::null_mut()),
+        },
+        "copying verified boot selection context",
+        std::ptr::null_mut(),
     )
 }
 

@@ -124,6 +124,40 @@ fn validate_context(
     arch: &str,
     client_id: &str,
 ) -> Result<(Vec<u8>, [u8; 12], String)> {
+    validate_context_hash(
+        metadata,
+        patch,
+        app_id,
+        platform,
+        arch,
+        &digest(client_id.as_bytes()),
+    )
+}
+
+pub(crate) fn validate_selection_context(
+    metadata: &EncryptionMetadata,
+    patch: &Patch,
+    scope: &crate::selection_v2::Scope,
+) -> Result<()> {
+    validate_context_hash(
+        metadata,
+        patch,
+        &scope.app_id,
+        &scope.platform,
+        &scope.arch,
+        &scope.client_id_hash,
+    )?;
+    Ok(())
+}
+
+fn validate_context_hash(
+    metadata: &EncryptionMetadata,
+    patch: &Patch,
+    app_id: &str,
+    platform: &str,
+    arch: &str,
+    device_hash: &str,
+) -> Result<(Vec<u8>, [u8; 12], String)> {
     ensure!(
         metadata.algorithm == "AES-256-GCM" && metadata.kdf == "HMAC-SHA256",
         "Unsupported encrypted patch format"
@@ -166,7 +200,6 @@ fn validate_context(
         "Invalid encrypted release identifier"
     );
     let transport_hash = value(5, "transport_hash=")?;
-    let device_hash = digest(client_id.as_bytes());
     ensure!(
         value(1, "app_id=")? == app_id
             && value(3, "patch_number=")? == patch.number.to_string()
@@ -417,6 +450,8 @@ mod tests {
     fn config(directory: &Path) -> UpdateConfig {
         let data = fixture();
         UpdateConfig {
+            selection_scope: None,
+            selection_baseline: None,
             native_options: crate::native_boot::NativeOptions::default(),
             storage_dir: directory.to_path_buf(),
             download_dir: directory.to_path_buf(),

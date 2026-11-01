@@ -174,6 +174,16 @@ pub fn verify_boot_patch(config: &UpdateConfig, patch: &crate::cache::PatchInfo)
 }
 
 fn verify_boot_patch_inner(config: &UpdateConfig, patch: &crate::cache::PatchInfo) -> Result<()> {
+    if config.selection_scope.is_some() {
+        let grant = crate::selection_v2::boot_grant(config)?.context("Missing v2 authorization")?;
+        let delivery = grant.delivery().context("V2 selected bundled base")?;
+        anyhow::ensure!(
+            delivery.number == patch.number.to_string()
+                && delivery.hash == crate::cache::hash_file(&patch.path)?,
+            "V2 boot artifact does not match selected content"
+        );
+        return Ok(());
+    }
     let path = authentication_path(config, patch.number);
     if !path.exists()
         && config.patch_response_verification != PatchResponseVerificationMode::Required
@@ -189,6 +199,15 @@ fn verify_boot_patch_inner(config: &UpdateConfig, patch: &crate::cache::PatchInf
 
 /// Recover publisher-authenticated metadata without treating ciphertext as code.
 pub(crate) fn load_authenticated_boot_patch(config: &UpdateConfig, number: usize) -> Result<Patch> {
+    if config.selection_scope.is_some() {
+        let grant = crate::selection_v2::boot_grant(config)?.context("Missing v2 authorization")?;
+        let delivery = grant.delivery().context("V2 selected bundled base")?;
+        anyhow::ensure!(
+            delivery.number == number.to_string(),
+            "V2 boot target mismatch"
+        );
+        return Ok(delivery.patch());
+    }
     let path = authentication_path(config, number);
     if !path.exists() {
         bail!("Installed patch authentication is missing");

@@ -78,6 +78,33 @@ pub fn patch_check_request_default(
     Ok(parsed)
 }
 
+/// V2 has its own strict decoder and bounded response. It cannot pass through
+/// the legacy optional-signature/no-update response shape.
+pub(crate) fn patch_check_v2(
+    url: &str,
+    context: &crate::selection_v2::RequestContext,
+    client_id: &str,
+    current_patch: Option<usize>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut request = serde_json::to_value(context)?;
+    let fields = request.as_object_mut().expect("Request context object");
+    fields.remove("client_id_hash"); // The server hashes the exact raw ID.
+    fields.insert("client_id".into(), serde_json::json!(client_id));
+    fields.insert("selection_protocol".into(), serde_json::json!(2));
+    if let Some(number) = current_patch {
+        fields.insert("current_patch_number".into(), serde_json::json!(number));
+    }
+    let response = handle_network_result(ureq::post(url).send_json(&request))?;
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 65536, "V2 response exceeds 64 KiB");
+    Ok(bytes)
+}
+
 /// Default download implementation that streams to a file with Range header
 /// support for resuming partial downloads.
 pub fn download_to_path_default(

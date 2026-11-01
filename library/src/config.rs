@@ -6,7 +6,7 @@ use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode, YamlConf
 use crate::{ExternalFileProvider, UpdateError};
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use once_cell::sync::OnceCell;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
@@ -14,6 +14,10 @@ use std::sync::{
 };
 
 static CHECKED_NATIVE_ONLY: AtomicBool = AtomicBool::new(false);
+static SELECTION_V2_ONLY: AtomicBool = AtomicBool::new(false);
+pub(crate) fn require_selection_v2_initialization() {
+    SELECTION_V2_ONLY.store(true, Ordering::Release);
+}
 // A key-refused interpreter boot runs BASE for the remainder of this process,
 // even if clearing its durable breadcrumb fails. Never promote that breadcrumb
 // from a later engine or a direct launch-report call.
@@ -120,6 +124,7 @@ pub fn testing_reset_config() {
     crate::encrypted_patch::reset_provider();
     crate::native_boot::reset();
     CHECKED_NATIVE_ONLY.store(false, Ordering::Relaxed);
+    SELECTION_V2_ONLY.store(false, Ordering::Relaxed);
     LAUNCH_OUTCOME.store(LaunchOutcome::Pending as u8, Ordering::Relaxed);
 }
 
@@ -161,6 +166,8 @@ where
 // The config passed into init.  This is immutable once set and copyable.
 #[derive(Debug, Clone)]
 pub struct UpdateConfig {
+    pub(crate) selection_scope: Option<crate::selection_v2::ReleaseScope>,
+    pub(crate) selection_baseline: Option<Box<dyn ExternalFileProvider>>,
     pub(crate) native_options: crate::native_boot::NativeOptions,
     pub storage_dir: PathBuf,
     pub download_dir: PathBuf,
@@ -206,7 +213,36 @@ pub(crate) fn set_config_with_native_options(
     native_options: crate::native_boot::NativeOptions,
     checked: bool,
 ) -> Result<()> {
+    set_config_with_binding(
+        app_config,
+        file_provider,
+        libapp_path,
+        yaml,
+        network_hooks,
+        native_options,
+        checked,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_config_with_binding(
+    app_config: AppConfig,
+    file_provider: Box<dyn ExternalFileProvider>,
+    libapp_path: PathBuf,
+    yaml: &YamlConfig,
+    network_hooks: NetworkHooks,
+    native_options: crate::native_boot::NativeOptions,
+    checked: bool,
+    selection_scope: Option<crate::selection_v2::ReleaseScope>,
+    selection_baseline: Option<Box<dyn ExternalFileProvider>>,
+) -> Result<()> {
     with_config_mut(|config: &mut Option<UpdateConfig>| {
+        anyhow::ensure!(
+            !SELECTION_V2_ONLY.load(Ordering::Acquire) || selection_scope.is_some(),
+            "A v2 initialization attempt cannot fall back to a v1 updater"
+        );
         if !checked && CHECKED_NATIVE_ONLY.load(Ordering::Relaxed) {
             bail!("A checked native initialization is required after encrypted native initialization was attempted");
         }
@@ -222,6 +258,8 @@ pub(crate) fn set_config_with_native_options(
         let download_dir = code_cache_path;
 
         let new_config = UpdateConfig {
+            selection_scope,
+            selection_baseline,
             native_options,
             storage_dir: std::path::PathBuf::from(app_config.app_storage_dir),
             download_dir,
@@ -250,6 +288,48 @@ pub(crate) fn set_config_with_native_options(
             && !new_config.native_options.encrypted(&new_config)
         {
             bail!("Encrypted native initialization must complete before this updater can be used");
+        }
+        if let Some(scope) = &new_config.selection_scope {
+            scope.validate()?;
+            anyhow::ensure!(
+                checked
+                    && scope.app_id == new_config.app_id
+                    && scope.release_version == new_config.release_version
+                    && scope.platform == current_platform()
+                    && scope.arch == current_arch(),
+                "V2 installed release identity mismatch"
+            );
+            anyhow::ensure!(
+                new_config.patch_verification == PatchVerificationMode::Strict
+                    && new_config.patch_response_verification
+                        == PatchResponseVerificationMode::Required
+                    && new_config.patch_public_key.is_some(),
+                "V2 requires pinned signatures and strict boot verification"
+            );
+            anyhow::ensure!(
+                scope.runtime_profile != "native-aot",
+                "V2 native key-context adapter is not implemented"
+            );
+            anyhow::ensure!(new_config.patch_decryption_key_provider.is_none(), "V2 interpreter selection requires artifact encryption, not the legacy transport provider");
+            use sha2::{Digest, Sha256};
+            let mut base = new_config
+                .selection_baseline
+                .as_ref()
+                .context("V2 requires independently supplied original bytecode baseline")?
+                .open()?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = std::io::Read::read(&mut base, &mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            anyhow::ensure!(
+                hex::encode(digest.finalize()) == scope.base_artifact_hash,
+                "Compiled v2 baseline does not match installed original bytes"
+            );
         }
         new_config.native_options.validate()?;
         crate::encrypted_patch::validate_config(&new_config)?;

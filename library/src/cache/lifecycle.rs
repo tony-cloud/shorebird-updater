@@ -168,6 +168,7 @@ pub struct ReleasePointers {
 /// `{download_root}/{N}` files for in-flight compressed downloads.
 #[derive(Debug)]
 pub struct PatchLifecycle {
+    explicit_selection: bool,
     /// Persistent app-storage root. Holds `pointers.json` and
     /// `patches/{N}/{state.json,dlc.vmcode}`.
     state_root: PathBuf,
@@ -185,6 +186,7 @@ impl PatchLifecycle {
     pub(crate) fn load_existing(state_root: PathBuf, download_root: PathBuf) -> Result<Self> {
         let pointers = disk_io::read(&state_root.join(POINTERS_FILE))?;
         Ok(Self {
+            explicit_selection: false,
             state_root,
             download_root,
             pointers,
@@ -214,10 +216,31 @@ impl PatchLifecycle {
             ReleasePointers::default()
         };
         Self {
+            explicit_selection: false,
             state_root,
             download_root,
             pointers,
         }
+    }
+
+    pub(crate) fn enable_explicit_selection(&mut self) {
+        self.explicit_selection = true;
+    }
+
+    /// Only the verified journal may supply this target. Never promote a
+    /// last-good/greater content number on a v2 fallback or validation failure.
+    pub(crate) fn select_authorized_target(&mut self, target: Option<usize>) -> Result<()> {
+        if let Some(n) = target {
+            anyhow::ensure!(
+                self.read_state(n).is_some_and(|s| s.is_installed()),
+                "Selected content is not installed"
+            );
+        }
+        if self.pointers.next_boot_patch != target {
+            self.pointers.next_boot_patch = target;
+            self.save_pointers()?;
+        }
+        Ok(())
     }
 
     pub fn pointers(&self) -> &ReleasePointers {
@@ -728,6 +751,16 @@ impl PatchLifecycle {
     /// validation), we go to base release even when an older Installed
     /// patch may be sitting in `patches/`.
     pub fn recompute_next_boot(&mut self) -> Result<()> {
+        if self.explicit_selection {
+            if self
+                .pointers
+                .next_boot_patch
+                .is_some_and(|n| !self.read_state(n).is_some_and(|s| s.is_installed()))
+            {
+                return self.select_authorized_target(None);
+            }
+            return Ok(());
+        }
         let mut dirty = false;
         if let Some(lb) = self.pointers.last_booted_patch {
             if self.read_state(lb).is_none() {
@@ -760,6 +793,9 @@ impl PatchLifecycle {
     /// are forgotten via [`cleanup`]); a Bad tombstone in that slot is
     /// preserved.
     pub fn promote_to_next_boot(&mut self, n: usize) -> Result<()> {
+        if self.explicit_selection {
+            return self.select_authorized_target(Some(n));
+        }
         if !self.read_state(n).is_some_and(|s| s.is_installed()) {
             bail!("promote_to_next_boot({n}) requires Installed state");
         }
@@ -820,6 +856,33 @@ impl PatchLifecycle {
         Ok(())
     }
 
+    /// Retain only the authorization, process, boot and pending references.
+    /// Selection journals live elsewhere and are never pruned here.
+    pub(crate) fn prune_selection_content(&self, authorized: Option<usize>) {
+        let retained = [
+            authorized,
+            self.pointers.next_boot_patch,
+            self.pointers.last_booted_patch,
+            self.pointers.currently_booting_patch,
+            crate::config::running_patch_number(),
+        ];
+        if let Ok(entries) = std::fs::read_dir(self.patches_root()) {
+            for entry in entries.flatten() {
+                if let Ok(number) = entry.file_name().to_string_lossy().parse::<usize>() {
+                    if !retained.contains(&Some(number)) {
+                        if let Err(error) = self.cleanup(number) {
+                            shorebird_error!(
+                                "Could not prune unreferenced selection content: {:?}",
+                                error
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.cleanup_orphan_downloads();
+    }
+
     /// Walks `state_root/patches/` and runs [`cleanup`] on every patch
     /// with number < `n`. State-aware per-patch: Bad tombstones
     /// survive, everything else is forgotten. Anything in `patches/`
@@ -835,6 +898,10 @@ impl PatchLifecycle {
     /// Best-effort — errors are logged so a single bad entry can't
     /// block the cleanup of others.
     fn cleanup_older_than(&self, n: usize) {
+        if self.explicit_selection {
+            self.prune_selection_content(Some(n));
+            return;
+        }
         if let Ok(entries) = std::fs::read_dir(self.patches_root()) {
             for entry in entries.flatten() {
                 let path = entry.path();

@@ -36,3 +36,6 @@ pub use self::updater::*;
 extern crate tempfile;
 
 mod response_auth;
+
+/// Signed v2 selection verification and durable authorization.
+pub mod selection_v2;
