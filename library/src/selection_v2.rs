@@ -1292,9 +1292,15 @@ pub(crate) fn content_readiness(
     };
     let number: usize = delivery.number.parse()?;
     match state.lifecycle().read_state(number) {
-        Some(PatchState::Installed { size, .. })
+        Some(PatchState::Installed { size, signature })
             if grant.descriptor().scope.runtime_profile != "native-aot" =>
         {
+            // Installed metadata is an untrusted cache. The current verified
+            // delivery, including its independently verified artifact signature,
+            // decides which bytes and signature can be used on this boot.
+            if signature.as_deref() != Some(delivery.hash_signature.as_str()) {
+                return Ok(ContentReadiness::Invalid(number));
+            }
             let path = state.lifecycle().installed_artifact_path(number);
             match std::fs::metadata(&path) {
                 Ok(meta)
@@ -1344,7 +1350,6 @@ pub(crate) fn recover_target(
     config: &crate::config::UpdateConfig,
     state: &mut crate::cache::UpdaterState,
 ) -> Result<()> {
-    use crate::cache::lifecycle::BadReason;
     let mut target = None;
     let mut authorized_content = None;
     if let Ok((grant, floor)) = accepted_grant(config) {
@@ -1357,10 +1362,13 @@ pub(crate) fn recover_target(
         if grant.activation(crate::time::unix_timestamp().max(floor)) == Activation::Patch {
             match content_readiness(config, state, &grant)? {
                 ContentReadiness::Ready(number) => target = Some(number),
-                ContentReadiness::Missing(number) => state.lifecycle().cleanup(number)?,
-                ContentReadiness::Invalid(number) => state
-                    .lifecycle()
-                    .mark_bad(number, BadReason::ValidationFailed)?,
+                // Missing/tampered local bytes or metadata do not prove the
+                // authenticated artifact bad. Discard the cache for a fresh
+                // download, just as for invalid native transport. Existing Bad
+                // states remain Unavailable and retain their quarantine.
+                ContentReadiness::Missing(number) | ContentReadiness::Invalid(number) => {
+                    state.lifecycle().cleanup(number)?
+                }
                 ContentReadiness::Unavailable => (),
             }
         }
@@ -1514,6 +1522,9 @@ mod integration_tests {
         }
     }
     fn setup(tmp: &tempfile::TempDir) -> ReleaseScope {
+        setup_with_profile(tmp, "interpreter-structural")
+    }
+    fn setup_with_profile(tmp: &tempfile::TempDir, runtime_profile: &str) -> ReleaseScope {
         crate::testing_reset_config();
         let path = tmp.path().join("lib/arch/libapp.so");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1528,8 +1539,8 @@ mod integration_tests {
             platform: crate::config::current_platform().into(),
             arch: crate::config::current_arch().into(),
             base_artifact_hash: hex::encode(Sha256::digest(b"original baseline")),
-            host_abi_hash: None,
-            runtime_profile: "interpreter-structural".into(),
+            host_abi_hash: (runtime_profile == "interpreter-full").then(|| "a".repeat(64)),
+            runtime_profile: runtime_profile.into(),
         };
         let app = crate::AppConfig {
             app_storage_dir: tmp.path().to_str().unwrap().into(),
@@ -1663,6 +1674,220 @@ mod integration_tests {
             )
             .unwrap();
     }
+
+    // The updater treats the VM's encrypted interpreter envelope as opaque
+    // signed bytes; these tests exercise that boundary, not VM decryption.
+    const INTERPRETER_ARTIFACT: &[u8] = b"encrypted interpreter artifact";
+    static INTERPRETER_DOWNLOADS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn assert_interpreter_cache_redownload(
+        tamper: impl FnOnce(&crate::cache::lifecycle::PatchLifecycle),
+    ) {
+        use crate::cache::lifecycle::DownloadAction;
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_with_profile(&tmp, "interpreter-full");
+        INTERPRETER_DOWNLOADS.store(0, SeqCst);
+        crate::network::testing_set_network_hooks(
+            |_, _| panic!("Unexpected legacy check"),
+            |_, path, resume_from| {
+                assert_eq!(resume_from, 0);
+                INTERPRETER_DOWNLOADS.fetch_add(1, SeqCst);
+                let mut compressed = std::io::Cursor::new(Vec::new());
+                patch::make_patch(
+                    b"original baseline".to_vec(),
+                    INTERPRETER_ARTIFACT.to_vec(),
+                    &mut compressed,
+                );
+                let bytes = compressed.into_inner();
+                std::fs::write(path, &bytes)?;
+                Ok(crate::network::DownloadResult {
+                    total_bytes: bytes.len() as u64,
+                    content_length: Some(bytes.len() as u64),
+                })
+            },
+            |_, _| Ok(()),
+        );
+        let config = crate::config::with_config(|c| Ok(c.clone())).unwrap();
+        let initial = grant(&config, 9, Some(2), INTERPRETER_ARTIFACT);
+        install(&config, &initial, INTERPRETER_ARTIFACT);
+        accept(&config, &initial);
+        let state = crate::updater::load_state(&config).unwrap();
+        assert_eq!(state.next_boot_patch().unwrap().number, 2);
+        tamper(state.lifecycle());
+
+        let journal =
+            SelectionJournal::new(&config.storage_dir, &initial.descriptor().scope).unwrap();
+        let authority_before_fallback = std::fs::read(journal.path()).unwrap();
+        // Offline corruption must select BASE without exposing the interpreter
+        // artifact/key context or changing the accepted authorization.
+        let fallback = crate::native_boot::prepare().unwrap();
+        assert!(fallback.patch.is_none());
+        assert!(fallback.path.is_none());
+        assert!(crate::native_boot::selection_context_json(fallback.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read(journal.path()).unwrap(),
+            authority_before_fallback
+        );
+        assert_eq!(INTERPRETER_DOWNLOADS.load(SeqCst), 0);
+        let initial_patch = initial.delivery().unwrap().patch();
+        assert_eq!(
+            crate::updater::load_state(&config)
+                .unwrap()
+                .lifecycle()
+                .decide_start(
+                    2,
+                    &initial_patch.download_identity(),
+                    &initial_patch.hash,
+                    initial_patch.hash_signature.as_deref(),
+                ),
+            DownloadAction::Fresh,
+        );
+
+        let free = grant(&config, 10, None, b"");
+        accept(&config, &free);
+        assert!(crate::updater::next_boot_patch().unwrap().is_none());
+        let renewed = grant(&config, 11, Some(2), INTERPRETER_ARTIFACT);
+        accept(&config, &renewed);
+        let patch = renewed.delivery().unwrap().patch();
+        let state = crate::updater::load_state(&config).unwrap();
+        let action = state.lifecycle().decide_start(
+            2,
+            &patch.download_identity(),
+            &patch.hash,
+            patch.hash_signature.as_deref(),
+        );
+        assert_eq!(action, DownloadAction::Fresh);
+        assert!(state.lifecycle().read_state(2).is_none());
+        assert!(state.next_boot_patch().is_none());
+        assert_eq!(status()["next_boot"]["reason"], "content_unavailable");
+        assert!(journal
+            .accept(
+                &initial,
+                &initial.descriptor().scope,
+                config.patch_public_key.as_deref().unwrap(),
+                0,
+            )
+            .is_err());
+        assert_eq!(accepted_grant(&config).unwrap().0.epoch(), 11);
+        assert_eq!(
+            crate::updater_lock::with_updater_thread_lock(|_| {
+                crate::updater::download_and_install_patch(&config, &patch, action, None)
+            })
+            .unwrap(),
+            crate::UpdateStatus::UpdateInstalled,
+        );
+        assert_eq!(INTERPRETER_DOWNLOADS.load(SeqCst), 1);
+        assert_eq!(status()["next_boot"]["reason"], "ready");
+        assert_eq!(crate::native_boot::prepare().unwrap().id, fallback.id);
+
+        // A cold process consumes the redownloaded bytes with the same content
+        // number and the latest verified grant; no cache reset is involved.
+        setup_with_profile(&tmp, "interpreter-full");
+        let prepared = crate::native_boot::prepare().unwrap();
+        assert_eq!(prepared.patch, Some(2));
+        assert_eq!(
+            std::fs::read(prepared.path.unwrap()).unwrap(),
+            INTERPRETER_ARTIFACT
+        );
+        assert_eq!(accepted_grant(&config).unwrap().0.epoch(), 11);
+        crate::testing_reset_config();
+    }
+
+    #[test]
+    #[serial]
+    fn interpreter_cached_ciphertext_tamper_redownloads_after_reauthorization() {
+        assert_interpreter_cache_redownload(|lifecycle| {
+            let mut bytes = INTERPRETER_ARTIFACT.to_vec();
+            bytes[0] ^= 1; // Same length: only authenticated content detects this.
+            std::fs::write(lifecycle.installed_artifact_path(2), bytes).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn interpreter_cached_signature_tamper_redownloads_after_reauthorization() {
+        for signature in [None, Some("tampered cached signature".into())] {
+            assert_interpreter_cache_redownload(|lifecycle| {
+                lifecycle
+                    .write_state(
+                        2,
+                        &PatchState::Installed {
+                            signature,
+                            size: INTERPRETER_ARTIFACT.len() as u64,
+                        },
+                    )
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn interpreter_cached_size_tamper_redownloads_after_reauthorization() {
+        assert_interpreter_cache_redownload(|lifecycle| {
+            let Some(PatchState::Installed { signature, size }) = lifecycle.read_state(2) else {
+                panic!("Missing installed fixture");
+            };
+            lifecycle
+                .write_state(
+                    2,
+                    &PatchState::Installed {
+                        signature,
+                        size: size + 1,
+                    },
+                )
+                .unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn verified_reauthorization_preserves_genuine_and_ambiguous_quarantine() {
+        use crate::cache::lifecycle::{DownloadAction, SkipReason};
+        for reason in [
+            BadReason::BootCrash,
+            BadReason::InvalidPatchBytes,
+            BadReason::InstallHashMismatch,
+            BadReason::ValidationFailed,
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            setup(&tmp);
+            let config = crate::config::with_config(|c| Ok(c.clone())).unwrap();
+            let initial = grant(&config, 9, Some(2), INTERPRETER_ARTIFACT);
+            install(&config, &initial, INTERPRETER_ARTIFACT);
+            accept(&config, &initial);
+            let state = crate::updater::load_state(&config).unwrap();
+            state.lifecycle().mark_bad(2, reason.clone()).unwrap();
+            let quarantined = state.lifecycle().read_state(2).unwrap();
+            let free = grant(&config, 10, None, b"");
+            accept(&config, &free);
+            assert!(crate::updater::next_boot_patch().unwrap().is_none());
+            let renewed = grant(&config, 11, Some(2), INTERPRETER_ARTIFACT);
+            accept(&config, &renewed);
+            let patch = renewed.delivery().unwrap().patch();
+            let state = crate::updater::load_state(&config).unwrap();
+            assert_eq!(state.lifecycle().read_state(2), Some(quarantined));
+            assert!(state.next_boot_patch().is_none());
+            assert_eq!(
+                state.lifecycle().decide_start(
+                    2,
+                    &patch.download_identity(),
+                    &patch.hash,
+                    patch.hash_signature.as_deref(),
+                ),
+                DownloadAction::Skip(SkipReason::KnownBad),
+                "{reason:?}"
+            );
+            assert_eq!(status()["next_boot"]["reason"], "quarantined");
+            assert_eq!(accepted_grant(&config).unwrap().0.epoch(), 11);
+            crate::testing_reset_config();
+        }
+    }
+
     #[test]
     #[serial]
     fn explicit_reselection_base_quarantine_and_cached_content_ignore_number_order() {
