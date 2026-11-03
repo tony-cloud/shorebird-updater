@@ -492,6 +492,18 @@ pub fn check_for_downloadable_update(channel: Option<&str>) -> anyhow::Result<bo
     }
 }
 
+/// If the installed artifact is an iOS linked AOT patch (`vmcode`), checks its
+/// header against the installed release (see `vmcode.rs`). Other artifacts pass.
+fn verify_linked_aot_patch(config: &UpdateConfig, installed_path: &Path) -> anyhow::Result<()> {
+    if !crate::vmcode::is_vmcode(installed_path)? {
+        return Ok(());
+    }
+    let mut base = patch_base(config)?;
+    crate::vmcode::verify_against_base(installed_path, &mut *base)
+        .context(UpdateError::CorruptPatch)
+        .context("Update rejected: the linked patch does not match the installed release.")
+}
+
 fn check_hash(path: &Path, expected_string: &str) -> anyhow::Result<()> {
     // Validate the expected string is a hex-encoded hash.
     hex::decode(expected_string).context("Invalid hash string from server.")?;
@@ -1094,6 +1106,13 @@ fn install_downloaded_patch(
         // Hash mismatch — bytes decompressed but produced the wrong
         // result. Most often a customer build/release mismatch on their
         // side; deterministic on this device.
+        mark_patch_bad(patch.number, BadReason::InstallHashMismatch);
+        return Err(e);
+    }
+
+    // iOS linked AOT patches (`vmcode`) name the release text they were linked
+    // to; refuse one that does not belong to the release installed here.
+    if let Err(e) = verify_linked_aot_patch(config, &installed_path) {
         mark_patch_bad(patch.number, BadReason::InstallHashMismatch);
         return Err(e);
     }
@@ -2592,6 +2611,75 @@ patch_verification: bogus_mode
                 err_chain
             );
         }
+    }
+
+    /// A linked AOT (`vmcode`) patch is diffed against the release's data and
+    /// text images, which is what the engine streams as the base. The updater
+    /// reconstructs it byte for byte and the header names this release.
+    #[test]
+    fn linked_aot_patch_reconstructs_against_the_release_blobs() {
+        let tmp_dir = TempDir::new().unwrap();
+        let text: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+        let data: Vec<u8> = (0..2048u32).map(|i| (i * 13 % 241) as u8).collect();
+        let base_blob = [data.clone(), text.clone()].concat();
+        let elf: Vec<u8> = (0..9000u32).map(|i| (i * 31 % 239) as u8).collect();
+        let vmcode = crate::vmcode::test_support::vmcode(&text, &elf);
+
+        let mut diff = std::io::Cursor::new(Vec::new());
+        patch::make_patch(base_blob.clone(), vmcode.clone(), &mut diff);
+        let diff_path = tmp_dir.path().join("diff.patch");
+        fs::write(&diff_path, diff.into_inner()).unwrap();
+
+        let output_path = tmp_dir.path().join("installed");
+        super::inflate(
+            &diff_path,
+            std::io::Cursor::new(base_blob.clone()),
+            &output_path,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&output_path).unwrap(), vmcode);
+        assert!(crate::vmcode::is_vmcode(&output_path).unwrap());
+        crate::vmcode::verify_against_base(&output_path, &mut std::io::Cursor::new(base_blob))
+            .unwrap();
+
+        // The same bytes against another release's blobs: the header refuses.
+        let mut other = base_blob_with_other_text(&data);
+        assert!(crate::vmcode::verify_against_base(&output_path, &mut other).is_err());
+    }
+
+    fn base_blob_with_other_text(data: &[u8]) -> std::io::Cursor<Vec<u8>> {
+        let text: Vec<u8> = (0..4096u32).map(|i| (i * 11 % 251) as u8).collect();
+        std::io::Cursor::new([data.to_vec(), text].concat())
+    }
+
+    /// Host end-to-end hook: reconstructs a real `shorebird patch` download
+    /// (`SHOREBIRD_E2E_DIFF`) against a real release blob
+    /// (`SHOREBIRD_E2E_BASE`, from `ios_linker diff-base`) with the updater's
+    /// own inflate, compares it with the vmcode the CLI hashed
+    /// (`SHOREBIRD_E2E_EXPECTED`) and runs the header verification. Run with
+    /// `cargo test -p updater --lib linked_aot_host_e2e -- --ignored`.
+    #[test]
+    #[ignore]
+    fn linked_aot_host_e2e() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} not set"));
+        let tmp_dir = TempDir::new().unwrap();
+        let output_path = tmp_dir.path().join("installed");
+        let base = fs::File::open(var("SHOREBIRD_E2E_BASE")).unwrap();
+        super::inflate(Path::new(&var("SHOREBIRD_E2E_DIFF")), base, &output_path).unwrap();
+        let expected = fs::read(var("SHOREBIRD_E2E_EXPECTED")).unwrap();
+        let actual = fs::read(&output_path).unwrap();
+        assert_eq!(actual.len(), expected.len(), "reconstructed size");
+        assert!(actual == expected, "reconstructed bytes differ");
+        assert!(crate::vmcode::is_vmcode(&output_path).unwrap());
+        let mut base = fs::File::open(var("SHOREBIRD_E2E_BASE")).unwrap();
+        crate::vmcode::verify_against_base(&output_path, &mut base).unwrap();
+        if let Ok(hash) = std::env::var("SHOREBIRD_E2E_HASH") {
+            super::check_hash(&output_path, &hash).unwrap();
+        }
+        println!(
+            "e2e: reconstructed {} bytes, byte-equal, header verified",
+            actual.len()
+        );
     }
 
     #[test]

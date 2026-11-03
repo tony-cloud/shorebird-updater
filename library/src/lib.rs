@@ -21,6 +21,7 @@ mod network;
 mod time;
 mod updater;
 mod updater_lock;
+mod vmcode;
 mod yaml;
 
 #[cfg(any(target_os = "android", test))]
