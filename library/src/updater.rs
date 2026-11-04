@@ -1098,9 +1098,10 @@ fn install_downloaded_patch(
 
     if let Err(e) = check_hash(&installed_path, &patch.hash).with_context(|| {
         format!(
-            "This app reports version {}, but the binary is different from \
-        the version {} that was submitted to Shorebird.",
-            config.release_version, config.release_version
+            "The downloaded patch for release {} does not match the signed hash \
+        the server published for it (the patch data was altered or corrupted \
+        in transit or on disk).",
+            config.release_version
         )
     }) {
         // Hash mismatch — bytes decompressed but produced the wrong
@@ -1377,7 +1378,35 @@ where
         base_r,
         std::io::BufWriter::new(output),
     )
-    .with_context(|| format!("Writing reconstructed patch to {}", output_path.display()))
+    .map_err(|e| {
+        if classify_failure(&e) == FailureCategory::CorruptPatch {
+            e.context(format!(
+                "Patch data corruption detected while inflating patch into {}",
+                output_path.display()
+            ))
+        } else {
+            e.context(format!(
+                "Writing reconstructed patch to {}",
+                output_path.display()
+            ))
+        }
+    })
+}
+
+/// True when a bipatch-side IO error means the patch stream itself is
+/// malformed or truncated, as opposed to a genuine filesystem failure.
+fn is_malformed_patch_stream(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// True when the zstd decompression thread failed for a reason of its own
+/// ("Data corruption detected", "Destination buffer is too small", ...). A
+/// BrokenPipe is just the downstream consumer going away, so it is not.
+fn is_decompression_failure(e: &std::io::Error) -> bool {
+    e.kind() != std::io::ErrorKind::BrokenPipe
 }
 
 pub(crate) fn inflate_reader_to_writer<R, RS, W>(
@@ -1492,13 +1521,19 @@ where
             // handle so we don't leak it.
             let dec_err = drain_decompress(decompress_handle);
             let diag = snapshot();
-            return Err(e).with_context(|| {
+            let corrupt = dec_err.as_ref().is_some_and(is_decompression_failure);
+            let err: anyhow::Result<()> = Err(e).with_context(|| {
                 let mut msg = format!("Failed to initialize bipatch reader. {}", diag);
                 if let Some(d) = dec_err {
                     msg.push_str(&format!(" Decompression thread also errored: {:#}", d));
                 }
                 msg
             });
+            return if corrupt {
+                err.context(UpdateError::CorruptPatch)
+            } else {
+                err
+            };
         }
     };
 
@@ -1551,7 +1586,16 @@ where
         }
         (Err(patch_err), Ok(_)) => {
             shorebird_error!("Patch application failed; decompression OK. {}", diag);
-            Err(patch_err).with_context(|| format!("Patch application failed. {}", diag))
+            let corrupt = patch_err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(is_malformed_patch_stream);
+            let err: anyhow::Result<()> =
+                Err(patch_err).with_context(|| format!("Patch application failed. {}", diag));
+            if corrupt {
+                err.context(UpdateError::CorruptPatch)
+            } else {
+                err
+            }
         }
         (Ok(_), Err(decompress_err)) => {
             // Patch succeeded but decompression reported an error. This can
@@ -1578,14 +1622,23 @@ where
                 decompress_err,
                 diag
             );
-            Err(patch_err).with_context(|| {
+            let corrupt = is_decompression_failure(&decompress_err)
+                || patch_err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(is_malformed_patch_stream);
+            let err: anyhow::Result<()> = Err(patch_err).with_context(|| {
                 format!(
                     "Patch application failed (decompression thread also errored \
                      downstream, almost always BrokenPipe caused by the upstream \
                      patch-side failure: {:#}). {}",
                     decompress_err, diag
                 )
-            })
+            });
+            if corrupt {
+                err.context(UpdateError::CorruptPatch)
+            } else {
+                err
+            }
         }
     }
 }
@@ -2511,6 +2564,26 @@ patch_verification: bogus_mode
             "Expected diagnostic byte counters in error, got: {}",
             err_chain
         );
+    }
+
+    #[test]
+    fn inflate_corrupt_zstd_is_classified_corrupt_patch() {
+        let tmp_dir = TempDir::new().unwrap();
+        let patch_path = tmp_dir.path().join("corrupt.patch");
+        let mut data = vec![0x28, 0xB5, 0x2F, 0xFD];
+        data.extend_from_slice(b"this is not valid zstd compressed data");
+        fs::write(&patch_path, &data).unwrap();
+        let output_path = tmp_dir.path().join("output");
+        let base = std::io::Cursor::new(b"base content".to_vec());
+
+        let err = super::inflate(&patch_path, base, &output_path).unwrap_err();
+        assert_eq!(
+            super::classify_failure(&err),
+            super::FailureCategory::CorruptPatch
+        );
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("Patch data corruption detected"), "{msg}");
+        assert!(!msg.contains("Writing reconstructed patch"), "{msg}");
     }
 
     #[test]
@@ -5798,7 +5871,14 @@ mod authenticated_transport_tests {
             },
             |_, _| Ok(()),
         );
-        assert!(update(None).is_err());
+        let hash_err = update(None).unwrap_err();
+        assert_eq!(classify_failure(&hash_err), FailureCategory::CorruptPatch);
+        let hash_msg = hash_err.to_string();
+        assert!(
+            hash_msg.contains("does not match the signed hash"),
+            "{hash_msg}"
+        );
+        assert!(!hash_msg.contains("submitted to Shorebird"), "{hash_msg}");
         with_mut_state(|state| {
             assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
             assert!(matches!(
