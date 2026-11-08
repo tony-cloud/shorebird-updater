@@ -50,6 +50,10 @@ pub struct CompiledPolicy {
     /// Optional pinned trust-root key IDs. When non-empty, the bundled
     /// `patch_public_key` must be one of them.
     pub trust_root_key_ids: Vec<String>,
+    /// Base64 raw Ed25519 public keys that may sign the bundled build
+    /// manifest (hardening P3, `crate::integrity`). Hardened builds have at
+    /// least one; legacy builds none.
+    pub build_manifest_keys: Vec<String>,
 }
 
 /// How network requests are restricted under a policy.
@@ -71,6 +75,7 @@ impl CompiledPolicy {
             toolchain_id: None,
             development_exceptions: false,
             trust_root_key_ids: Vec::new(),
+            build_manifest_keys: Vec::new(),
         }
     }
 
@@ -105,6 +110,10 @@ fn build_time_policy() -> CompiledPolicy {
         trust_root_key_ids: generated::COMPILED_TRUST_ROOT_KEY_IDS
             .iter()
             .map(|id| id.to_string())
+            .collect(),
+        build_manifest_keys: generated::COMPILED_BUILD_MANIFEST_KEYS
+            .iter()
+            .map(|key| key.to_string())
             .collect(),
     }
 }
@@ -391,6 +400,7 @@ pub(crate) mod tests {
             toolchain_id: Some(TOOLCHAIN.to_string()),
             development_exceptions: false,
             trust_root_key_ids: Vec::new(),
+            build_manifest_keys: Vec::new(),
         }
     }
 
@@ -434,6 +444,7 @@ pub(crate) mod tests {
             option_env!("SHOREBIRD_TOOLCHAIN_ID"),
             option_env!("SHOREBIRD_SECURITY_DEVELOPMENT_EXCEPTIONS"),
             option_env!("SHOREBIRD_TRUST_ROOT_KEY_IDS"),
+            option_env!("SHOREBIRD_BUILD_MANIFEST_KEYS"),
         )
         .unwrap();
         let policy = build_time_policy();
@@ -445,6 +456,7 @@ pub(crate) mod tests {
             expected.development_exceptions
         );
         assert_eq!(policy.trust_root_key_ids, expected.trust_root_key_ids);
+        assert_eq!(policy.build_manifest_keys, expected.build_manifest_keys);
         if option_env!("SHOREBIRD_SECURITY_PROFILE").is_none() {
             assert_eq!(policy, CompiledPolicy::legacy());
         }

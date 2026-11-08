@@ -218,6 +218,35 @@ pub extern "C" fn shorebird_compiled_security_profile() -> *const c_char {
     }
 }
 
+/// The startup integrity gate's result in this process, as a static
+/// NUL-terminated string the caller must not free: `not_checked` (legacy
+/// builds, or before initialization), `ok`, or a stable failure code such as
+/// `config_digest_mismatch` or `module_mismatch` (hardening P3,
+/// `IntegrityFailure::code`). The engine logs it when initialization fails.
+#[no_mangle]
+pub extern "C" fn shorebird_integrity_status() -> *const c_char {
+    integrity_status_cstr(crate::integrity::status()).as_ptr()
+}
+
+fn integrity_status_cstr(code: &str) -> &'static std::ffi::CStr {
+    match code {
+        "ok" => c"ok",
+        "manifest_missing" => c"manifest_missing",
+        "manifest_malformed" => c"manifest_malformed",
+        "manifest_untrusted_signer" => c"manifest_untrusted_signer",
+        "manifest_bad_signature" => c"manifest_bad_signature",
+        "manifest_policy_mismatch" => c"manifest_policy_mismatch",
+        "config_digest_mismatch" => c"config_digest_mismatch",
+        "module_unbound" => c"module_unbound",
+        "module_unmeasurable" => c"module_unmeasurable",
+        "module_mismatch" => c"module_mismatch",
+        "package_identity_unavailable" => c"package_identity_unavailable",
+        "package_identity_mismatch" => c"package_identity_mismatch",
+        "package_identity_unsupported" => c"package_identity_unsupported",
+        _ => c"not_checked",
+    }
+}
+
 /// Returns if the app should run the updater automatically on launch.
 #[no_mangle]
 pub extern "C" fn shorebird_should_auto_update() -> bool {
@@ -812,5 +841,40 @@ mod native_source_tests {
         }
         assert!(crate::with_state(|s| Ok(s.currently_booting_patch().is_none())).unwrap());
         crate::testing_reset_config();
+    }
+
+    #[test]
+    fn integrity_status_exposes_every_typed_code() {
+        use crate::integrity::IntegrityFailure as F;
+        let failures = [
+            F::ManifestMissing,
+            F::ManifestMalformed(String::new()),
+            F::UntrustedSigner,
+            F::BadSignature,
+            F::PolicyMismatch("x"),
+            F::ConfigDigestMismatch,
+            F::ModuleUnbound,
+            F::ModuleUnmeasurable(String::new()),
+            F::ModuleMismatch,
+            F::PackageIdentityUnavailable(String::new()),
+            F::PackageIdentityMismatch,
+            F::PackageIdentityUnsupported,
+        ];
+        for failure in failures {
+            assert_eq!(
+                super::integrity_status_cstr(failure.code())
+                    .to_str()
+                    .unwrap(),
+                failure.code()
+            );
+        }
+        assert_eq!(super::integrity_status_cstr("ok").to_str().unwrap(), "ok");
+        assert_eq!(
+            super::integrity_status_cstr("anything else")
+                .to_str()
+                .unwrap(),
+            "not_checked"
+        );
+        assert!(!super::shorebird_integrity_status().is_null());
     }
 }

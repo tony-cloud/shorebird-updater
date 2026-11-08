@@ -249,6 +249,10 @@ pub(crate) fn set_config_with_binding(
     // as a weaker retry path.
     let policy = crate::security::compiled();
     let admitted = crate::security::admit(&policy, yaml)?;
+    // Hardened only: the signed build manifest, the loaded engine module and
+    // the package identity must match (P3). Like admission, a failure
+    // publishes nothing; legacy returns immediately.
+    crate::integrity::check(&policy, &yaml.build_manifest, &libapp_path)?;
     shorebird_debug!("Security profile: {}", policy.profile.as_str());
     if policy.development_exceptions {
         shorebird_warn!(
@@ -558,6 +562,11 @@ mod tests {
 
     mod hardened_admission {
         use super::{fake_app_config, FakeExternalFileProvider};
+        use crate::integrity::tests::{
+            hardened_with_key, manifest_json, module_entry, signed_hardened_yaml, signed_yaml,
+            token, NO_IDENTITY, SEED,
+        };
+        use crate::integrity::{IntegrityFailure, MANIFEST_KEY};
         use crate::security::tests::{hardened, hardened_yaml_text};
         use crate::security::{testing_set_compiled_policy, CompiledPolicy, SecurityError};
         use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode, YamlConfig};
@@ -591,13 +600,15 @@ mod tests {
         #[test]
         fn hardened_updater_boots_the_hardened_build_output() {
             testing_reset_config();
-            testing_set_compiled_policy(Some(hardened()));
+            testing_set_compiled_policy(Some(hardened_with_key()));
             // The YAML omits nothing the floor needs; drop the explicit
             // verification keys to show the floor, not the YAML, decides.
             let text = hardened_yaml_text()
                 .replace("patch_verification: strict\n", "")
                 .replace("patch_response_verification: required\n", "");
-            configure(&text, false).unwrap();
+            // P3: as built, i.e. with the signed build manifest bound to
+            // this process's module.
+            configure(&signed_yaml(&text), false).unwrap();
             let config = super::super::with_config(|c| Ok(c.clone())).unwrap();
             testing_reset_config();
             assert_eq!(config.patch_verification, PatchVerificationMode::Strict);
@@ -694,6 +705,143 @@ mod tests {
                 PatchResponseVerificationMode::Optional
             );
             assert_eq!(config.patch_public_key, None);
+        }
+
+        fn integrity_refusal(result: anyhow::Result<()>) -> IntegrityFailure {
+            result
+                .unwrap_err()
+                .downcast::<IntegrityFailure>()
+                .expect("a typed integrity refusal")
+        }
+
+        #[serial]
+        #[test]
+        fn tampered_installs_publish_nothing_on_any_entry_point() {
+            let signed = signed_hardened_yaml();
+            let other_module = module_entry(
+                crate::config::current_platform(),
+                crate::config::current_arch(),
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            );
+            let config = format!("{}\n", hardened_yaml_text());
+            let replaced_engine = format!(
+                "{config}{MANIFEST_KEY}: {}\n",
+                token(&SEED, &manifest_json(&config, &other_module, NO_IDENTITY))
+            );
+            let cases = [
+                // Unsigned (stripped manifest).
+                (format!("{}\n", hardened_yaml_text()), "manifest_missing"),
+                // Replaced key, consistent with the rest of the YAML.
+                (
+                    signed.replacen("patch_public_key: AQID", "patch_public_key: BAUG", 1),
+                    "config_digest_mismatch",
+                ),
+                // Replaced origin (still https, so admission alone accepts it).
+                (
+                    signed.replacen("updates.example.com", "attacker.example.com", 1),
+                    "config_digest_mismatch",
+                ),
+                // Engine/updater module that is not the one the manifest binds.
+                (replaced_engine, "module_mismatch"),
+                // Signature bytes swapped for another manifest's.
+                (
+                    {
+                        let (head, _) = signed.rsplit_once('.').unwrap();
+                        let (_, other_sig) = signed_yaml("app_id: x")
+                            .rsplit_once('.')
+                            .map(|(h, t)| (h.to_string(), t.to_string()))
+                            .unwrap();
+                        format!("{head}.{other_sig}")
+                    },
+                    "manifest_bad_signature",
+                ),
+            ];
+            for (text, code) in &cases {
+                for checked in [false, true] {
+                    testing_reset_config();
+                    testing_set_compiled_policy(Some(hardened_with_key()));
+                    assert_eq!(integrity_refusal(configure(text, checked)).code(), *code);
+                    assert_eq!(crate::integrity::status(), *code);
+                    // Nothing is published: no key provider can be asked,
+                    // no launch reported, no patch selected.
+                    assert!(!published(), "{code}");
+                    assert!(crate::updater::next_boot_patch().is_err());
+                }
+            }
+            testing_reset_config();
+            testing_set_compiled_policy(None);
+        }
+
+        #[serial]
+        #[test]
+        fn a_signed_manifest_cannot_lower_the_compiled_floor() {
+            // Even a manifest signed by the compiled key does not admit a
+            // configuration below the hardened floor: admission runs first.
+            for weaker in [
+                hardened_yaml_text().replace("https://", "http://"),
+                hardened_yaml_text().replace("required", "optional"),
+                hardened_yaml_text().replace("security_profile: hardened\n", ""),
+            ] {
+                testing_reset_config();
+                testing_set_compiled_policy(Some(hardened_with_key()));
+                refusal(configure(&signed_yaml(&weaker), false));
+                assert!(!published());
+            }
+            testing_reset_config();
+            testing_set_compiled_policy(None);
+        }
+
+        #[serial]
+        #[test]
+        fn init_reports_a_typed_integrity_refusal_and_keeps_user_data() {
+            testing_reset_config();
+            testing_set_compiled_policy(Some(hardened_with_key()));
+            let tmp = tempfile::tempdir().unwrap();
+            // Existing updater state and downloads from earlier launches.
+            let state = tmp.path().join("patches_state.json");
+            std::fs::write(&state, b"{\"previous\":true}").unwrap();
+            std::fs::create_dir_all(tmp.path().join("downloads")).unwrap();
+            let download = tmp.path().join("downloads/1");
+            std::fs::write(&download, b"patch bytes").unwrap();
+            let tampered = signed_hardened_yaml().replacen("app_id: app", "app_id: other", 1);
+            let result = crate::init(
+                crate::AppConfig {
+                    app_storage_dir: tmp.path().to_str().unwrap().to_string(),
+                    code_cache_dir: tmp.path().to_str().unwrap().to_string(),
+                    release_version: "1.0.0+1".to_string(),
+                    original_libapp_paths: vec![tmp
+                        .path()
+                        .join("lib/arch/libapp.so")
+                        .to_str()
+                        .unwrap()
+                        .to_string()],
+                },
+                Box::new(FakeExternalFileProvider {}),
+                &tampered,
+            );
+            testing_reset_config();
+            testing_set_compiled_policy(None);
+            assert_eq!(result, Err(InitError::Integrity("config_digest_mismatch")));
+            // Recovery never deletes user data.
+            assert_eq!(std::fs::read(&state).unwrap(), b"{\"previous\":true}");
+            assert_eq!(std::fs::read(&download).unwrap(), b"patch bytes");
+        }
+
+        #[serial]
+        #[test]
+        fn legacy_ignores_the_manifest_line_entirely() {
+            // A legacy updater never runs the gate, whatever the YAML ends
+            // with; legacy configurations behave exactly as before.
+            testing_reset_config();
+            testing_set_compiled_policy(Some(CompiledPolicy::legacy()));
+            configure(
+                &format!("app_id: app\n{MANIFEST_KEY}: v1.garbage.garbage\n"),
+                false,
+            )
+            .unwrap();
+            assert!(published());
+            testing_reset_config();
+            testing_set_compiled_policy(None);
         }
     }
 }

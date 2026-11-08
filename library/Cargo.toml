@@ -73,7 +73,11 @@ oslog = "0.2.0"
 simple_logger = "5.0.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+] }
 
 [dev-dependencies]
 patch = { path = "../patch" }

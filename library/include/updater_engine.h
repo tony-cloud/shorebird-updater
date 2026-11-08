@@ -209,6 +209,15 @@ bool shorebird_init(const struct AppParameters *c_params,
 SHOREBIRD_EXPORT const char *shorebird_compiled_security_profile(void);
 
 /**
+ * The startup integrity gate's result in this process, as a static
+ * NUL-terminated string the caller must not free: `not_checked` (legacy
+ * builds, or before initialization), `ok`, or a stable failure code such as
+ * `config_digest_mismatch` or `module_mismatch` (hardening P3,
+ * `IntegrityFailure::code`). The engine logs it when initialization fails.
+ */
+SHOREBIRD_EXPORT const char *shorebird_integrity_status(void);
+
+/**
  * Returns if the app should run the updater automatically on launch.
  */
 SHOREBIRD_EXPORT bool shorebird_should_auto_update(void);

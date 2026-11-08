@@ -64,6 +64,7 @@ fn generate_compiled_security_policy() {
         values[1].as_deref(),
         values[2].as_deref(),
         values[3].as_deref(),
+        values[4].as_deref(),
     )
     .unwrap_or_else(|error| panic!("Invalid compiled security policy: {error}"));
     if inputs.development_exceptions {

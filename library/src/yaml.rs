@@ -85,6 +85,9 @@ pub struct YamlConfig {
     /// Keys that appeared more than once (the last value wins, as before).
     /// A hardened policy rejects any duplicate; legacy ignores them.
     pub duplicate_keys: Vec<String>,
+    /// The signed build-manifest line and the digest of the bytes before it,
+    /// computed from the same string this parser reads (hardening P3).
+    pub build_manifest: crate::integrity::ManifestSource,
 }
 
 impl YamlConfig {
@@ -210,6 +213,7 @@ impl YamlConfig {
             toolchain_id,
             security_development_exceptions,
             duplicate_keys,
+            build_manifest: crate::integrity::split_source(yaml),
         })
     }
 }

@@ -38,6 +38,15 @@ extern crate tempfile;
 
 mod response_auth;
 
+/// Startup integrity gate: signed build manifest, loaded-module measurement
+/// and package identity (hardening P3).
+mod integrity;
+// File-image parsers are used at run time only on the platforms that measure
+// files (Windows); every platform tests all of them.
+#[cfg_attr(not(test), allow(dead_code))]
+mod module_measurement;
+mod package_identity;
+
 /// Compiled security floor and release admission (hardening contract v1).
 mod security;
 // Shared with build.rs; the library itself uses only the identity check.

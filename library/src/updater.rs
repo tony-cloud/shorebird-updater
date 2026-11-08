@@ -76,6 +76,11 @@ pub enum InitError {
     /// The bundled configuration does not satisfy the compiled security
     /// policy. The updater stays unusable; the app runs its bundled base.
     SecurityPolicy(String),
+    /// The hardened startup integrity gate refused this installation
+    /// (repacked, replaced engine/updater, or tampered configuration). The
+    /// value is the stable `IntegrityFailure::code()`. No key is requested,
+    /// no patch is activated and no data is deleted; the bundled base runs.
+    Integrity(&'static str),
 }
 
 impl std::error::Error for InitError {}
@@ -92,6 +97,9 @@ impl Display for InitError {
             }
             InitError::SecurityPolicy(reason) => {
                 write!(f, "Security policy refused this configuration: {reason}")
+            }
+            InitError::Integrity(code) => {
+                write!(f, "Integrity check refused this installation: {code}")
             }
         }
     }
@@ -357,6 +365,9 @@ pub fn init(
     if let Err(error) = set_config_result {
         if let Some(refusal) = error.downcast_ref::<crate::security::SecurityError>() {
             return Err(InitError::SecurityPolicy(refusal.to_string()));
+        }
+        if let Some(failure) = error.downcast_ref::<crate::integrity::IntegrityFailure>() {
+            return Err(InitError::Integrity(failure.code()));
         }
         return Err(InitError::AlreadyInitialized);
     }
