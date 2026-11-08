@@ -125,6 +125,8 @@ pub fn testing_reset_config() {
     crate::native_boot::reset();
     CHECKED_NATIVE_ONLY.store(false, Ordering::Relaxed);
     SELECTION_V2_ONLY.store(false, Ordering::Relaxed);
+    #[cfg(test)]
+    crate::security::testing_set_compiled_policy(None);
     LAUNCH_OUTCOME.store(LaunchOutcome::Pending as u8, Ordering::Relaxed);
 }
 
@@ -240,6 +242,19 @@ pub(crate) fn set_config_with_binding(
     selection_scope: Option<crate::selection_v2::ReleaseScope>,
     selection_baseline: Option<Box<dyn ExternalFileProvider>>,
 ) -> Result<()> {
+    // Security admission precedes everything else: a refused hardened
+    // configuration publishes no config, so no key is requested and no patch
+    // is activated (the engine continues on the bundled base). Every entry
+    // point (v1, checked native, v2) passes through here, so none can serve
+    // as a weaker retry path.
+    let policy = crate::security::compiled();
+    let admitted = crate::security::admit(&policy, yaml)?;
+    shorebird_debug!("Security profile: {}", policy.profile.as_str());
+    if policy.development_exceptions {
+        shorebird_warn!(
+            "DEVELOPMENT-ONLY hardened updater: loopback HTTP is allowed. Never ship this build."
+        );
+    }
     with_config_mut(|config: &mut Option<UpdateConfig>| {
         anyhow::ensure!(
             !SELECTION_V2_ONLY.load(Ordering::Acquire) || selection_scope.is_some(),
@@ -292,8 +307,8 @@ pub(crate) fn set_config_with_binding(
             patch_public_key: yaml.patch_public_key.to_owned(),
             patch_decryption_key_provider: crate::encrypted_patch::provider(),
             patch_decryption_key_provider_v2: crate::encrypted_patch::provider_v2(),
-            patch_verification: yaml.patch_verification.unwrap_or_default(),
-            patch_response_verification: yaml.patch_response_verification.unwrap_or_default(),
+            patch_verification: admitted.patch_verification,
+            patch_response_verification: admitted.patch_response_verification,
         };
         if CHECKED_NATIVE_ONLY.load(Ordering::Relaxed)
             && !new_config.native_options.encrypted(&new_config)
@@ -435,6 +450,7 @@ mod tests {
             patch_public_key: None,
             patch_verification: None,
             patch_response_verification: None,
+            ..Default::default()
         }
     }
 
@@ -461,6 +477,7 @@ mod tests {
                 patch_public_key: Some("patch_public_key".to_string()),
                 patch_verification: None,
                 patch_response_verification: None,
+                ..Default::default()
             },
             NetworkHooks::default(),
         )?;
@@ -537,5 +554,146 @@ mod tests {
         assert_eq!(config.libapp_path.to_str(), Some("first_path"));
 
         Ok(())
+    }
+
+    mod hardened_admission {
+        use super::{fake_app_config, FakeExternalFileProvider};
+        use crate::security::tests::{hardened, hardened_yaml_text};
+        use crate::security::{testing_set_compiled_policy, CompiledPolicy, SecurityError};
+        use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode, YamlConfig};
+        use crate::{network::NetworkHooks, testing_reset_config, InitError};
+        use serial_test::serial;
+
+        fn configure(text: &str, checked: bool) -> anyhow::Result<()> {
+            super::super::set_config_with_native_options(
+                fake_app_config(),
+                Box::new(FakeExternalFileProvider {}),
+                "libapp.so".into(),
+                &YamlConfig::from_yaml(text).map_err(anyhow::Error::msg)?,
+                NetworkHooks::default(),
+                crate::native_boot::NativeOptions::default(),
+                checked,
+            )
+        }
+
+        fn refusal(result: anyhow::Result<()>) -> SecurityError {
+            result
+                .unwrap_err()
+                .downcast::<SecurityError>()
+                .expect("a typed security refusal")
+        }
+
+        fn published() -> bool {
+            super::super::with_config(|_| Ok(())).is_ok()
+        }
+
+        #[serial]
+        #[test]
+        fn hardened_updater_boots_the_hardened_build_output() {
+            testing_reset_config();
+            testing_set_compiled_policy(Some(hardened()));
+            // The YAML omits nothing the floor needs; drop the explicit
+            // verification keys to show the floor, not the YAML, decides.
+            let text = hardened_yaml_text()
+                .replace("patch_verification: strict\n", "")
+                .replace("patch_response_verification: required\n", "");
+            configure(&text, false).unwrap();
+            let config = super::super::with_config(|c| Ok(c.clone())).unwrap();
+            testing_reset_config();
+            assert_eq!(config.patch_verification, PatchVerificationMode::Strict);
+            assert_eq!(
+                config.patch_response_verification,
+                PatchResponseVerificationMode::Required
+            );
+            assert_eq!(config.base_url, "https://updates.example.com");
+        }
+
+        #[serial]
+        #[test]
+        fn refused_configuration_publishes_nothing_on_any_entry_point() {
+            // Each tamper is refused by admission (the parser's own
+            // required-needs-key/strict rules are removed from the way).
+            let unpaired =
+                hardened_yaml_text().replace("patch_response_verification: required\n", "");
+            let tampered = [
+                unpaired.replace("patch_public_key: AQID\n", ""),
+                hardened_yaml_text().replace("security_profile: hardened\n", ""),
+                unpaired.replace("strict", "install_only"),
+                hardened_yaml_text().replace("required", "optional"),
+                hardened_yaml_text().replace("https://", "http://"),
+                hardened_yaml_text().replace(
+                    "security_contract_version: 1",
+                    "security_contract_version: 2",
+                ),
+                hardened_yaml_text().replace("toolchain_id: sha256:7", "toolchain_id: sha256:8"),
+                "app_id: app\nbase_url: https://updates.example.com\npatch_public_key: AQID"
+                    .to_string(),
+            ];
+            for text in &tampered {
+                for checked in [false, true] {
+                    testing_reset_config();
+                    testing_set_compiled_policy(Some(hardened()));
+                    refusal(configure(text, checked));
+                    // Nothing is published, so no API can request a key,
+                    // report a launch or select a patch.
+                    assert!(!published(), "{text}");
+                    assert!(crate::updater::next_boot_patch().is_err());
+                }
+            }
+            testing_reset_config();
+        }
+
+        #[serial]
+        #[test]
+        fn init_reports_a_typed_security_refusal() {
+            testing_reset_config();
+            testing_set_compiled_policy(Some(hardened()));
+            let tmp = tempfile::tempdir().unwrap();
+            let result = crate::init(
+                crate::AppConfig {
+                    app_storage_dir: tmp.path().to_str().unwrap().to_string(),
+                    code_cache_dir: tmp.path().to_str().unwrap().to_string(),
+                    release_version: "1.0.0+1".to_string(),
+                    original_libapp_paths: vec![tmp
+                        .path()
+                        .join("lib/arch/libapp.so")
+                        .to_str()
+                        .unwrap()
+                        .to_string()],
+                },
+                Box::new(FakeExternalFileProvider {}),
+                "app_id: app\nbase_url: http://localhost:8080",
+            );
+            testing_reset_config();
+            assert!(matches!(result, Err(InitError::SecurityPolicy(_))));
+        }
+
+        #[serial]
+        #[test]
+        fn legacy_updater_refuses_hardened_yaml_but_keeps_legacy_defaults() {
+            testing_reset_config();
+            testing_set_compiled_policy(Some(CompiledPolicy::legacy()));
+            assert!(matches!(
+                refusal(configure(&hardened_yaml_text(), false)),
+                SecurityError::ProfileMismatch { .. }
+            ));
+            assert!(!published());
+            testing_reset_config();
+            // Today's legacy shapes (no key, http default origin, install_only)
+            // still configure exactly as before.
+            configure("app_id: app\npatch_verification: install_only", false).unwrap();
+            let config = super::super::with_config(|c| Ok(c.clone())).unwrap();
+            testing_reset_config();
+            assert_eq!(config.base_url, super::super::DEFAULT_BASE_URL);
+            assert_eq!(
+                config.patch_verification,
+                PatchVerificationMode::InstallOnly
+            );
+            assert_eq!(
+                config.patch_response_verification,
+                PatchResponseVerificationMode::Optional
+            );
+            assert_eq!(config.patch_public_key, None);
+        }
     }
 }

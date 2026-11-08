@@ -66,12 +66,32 @@ impl Default for NetworkHooks {
     }
 }
 
+/// Applies the compiled transport rule to a request. Legacy requests are
+/// untouched. Hardened requests must use HTTPS on every hop, including
+/// redirects (an HTTPS-to-HTTP redirect fails); the development exception
+/// allows loopback HTTP but refuses redirects so they cannot leave loopback.
+fn with_transport_rule<B>(request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+    with_transport_rule_for(crate::security::compiled().transport_rule(), request)
+}
+
+fn with_transport_rule_for<B>(
+    rule: crate::security::TransportRule,
+    request: ureq::RequestBuilder<B>,
+) -> ureq::RequestBuilder<B> {
+    use crate::security::TransportRule;
+    match rule {
+        TransportRule::Unrestricted => request,
+        TransportRule::HttpsOnly => request.config().https_only(true).build(),
+        TransportRule::LoopbackDevelopment => request.config().max_redirects(0).build(),
+    }
+}
+
 pub fn patch_check_request_default(
     url: &str,
     request: PatchCheckRequest,
 ) -> anyhow::Result<PatchCheckResponse> {
     shorebird_info!("Sending patch check request: {}", request.log_line());
-    let result = ureq::post(url).send_json(&request);
+    let result = with_transport_rule(ureq::post(url)).send_json(&request);
     let response = handle_network_result(result)?;
     let parsed = response.into_body().read_json()?;
     shorebird_debug!("Patch check response: {:?}", parsed);
@@ -100,7 +120,7 @@ pub(crate) fn patch_check_v2(
     if let Some(number) = current_patch {
         fields.insert("current_patch_number".into(), serde_json::json!(number));
     }
-    let response = handle_network_result(ureq::post(url).send_json(&request))?;
+    let response = handle_network_result(with_transport_rule(ureq::post(url)).send_json(&request))?;
     let mut bytes = Vec::new();
     response
         .into_body()
@@ -122,7 +142,7 @@ pub fn download_to_path_default(
     if resume_from > 0 {
         request = request.header("Range", &format!("bytes={resume_from}-"));
     }
-    let result = request.call();
+    let result = with_transport_rule(request).call();
     let response = handle_network_result(result)?;
     let status = response.status();
 
@@ -170,7 +190,7 @@ pub fn download_to_path_default(
 const REPORT_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn report_event_default(url: &str, request: CreatePatchEventRequest) -> anyhow::Result<()> {
-    let result = ureq::post(url)
+    let result = with_transport_rule(ureq::post(url))
         .config()
         .timeout_global(Some(REPORT_EVENT_TIMEOUT))
         .build()
@@ -512,6 +532,9 @@ pub fn download_to_path(
     resume_from: u64,
 ) -> anyhow::Result<DownloadResult> {
     shorebird_info!("Downloading patch artifact");
+    // Download URLs come from the server response, not from the admitted
+    // base_url, so a hardened release checks each one before any request.
+    crate::security::check_origin(&crate::security::compiled(), url)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_file_context(FileOperation::CreateDir, parent)?;
     }
@@ -930,5 +953,120 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    mod hardened_transport {
+        use crate::network::{download_to_path, with_transport_rule_for, NetworkHooks};
+        use crate::security::{testing_set_compiled_policy, TransportRule};
+
+        fn refusing_hook(
+            _url: &str,
+            _dest: &std::path::Path,
+            _resume_from: u64,
+        ) -> anyhow::Result<crate::network::DownloadResult> {
+            panic!("a refused origin must not reach the network");
+        }
+
+        fn accepting_hook(
+            _url: &str,
+            _dest: &std::path::Path,
+            _resume_from: u64,
+        ) -> anyhow::Result<crate::network::DownloadResult> {
+            Ok(crate::network::DownloadResult {
+                total_bytes: 0,
+                content_length: None,
+            })
+        }
+
+        #[test]
+        fn hardened_download_refuses_http_before_any_request() {
+            let tmp = tempfile::tempdir().unwrap();
+            let refusing = NetworkHooks {
+                download_to_path_fn: refusing_hook,
+                ..NetworkHooks::default()
+            };
+            testing_set_compiled_policy(Some(crate::security::tests::hardened()));
+            let http = download_to_path(
+                &refusing,
+                "http://cdn.example.com/p",
+                &tmp.path().join("p"),
+                0,
+            );
+            let creds = download_to_path(
+                &refusing,
+                "https://u:p@cdn.example.com/p",
+                &tmp.path().join("p"),
+                0,
+            );
+            let https = download_to_path(
+                &NetworkHooks {
+                    download_to_path_fn: accepting_hook,
+                    ..NetworkHooks::default()
+                },
+                "https://cdn.example.com/p",
+                &tmp.path().join("p"),
+                0,
+            );
+            testing_set_compiled_policy(None);
+            assert!(http.unwrap_err().to_string().contains("https origin"));
+            assert!(creds.is_err());
+            assert!(https.is_ok());
+        }
+
+        #[test]
+        fn legacy_download_still_accepts_http() {
+            let tmp = tempfile::tempdir().unwrap();
+            let hooks = NetworkHooks {
+                download_to_path_fn: accepting_hook,
+                ..NetworkHooks::default()
+            };
+            assert!(
+                download_to_path(&hooks, "http://cdn.example.com/p", &tmp.path().join("p"), 0)
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn https_only_rule_refuses_plain_http_requests() {
+            let mut server = mockito::Server::new();
+            let mock = server.mock("GET", "/p").with_status(200).expect(0).create();
+            let result = with_transport_rule_for(
+                TransportRule::HttpsOnly,
+                ureq::get(format!("{}/p", server.url())),
+            )
+            .call();
+            assert!(matches!(result, Err(ureq::Error::RequireHttpsOnly(_))));
+            mock.assert();
+        }
+
+        #[test]
+        fn development_rule_refuses_redirects_but_legacy_follows_them() {
+            let mut server = mockito::Server::new();
+            let target = format!("{}/final", server.url());
+            let redirect = server
+                .mock("GET", "/start")
+                .with_status(302)
+                .with_header("location", &target)
+                .expect(2)
+                .create();
+            let landed = server
+                .mock("GET", "/final")
+                .with_status(200)
+                .expect(1)
+                .create();
+            let start = format!("{}/start", server.url());
+            let development =
+                with_transport_rule_for(TransportRule::LoopbackDevelopment, ureq::get(&start))
+                    .call();
+            // Not followed: the 302 itself comes back and /final is never
+            // contacted from the development rule (a redirect could leave
+            // loopback). The caller then fails on the non-artifact body.
+            assert_eq!(development.unwrap().status(), 302);
+            let legacy =
+                with_transport_rule_for(TransportRule::Unrestricted, ureq::get(&start)).call();
+            assert_eq!(legacy.unwrap().status(), 200);
+            redirect.assert();
+            landed.assert();
+        }
     }
 }

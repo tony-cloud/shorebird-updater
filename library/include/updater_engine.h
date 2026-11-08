@@ -201,6 +201,14 @@ bool shorebird_init(const struct AppParameters *c_params,
                     const char *c_yaml);
 
 /**
+ * The security profile compiled into this updater ("legacy" or "hardened"),
+ * as a static NUL-terminated string the caller must not free. The engine
+ * compares it with its own compiled `shorebird_security_profile` GN arg and
+ * refuses to initialize on a mismatch (a stale or wrong updater library).
+ */
+SHOREBIRD_EXPORT const char *shorebird_compiled_security_profile(void);
+
+/**
  * Returns if the app should run the updater automatically on launch.
  */
 SHOREBIRD_EXPORT bool shorebird_should_auto_update(void);

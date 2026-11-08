@@ -206,6 +206,18 @@ pub extern "C" fn shorebird_init(
     )
 }
 
+/// The security profile compiled into this updater ("legacy" or "hardened"),
+/// as a static NUL-terminated string the caller must not free. The engine
+/// compares it with its own compiled `shorebird_security_profile` GN arg and
+/// refuses to initialize on a mismatch (a stale or wrong updater library).
+#[no_mangle]
+pub extern "C" fn shorebird_compiled_security_profile() -> *const c_char {
+    match crate::security::compiled_profile_name() {
+        "hardened" => c"hardened".as_ptr(),
+        _ => c"legacy".as_ptr(),
+    }
+}
+
 /// Returns if the app should run the updater automatically on launch.
 #[no_mangle]
 pub extern "C" fn shorebird_should_auto_update() -> bool {

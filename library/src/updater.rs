@@ -73,6 +73,9 @@ pub enum InitError {
     InvalidArgument(String, String),
     AlreadyInitialized,
     FailedToCleanUpFailedPatch,
+    /// The bundled configuration does not satisfy the compiled security
+    /// policy. The updater stays unusable; the app runs its bundled base.
+    SecurityPolicy(String),
 }
 
 impl std::error::Error for InitError {}
@@ -86,6 +89,9 @@ impl Display for InitError {
             InitError::AlreadyInitialized => write!(f, "Shorebird has already been initialized."),
             InitError::FailedToCleanUpFailedPatch => {
                 write!(f, "Failed to clean up after a failed patch.")
+            }
+            InitError::SecurityPolicy(reason) => {
+                write!(f, "Security policy refused this configuration: {reason}")
             }
         }
     }
@@ -348,7 +354,10 @@ pub fn init(
 
     // set_config will return an error if the config is already initialized. This should not cause
     // init to fail.
-    if set_config_result.is_err() {
+    if let Err(error) = set_config_result {
+        if let Some(refusal) = error.downcast_ref::<crate::security::SecurityError>() {
+            return Err(InitError::SecurityPolicy(refusal.to_string()));
+        }
         return Err(InitError::AlreadyInitialized);
     }
 

@@ -23,14 +23,29 @@ pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
 }
 
 /// Verifies `signature` over a patch's `hash` against `public_key`, the
-/// app's configured `patch_public_key`. With no `public_key`, signing is off
-/// and this always succeeds; with one, a missing signature is an error.
+/// app's configured `patch_public_key`. With one, a missing signature is an
+/// error. With no `public_key`, a legacy release has signing off and this
+/// succeeds (unchanged legacy acceptance); a hardened updater never accepts
+/// unsigned content, even if a configuration without a key reached it.
 pub fn check_patch_signature(
     hash: &str,
     signature: Option<&str>,
     public_key: Option<&str>,
 ) -> Result<()> {
+    check_patch_signature_with_policy(&crate::security::compiled(), hash, signature, public_key)
+}
+
+pub(crate) fn check_patch_signature_with_policy(
+    policy: &crate::security::CompiledPolicy,
+    hash: &str,
+    signature: Option<&str>,
+    public_key: Option<&str>,
+) -> Result<()> {
     let Some(public_key) = public_key else {
+        anyhow::ensure!(
+            !policy.requires_signatures(),
+            "Hardened releases never accept unsigned patches; no trust root is configured"
+        );
         return Ok(());
     };
     let signature = signature.context("Patch signature is missing")?;
@@ -104,6 +119,45 @@ mod tests {
         // No public key: any signature, or none, is accepted.
         assert!(super::check_patch_signature(MESSAGE, Some("garbage"), None).is_ok());
         assert!(super::check_patch_signature(MESSAGE, None, None).is_ok());
+    }
+
+    #[test]
+    fn hardened_policy_never_accepts_unsigned_content() {
+        let hardened = crate::security::tests::hardened();
+        // The legacy acceptance of "no key configured" does not exist here.
+        for signature in [None, Some("garbage"), Some(SIGNATURE)] {
+            let error =
+                super::check_patch_signature_with_policy(&hardened, MESSAGE, signature, None)
+                    .unwrap_err();
+            assert!(error.to_string().contains("never accept unsigned"));
+        }
+        // Signed content still verifies, and a wrong or missing signature fails.
+        assert!(super::check_patch_signature_with_policy(
+            &hardened,
+            MESSAGE,
+            Some(SIGNATURE),
+            Some(PUBLIC_KEY)
+        )
+        .is_ok());
+        assert!(super::check_patch_signature_with_policy(
+            &hardened,
+            MESSAGE,
+            None,
+            Some(PUBLIC_KEY)
+        )
+        .is_err());
+        assert!(super::check_patch_signature_with_policy(
+            &hardened,
+            &"0".repeat(64),
+            Some(SIGNATURE),
+            Some(PUBLIC_KEY)
+        )
+        .is_err());
+        // The process-wide entry point consults the compiled floor.
+        crate::security::testing_set_compiled_policy(Some(hardened));
+        let result = super::check_patch_signature(MESSAGE, None, None);
+        crate::security::testing_set_compiled_policy(None);
+        assert!(result.is_err());
     }
 
     #[test]

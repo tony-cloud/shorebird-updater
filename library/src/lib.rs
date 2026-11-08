@@ -38,5 +38,11 @@ extern crate tempfile;
 
 mod response_auth;
 
+/// Compiled security floor and release admission (hardening contract v1).
+mod security;
+// Shared with build.rs; the library itself uses only the identity check.
+#[allow(dead_code)]
+mod security_inputs;
+
 /// Signed v2 selection verification and durable authorization.
 pub mod selection_v2;
