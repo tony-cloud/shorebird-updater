@@ -1,14 +1,17 @@
 //! Startup integrity gate for hardened releases (hardening stage P3,
-//! contract `docs/HARDENING_CONTRACTS.md` §9 in the workspace).
+//! contract `docs/HARDENING_CONTRACTS.md` §9; release root of trust from
+//! stage P4, contract v2, §10 in the workspace).
 //!
 //! A hardened build appends one line to the bundled shorebird.yaml:
 //!
 //! ```text
-//! shorebird_build_manifest: v1.<base64url(manifest JSON)>.<base64url(Ed25519 signature)>
+//! shorebird_build_manifest: v2.<b64url(manifest JSON)>.<b64url(Ed25519 signature)>.<b64url(release-trust JSON)>
 //! ```
 //!
-//! The manifest is signed by a build-manifest key compiled into the engine
-//! (GN `shorebird_build_manifest_keys`), never by a key found in the package.
+//! The manifest is signed by a `build-manifest` key that the release-trust
+//! bundle delegates under the release root compiled into the engine (GN
+//! `shorebird_release_root`), never by a key the package alone vouches for.
+//! The manifest binds the digest of the delegations it was signed under.
 //! It binds the compiled policy (profile, toolchain, development exceptions),
 //! the SHA-256 of every shorebird.yaml byte before its own line, the
 //! measurement of the engine module for each platform/architecture, and
@@ -27,6 +30,7 @@
 //! code was modified to skip them, they detect nothing; see the contract for
 //! what is detection and what is prevention.
 use crate::module_measurement::{measure_running_module, MeasureError, RunningModule};
+use crate::release_trust;
 use crate::security::CompiledPolicy;
 use crate::security_inputs::is_sha256_id;
 use base64::Engine;
@@ -36,11 +40,11 @@ use std::path::Path;
 
 /// The YAML key carrying the signed manifest; always the last line.
 pub const MANIFEST_KEY: &str = "shorebird_build_manifest";
-/// Token version prefix.
-pub const TOKEN_PREFIX: &str = "v1.";
+/// Token version prefix (contract v2).
+pub const TOKEN_PREFIX: &str = "v2.";
 /// Ed25519 signs this prefix followed by the lowercase hex SHA-256 of the
 /// manifest JSON bytes.
-pub const SIGNATURE_DOMAIN: &str = "open-shorebird.build-manifest-signature.v1:";
+pub const SIGNATURE_DOMAIN: &str = "open-shorebird.build-manifest-signature.v2:";
 pub const MANIFEST_SCHEMA: &str = "open-shorebird.build-manifest";
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 
@@ -109,7 +113,19 @@ pub enum IntegrityFailure {
     ManifestMissing,
     ManifestMalformed(String),
     UntrustedSigner,
+    /// The signer is listed as revoked by the delegations.
+    SignerRevoked,
+    /// The signer is a root key or a key delegated for another role.
+    SignerRole,
     BadSignature,
+    /// No release root is compiled into this hardened updater.
+    TrustRootMissing,
+    /// The release-trust bundle (or the compiled pin) cannot be parsed.
+    TrustMalformed(String),
+    /// A root rotation or the delegations are not signed by the root.
+    TrustUnverified(&'static str),
+    /// The delegations are older than the compiled minimum version.
+    TrustRollback,
     PolicyMismatch(&'static str),
     ConfigDigestMismatch,
     ModuleUnbound,
@@ -126,7 +142,13 @@ impl IntegrityFailure {
             IntegrityFailure::ManifestMissing => "manifest_missing",
             IntegrityFailure::ManifestMalformed(_) => "manifest_malformed",
             IntegrityFailure::UntrustedSigner => "manifest_untrusted_signer",
+            IntegrityFailure::SignerRevoked => "manifest_signer_revoked",
+            IntegrityFailure::SignerRole => "manifest_signer_role",
             IntegrityFailure::BadSignature => "manifest_bad_signature",
+            IntegrityFailure::TrustRootMissing => "trust_root_missing",
+            IntegrityFailure::TrustMalformed(_) => "trust_malformed",
+            IntegrityFailure::TrustUnverified(_) => "trust_unverified",
+            IntegrityFailure::TrustRollback => "trust_rollback",
             IntegrityFailure::PolicyMismatch(_) => "manifest_policy_mismatch",
             IntegrityFailure::ConfigDigestMismatch => "config_digest_mismatch",
             IntegrityFailure::ModuleUnbound => "module_unbound",
@@ -144,11 +166,12 @@ impl std::fmt::Display for IntegrityFailure {
         // Details never include keys, signatures, URLs or digests.
         match self {
             IntegrityFailure::ManifestMalformed(why)
+            | IntegrityFailure::TrustMalformed(why)
             | IntegrityFailure::ModuleUnmeasurable(why)
             | IntegrityFailure::PackageIdentityUnavailable(why) => {
                 write!(f, "integrity check failed: {} ({why})", self.code())
             }
-            IntegrityFailure::PolicyMismatch(field) => {
+            IntegrityFailure::PolicyMismatch(field) | IntegrityFailure::TrustUnverified(field) => {
                 write!(f, "integrity check failed: {} ({field})", self.code())
             }
             _ => write!(f, "integrity check failed: {}", self.code()),
@@ -176,7 +199,7 @@ pub struct PackageIdentity {
     pub apple_team_ids: Vec<String>,
 }
 
-/// Build manifest, contract v1. Every field is required; unknown fields and
+/// Build manifest, contract v2. Every field is required; unknown fields and
 /// duplicate fields are rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,14 +210,12 @@ pub struct BuildManifest {
     pub toolchain_id: String,
     pub development_exceptions: bool,
     pub signer_key_id: String,
+    /// Lowercase hex SHA-256 of the delegations payload bytes the signer was
+    /// delegated by.
+    pub delegations_sha256: String,
     pub config_sha256: String,
     pub modules: Vec<ModuleEntry>,
     pub package_identity: PackageIdentity,
-}
-
-/// `sha256:` over a raw 32-byte Ed25519 public key (the P2 catalog rule).
-pub fn ed25519_key_id(raw: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(raw)))
 }
 
 fn is_lower_hex(value: &str, len: usize) -> bool {
@@ -207,8 +228,10 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
 const PLATFORMS: [&str; 5] = ["android", "ios", "linux", "macos", "windows"];
 const ARCHES: [&str; 4] = ["aarch64", "arm", "x86", "x86_64"];
 
-/// Decodes and authenticates a manifest token against the compiled keys.
-/// The signature is checked before any other manifest field is trusted.
+/// Decodes and authenticates a manifest token: the release-trust bundle
+/// against the compiled release root, then the manifest signature against
+/// the key the bundle delegates for the `build-manifest` role. The signature
+/// is checked before any other manifest field is trusted.
 pub fn verify_token(
     policy: &CompiledPolicy,
     token: &str,
@@ -217,9 +240,12 @@ pub fn verify_token(
     let body = token
         .strip_prefix(TOKEN_PREFIX)
         .ok_or_else(|| malformed("unknown token version"))?;
-    let (manifest_b64, signature_b64) = body
-        .split_once('.')
-        .ok_or_else(|| malformed("token has no signature"))?;
+    let mut parts = body.split('.');
+    let (Some(manifest_b64), Some(signature_b64), Some(trust_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(malformed("token needs manifest, signature and trust"));
+    };
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let manifest_bytes = b64
         .decode(manifest_b64)
@@ -227,9 +253,21 @@ pub fn verify_token(
     let signature = b64
         .decode(signature_b64)
         .map_err(|_| malformed("signature is not base64url"))?;
+    let trust_bytes = b64
+        .decode(trust_b64)
+        .map_err(|_| malformed("trust is not base64url"))?;
     if manifest_bytes.len() > MAX_MANIFEST_BYTES || signature.len() != 64 {
         return Err(malformed("manifest or signature size"));
     }
+    let pinned = policy
+        .release_root
+        .as_deref()
+        .ok_or(IntegrityFailure::TrustRootMissing)?;
+    let pinned = base64::engine::general_purpose::STANDARD
+        .decode(pinned)
+        .map_err(|_| IntegrityFailure::TrustMalformed("compiled release root".into()))?;
+    let trust =
+        release_trust::verify_bundle(&pinned, policy.min_delegations_version, &trust_bytes)?;
     // Only the signer selector is read before verification.
     #[derive(Deserialize)]
     struct Selector {
@@ -237,17 +275,12 @@ pub fn verify_token(
     }
     let selector: Selector =
         serde_json::from_slice(&manifest_bytes).map_err(|_| malformed("manifest JSON"))?;
-    let key = policy
-        .build_manifest_keys
-        .iter()
-        .filter_map(|key| base64::engine::general_purpose::STANDARD.decode(key).ok())
-        .find(|raw| ed25519_key_id(raw) == selector.signer_key_id)
-        .ok_or(IntegrityFailure::UntrustedSigner)?;
+    let key = trust.role_key(release_trust::Role::BuildManifest, &selector.signer_key_id)?;
     let message = format!(
         "{SIGNATURE_DOMAIN}{}",
         hex::encode(Sha256::digest(&manifest_bytes))
     );
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
         .verify(message.as_bytes(), &signature)
         .map_err(|_| IntegrityFailure::BadSignature)?;
     let manifest: BuildManifest =
@@ -256,6 +289,11 @@ pub fn verify_token(
         return Err(malformed("signer_key_id"));
     }
     validate_shape(&manifest)?;
+    // The manifest names the delegations it was signed under; another
+    // (older or newer) delegations document is not a substitute.
+    if manifest.delegations_sha256 != hex::encode(trust.delegations_sha256) {
+        return Err(IntegrityFailure::PolicyMismatch("delegations_sha256"));
+    }
     Ok(manifest)
 }
 
@@ -263,6 +301,9 @@ fn validate_shape(manifest: &BuildManifest) -> Result<(), IntegrityFailure> {
     let malformed = |why: &str| Err(IntegrityFailure::ManifestMalformed(why.to_string()));
     if !is_lower_hex(&manifest.config_sha256, 64) {
         return malformed("config_sha256");
+    }
+    if !is_lower_hex(&manifest.delegations_sha256, 64) {
+        return malformed("delegations_sha256");
     }
     let mut seen = Vec::new();
     for module in &manifest.modules {
@@ -469,11 +510,13 @@ pub fn check(
 pub(crate) mod tests {
     use super::*;
     use crate::module_measurement::RunningModule;
+    use crate::release_trust::tests as trust;
     use crate::security::tests::{hardened, hardened_yaml_text, TOOLCHAIN};
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    pub const SEED: [u8; 32] = [7; 32];
-    const OTHER_SEED: [u8; 32] = [9; 32];
+    /// The delegated build-manifest key of the default test trust.
+    pub const SEED: [u8; 32] = trust::MANIFEST_SEED;
+    const OTHER_SEED: [u8; 32] = trust::STRANGER_SEED;
 
     pub fn public_key(seed: &[u8; 32]) -> Vec<u8> {
         Ed25519KeyPair::from_seed_unchecked(seed)
@@ -483,30 +526,57 @@ pub(crate) mod tests {
             .to_vec()
     }
 
-    pub fn public_key_b64(seed: &[u8; 32]) -> String {
-        base64::engine::general_purpose::STANDARD.encode(public_key(seed))
+    /// The hardened test policy with the test release root compiled in.
+    pub fn hardened_with_key() -> CompiledPolicy {
+        policy_with_root(&trust::default_root(), 1)
     }
 
-    /// The hardened test policy with the test manifest key compiled in.
-    pub fn hardened_with_key() -> CompiledPolicy {
+    pub fn policy_with_root(root_payload: &str, min_delegations_version: u64) -> CompiledPolicy {
         CompiledPolicy {
-            build_manifest_keys: vec![public_key_b64(&SEED)],
+            release_root: Some(
+                base64::engine::general_purpose::STANDARD.encode(root_payload.as_bytes()),
+            ),
+            min_delegations_version,
             ..hardened()
         }
     }
 
     pub fn manifest_json(config: &str, modules: &str, identity: &str) -> String {
+        manifest_json_for(
+            &SEED,
+            &trust::default_delegations(),
+            config,
+            modules,
+            identity,
+        )
+    }
+
+    /// A manifest naming `signer` and the delegations payload it signs under.
+    pub fn manifest_json_for(
+        signer: &[u8; 32],
+        delegations: &str,
+        config: &str,
+        modules: &str,
+        identity: &str,
+    ) -> String {
         format!(
-            "{{\"schema\":\"{MANIFEST_SCHEMA}\",\"contract_version\":1,\
+            "{{\"schema\":\"{MANIFEST_SCHEMA}\",\"contract_version\":2,\
              \"security_profile\":\"hardened\",\"toolchain_id\":\"{TOOLCHAIN}\",\
              \"development_exceptions\":false,\"signer_key_id\":\"{}\",\
+             \"delegations_sha256\":\"{}\",\
              \"config_sha256\":\"{}\",\"modules\":[{modules}],\"package_identity\":{identity}}}",
-            ed25519_key_id(&public_key(&SEED)),
+            crate::release_trust::key_id(&public_key(signer)),
+            hex::encode(Sha256::digest(delegations.as_bytes())),
             hex::encode(Sha256::digest(config.as_bytes())),
         )
     }
 
+    /// A v2 token carrying the default test trust bundle.
     pub fn token(seed: &[u8; 32], manifest: &str) -> String {
+        token_with_trust(seed, manifest, &trust::default_bundle())
+    }
+
+    pub fn token_with_trust(seed: &[u8; 32], manifest: &str, bundle: &str) -> String {
         let pair = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
         let message = format!(
             "{SIGNATURE_DOMAIN}{}",
@@ -514,9 +584,10 @@ pub(crate) mod tests {
         );
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         format!(
-            "{TOKEN_PREFIX}{}.{}",
+            "{TOKEN_PREFIX}{}.{}.{}",
             b64.encode(manifest),
-            b64.encode(pair.sign(message.as_bytes()))
+            b64.encode(pair.sign(message.as_bytes())),
+            b64.encode(bundle)
         )
     }
 
@@ -641,10 +712,15 @@ pub(crate) mod tests {
                 &format!("\n{MANIFEST_KEY}: "),
                 &format!("\n {MANIFEST_KEY}: "),
             ),
+            // A contract v1 (P3) token, and a v2 token without its trust.
             text.replace(
-                &format!("{MANIFEST_KEY}: v1."),
                 &format!("{MANIFEST_KEY}: v2."),
+                &format!("{MANIFEST_KEY}: v1."),
             ),
+            {
+                let (head, _) = text.trim_end().rsplit_once('.').unwrap();
+                format!("{head}\n")
+            },
             text.replace(&format!("{MANIFEST_KEY}: "), &format!("{MANIFEST_KEY}:  ")),
             format!("{}# {MANIFEST_KEY}\n{}", config(), &text[config().len()..]),
         ] {
@@ -681,8 +757,8 @@ pub(crate) mod tests {
             NO_IDENTITY,
         )
         .replace(
-            &ed25519_key_id(&public_key(&SEED)),
-            &ed25519_key_id(&public_key(&OTHER_SEED)),
+            &crate::release_trust::key_id(&public_key(&SEED)),
+            &crate::release_trust::key_id(&public_key(&OTHER_SEED)),
         );
         let own_signed = format!(
             "{}{MANIFEST_KEY}: {}\n",
@@ -693,20 +769,16 @@ pub(crate) mod tests {
             run(&own_signed, "linux", "x86_64", &Fake::new()),
             Err(IntegrityFailure::UntrustedSigner)
         );
-        // No compiled key at all trusts nothing.
-        let policy = CompiledPolicy {
-            build_manifest_keys: Vec::new(),
-            ..hardened()
-        };
+        // A hardened updater without a compiled release root trusts nothing.
         assert_eq!(
             evaluate(
-                &policy,
+                &hardened(),
                 &split_source(&linux_text()),
                 "linux",
                 "x86_64",
                 &Fake::new()
             ),
-            Err(IntegrityFailure::UntrustedSigner)
+            Err(IntegrityFailure::TrustRootMissing)
         );
         // A legitimately signed manifest with one flipped signature bit.
         let text = linux_text();
@@ -762,8 +834,13 @@ pub(crate) mod tests {
                 "development_exceptions",
             ),
             (
-                "\"contract_version\":1",
                 "\"contract_version\":2",
+                "\"contract_version\":1",
+                "contract_version",
+            ),
+            (
+                "\"contract_version\":2",
+                "\"contract_version\":3",
                 "contract_version",
             ),
         ] {
@@ -961,14 +1038,204 @@ pub(crate) mod tests {
         );
     }
 
+    /// A linux build output signed by `signer` under `delegations`, carried
+    /// in `bundle`.
+    fn signed_under(signer: &[u8; 32], delegations: &str, bundle: &str) -> String {
+        let manifest = manifest_json_for(
+            signer,
+            delegations,
+            &config(),
+            &module_entry("linux", "x86_64", MEASUREMENT),
+            NO_IDENTITY,
+        );
+        format!(
+            "{}{MANIFEST_KEY}: {}\n",
+            config(),
+            token_with_trust(signer, &manifest, bundle)
+        )
+    }
+
+    fn delegations_bundle(delegations: &str) -> String {
+        trust::trust_bundle(
+            &[],
+            &trust::envelope(
+                crate::release_trust::DELEGATIONS_SIGNATURE_DOMAIN,
+                delegations,
+                &[trust::ROOT_SEED],
+            ),
+        )
+    }
+
+    #[test]
+    fn manifest_signer_must_be_a_delegated_build_manifest_key() {
+        let fake = Fake::new();
+        let default = trust::default_delegations();
+        let bundle = trust::default_bundle();
+        assert_eq!(
+            run(
+                &signed_under(&SEED, &default, &bundle),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Ok(())
+        );
+        // Role confusion: the artifact-catalog key and the root key itself
+        // sign a manifest that names them.
+        for confused in [trust::CATALOG_SEED, trust::ROOT_SEED] {
+            assert_eq!(
+                run(
+                    &signed_under(&confused, &default, &bundle),
+                    "linux",
+                    "x86_64",
+                    &fake
+                ),
+                Err(IntegrityFailure::SignerRole)
+            );
+        }
+        // Wrong key ID: a key the delegations never name.
+        assert_eq!(
+            run(
+                &signed_under(&OTHER_SEED, &default, &bundle),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Err(IntegrityFailure::UntrustedSigner)
+        );
+    }
+
+    #[test]
+    fn revoked_rotated_out_and_rolled_back_signers_are_refused() {
+        let fake = Fake::new();
+        // Delegations v2 rotate the manifest key to [8;32] and revoke [7;32].
+        let rotated = trust::delegations_payload(
+            2,
+            1,
+            &[trust::NEXT_MANIFEST_SEED],
+            &[trust::CATALOG_SEED],
+            &[trust::id(&SEED)],
+        );
+        let bundle = delegations_bundle(&rotated);
+        let policy = policy_with_root(&trust::default_root(), 2);
+        let check = |text: &str| evaluate(&policy, &split_source(text), "linux", "x86_64", &fake);
+        assert_eq!(
+            check(&signed_under(&trust::NEXT_MANIFEST_SEED, &rotated, &bundle)),
+            Ok(())
+        );
+        assert_eq!(
+            check(&signed_under(&SEED, &rotated, &bundle)),
+            Err(IntegrityFailure::SignerRevoked)
+        );
+        // Rotated out without revocation.
+        let dropped = trust::delegations_payload(2, 1, &[trust::NEXT_MANIFEST_SEED], &[], &[]);
+        assert_eq!(
+            check(&signed_under(
+                &SEED,
+                &dropped,
+                &delegations_bundle(&dropped)
+            )),
+            Err(IntegrityFailure::UntrustedSigner)
+        );
+        // The old key with the old delegations that still list it: the
+        // compiled floor (2) refuses the rollback.
+        assert_eq!(
+            check(&signed_under(
+                &SEED,
+                &trust::default_delegations(),
+                &trust::default_bundle()
+            )),
+            Err(IntegrityFailure::TrustRollback)
+        );
+    }
+
+    #[test]
+    fn manifest_binds_the_delegations_it_was_signed_under() {
+        let fake = Fake::new();
+        // Signed naming the default delegations, shipped with another
+        // delegations version that also delegates the same key.
+        let other = trust::delegations_payload(2, 1, &[SEED], &[], &[]);
+        assert_eq!(
+            run(
+                &signed_under(
+                    &SEED,
+                    &trust::default_delegations(),
+                    &delegations_bundle(&other)
+                ),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Err(IntegrityFailure::PolicyMismatch("delegations_sha256"))
+        );
+        // A tampered or unsigned bundle is refused before the signer is used.
+        let unsigned = trust::trust_bundle(
+            &[],
+            &trust::envelope(
+                crate::release_trust::DELEGATIONS_SIGNATURE_DOMAIN,
+                &trust::default_delegations(),
+                &[SEED],
+            ),
+        );
+        assert_eq!(
+            run(
+                &signed_under(&SEED, &trust::default_delegations(), &unsigned),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Err(IntegrityFailure::TrustUnverified("delegations signature"))
+        );
+        assert!(matches!(
+            run(
+                &signed_under(&SEED, &trust::default_delegations(), "{}"),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Err(IntegrityFailure::TrustMalformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_planned_root_rotation_is_followed() {
+        // The engine pins root v1; the build was made after the operator
+        // rotated to root v2 (cross-signed) and re-delegated under it.
+        let next = trust::root_payload(2, 1, &[trust::NEXT_ROOT_SEED]);
+        let delegations = trust::delegations_payload(1, 2, &[SEED], &[], &[]);
+        let bundle = trust::trust_bundle(
+            &[trust::envelope(
+                crate::release_trust::ROOT_SIGNATURE_DOMAIN,
+                &next,
+                &[trust::ROOT_SEED, trust::NEXT_ROOT_SEED],
+            )],
+            &trust::envelope(
+                crate::release_trust::DELEGATIONS_SIGNATURE_DOMAIN,
+                &delegations,
+                &[trust::NEXT_ROOT_SEED],
+            ),
+        );
+        assert_eq!(
+            run(
+                &signed_under(&SEED, &delegations, &bundle),
+                "linux",
+                "x86_64",
+                &Fake::new()
+            ),
+            Ok(())
+        );
+    }
+
     /// The exact output of flutter_tools' `appendShorebirdBuildManifest` for
     /// a fixed key and input (`shorebird_build_manifest_test.dart`, "matches
-    /// the token the updater verifies"). Proves the two implementations agree
-    /// on the line format, the config digest, the key ID and the signature.
+    /// the token the updater verifies"), carrying the DEVELOPMENT-ONLY
+    /// release-trust bundle `scripts/release_trust.py` produced. Proves the
+    /// three implementations agree on the line format, the config digest, the
+    /// delegations digest, key IDs, envelopes and signatures.
     const FLUTTER_TOOLS_OUTPUT: &str = concat!(
         "app_id: app\nbase_url: https://updates.example.com\n",
         "shorebird_build_manifest: ",
-        "v1.eyJzY2hlbWEiOiJvcGVuLXNob3JlYmlyZC5idWlsZC1tYW5pZmVzdCIsImNvbnRyYWN0X3ZlcnNpb24iOjEsInNlY3VyaXR5X3Byb2ZpbGUiOiJoYXJkZW5lZCIsInRvb2xjaGFpbl9pZCI6InNoYTI1Njo3MDIyOWU0MDdlNTMxMTQwMWFhMzI1MTQxOGVmZjEwNjQ2N2E3NTBjY2ZjYjdlOGZlN2I2MWM0NDQyNzAwMDQwIiwiZGV2ZWxvcG1lbnRfZXhjZXB0aW9ucyI6ZmFsc2UsInNpZ25lcl9rZXlfaWQiOiJzaGEyNTY6ZmU4MTJjMTJmM2FiNGNlNmFjNWRiNjlhYzM1MmY5MDZjYjFiMTFlZjQzZmIzM2UyNTJlZjdmZjU1MjI2Mzg4OSIsImNvbmZpZ19zaGEyNTYiOiIwODRjOGQ2NTQyODRjMGZjZjkyZWQ5ZTgxNDE0YTE1ZGQxOTUzMjYxMmU2MzAxZDllMTg0ZTRlMGU2MjQyNmM0IiwibW9kdWxlcyI6W3sicGxhdGZvcm0iOiJsaW51eCIsImFyY2giOiJ4ODZfNjQiLCJtZWFzdXJlbWVudCI6InNoYTI1NjpmMTc3MTY5MjQ1MTg2YmU4ZTBmYTJlOGU2ZmZiOWRmNzBmOGRkMDgyNGM4ZjMwNWMwNmUxN2YzMGY2Mzk5MWNkIn1dLCJwYWNrYWdlX2lkZW50aXR5Ijp7ImFuZHJvaWRfc2lnbmluZ19jZXJ0X3NoYTI1NiI6W10sImFwcGxlX3RlYW1faWRzIjpbXX19.ZYBT71bqRnbCzQ61c36AO41gM27qCV_JTwJcMh0GCw8USHsg9wTsefmPQ3bbnZZQl96YEtgUZhIyUOLpi0xcCw\n",
+        "v2.eyJzY2hlbWEiOiJvcGVuLXNob3JlYmlyZC5idWlsZC1tYW5pZmVzdCIsImNvbnRyYWN0X3ZlcnNpb24iOjIsInNlY3VyaXR5X3Byb2ZpbGUiOiJoYXJkZW5lZCIsInRvb2xjaGFpbl9pZCI6InNoYTI1Njo3MDIyOWU0MDdlNTMxMTQwMWFhMzI1MTQxOGVmZjEwNjQ2N2E3NTBjY2ZjYjdlOGZlN2I2MWM0NDQyNzAwMDQwIiwiZGV2ZWxvcG1lbnRfZXhjZXB0aW9ucyI6ZmFsc2UsInNpZ25lcl9rZXlfaWQiOiJzaGEyNTY6ZmU4MTJjMTJmM2FiNGNlNmFjNWRiNjlhYzM1MmY5MDZjYjFiMTFlZjQzZmIzM2UyNTJlZjdmZjU1MjI2Mzg4OSIsImRlbGVnYXRpb25zX3NoYTI1NiI6Ijc5YTYwNGZmOTFkNjhhYWRjYmQxMmM0ZmE0YTNlNDJjNWRjZTJiNGQ5Y2U3MWExZWYyMmRjMzk3N2NiOTk0ZGYiLCJjb25maWdfc2hhMjU2IjoiMDg0YzhkNjU0Mjg0YzBmY2Y5MmVkOWU4MTQxNGExNWRkMTk1MzI2MTJlNjMwMWQ5ZTE4NGU0ZTBlNjI0MjZjNCIsIm1vZHVsZXMiOlt7InBsYXRmb3JtIjoibGludXgiLCJhcmNoIjoieDg2XzY0IiwibWVhc3VyZW1lbnQiOiJzaGEyNTY6ZjE3NzE2OTI0NTE4NmJlOGUwZmEyZThlNmZmYjlkZjcwZjhkZDA4MjRjOGYzMDVjMDZlMTdmMzBmNjM5OTFjZCJ9XSwicGFja2FnZV9pZGVudGl0eSI6eyJhbmRyb2lkX3NpZ25pbmdfY2VydF9zaGEyNTYiOltdLCJhcHBsZV90ZWFtX2lkcyI6W119fQ.HK-FpA4qt5auJPBUoqhL0ixlBNl5kabAz_RW80B_ZLjc1anfgGMyzGNmAZAJyF8NCCeQurW91yB1aw6bxa2wCw.eyJjb250cmFjdF92ZXJzaW9uIjoyLCJkZWxlZ2F0aW9ucyI6eyJwYXlsb2FkIjoiZXlKamIyNTBjbUZqZEY5MlpYSnphVzl1SWpveUxDSmxlSEJwY21WelgyRjBJam9pTWpBek5pMHhNUzB3TVZRd01Eb3dNRG93TUZvaUxDSnBjM04xWldSZllYUWlPaUl5TURJMkxURXhMVEF4VkRBd09qQXdPakF3V2lJc0luSmxkbTlyWldSZmEyVjVYMmxrY3lJNlcxMHNJbkp2YkdWeklqcDdJbUZ5ZEdsbVlXTjBMV05oZEdGc2IyY2lPbHQ3SW10bGVWOXBaQ0k2SW5Ob1lUSTFOam80Tm1RME5tVXdPV1E1TW1JME1UTXhNREJpWWpZMVl6Rm1NRGs0TWpNMVpXUXlNMlJrWWpnMFpUQTRNV0kxTnpSak1qQmlaVEV4WkRFMVptUTJOVGcwSWl3aWJtOTBYMkZtZEdWeUlqb2lNakF6TmkweE1TMHdNVlF3TURvd01Eb3dNRm9pTENKdWIzUmZZbVZtYjNKbElqb2lNakF5TmkweE1TMHdNVlF3TURvd01Eb3dNRm9pTENKd2RXSnNhV05mYTJWNUlqb2lWblp6ZEVkMkwydGlNemxZTm5JelJqUjZWSEJZYUV0a1IyMTNVMEZHYTFkQ09YbzRMMUpyVVZoMGJ6MGlmVjBzSW1KMWFXeGtMVzFoYm1sbVpYTjBJanBiZXlKclpYbGZhV1FpT2lKemFHRXlOVFk2Wm1VNE1USmpNVEptTTJGaU5HTmxObUZqTldSaU5qbGhZek0xTW1ZNU1EWmpZakZpTVRGbFpqUXpabUl6TTJVeU5USmxaamRtWmpVMU1qSTJNemc0T1NJc0ltNXZkRjloWm5SbGNpSTZJakl3TXpZdE1URXRNREZVTURBNk1EQTZNREJhSWl3aWJtOTBYMkpsWm05eVpTSTZJakl3TWpZdE1URXRNREZVTURBNk1EQTZNREJhSWl3aWNIVmliR2xqWDJ0bGVTSTZJalpyY0hOWkswdGpWV2R4S3psV1FqZEZlVGRHSzFwV1NHUnhOaXQyYm5WVFVXZzNjV0ZTVWtjd2FYYzlJbjFkZlN3aWNtOXZkRjkyWlhKemFXOXVJam94TENKelkyaGxiV0VpT2lKdmNHVnVMWE5vYjNKbFltbHlaQzV5Wld4bFlYTmxMV1JsYkdWbllYUnBiMjV6SWl3aWRtVnljMmx2YmlJNk1YMD0iLCJzaWduYXR1cmVzIjpbeyJrZXlfaWQiOiJzaGEyNTY6MzQ3NTBmOThiZDU5ZmNmYzk0NmRhNDVhYWFiZTkzM2JlMTU0YTRiNTA5NGUxYzRhYmY0Mjg2NjUwNWYzYzk3ZSIsInNpZ25hdHVyZSI6ImI2NzQ1cFFFS2k4WHR4cHg3VzM5NlZqb1pWUWUxUXRNcUthWlJWeFJJcVJobk85NldnUngrK1lxdzFZeE1NR05XZEZYNlhwVnlDQkpQOGtjbEt3WUJBPT0ifV19LCJyb290X2NoYWluIjpbeyJwYXlsb2FkIjoiZXlKamIyNTBjbUZqZEY5MlpYSnphVzl1SWpveUxDSmxlSEJwY21WelgyRjBJam9pTWpBek5pMHhNUzB3T1ZRd01Eb3dNRG93TUZvaUxDSnJaWGx6SWpwYmV5SnJaWGxmYVdRaU9pSnphR0V5TlRZNk16UTNOVEJtT1RoaVpEVTVabU5tWXprME5tUmhORFZoWVdGaVpUa3pNMkpsTVRVMFlUUmlOVEE1TkdVeFl6UmhZbVkwTWpnMk5qVXdOV1l6WXprM1pTSXNJbkIxWW14cFkxOXJaWGtpT2lKcGIycHFNMWhSU2poYVdEbFZkSE4wVUV4d1pHTnpjRzVEWWpoa2JFSkpZamd6VTBsQllsRlFZakYzUFNKOVhTd2ljMk5vWlcxaElqb2liM0JsYmkxemFHOXlaV0pwY21RdWNtVnNaV0Z6WlMxeWIyOTBJaXdpZEdoeVpYTm9iMnhrSWpveExDSjJaWEp6YVc5dUlqb3hmUT09Iiwic2lnbmF0dXJlcyI6W3sia2V5X2lkIjoic2hhMjU2OjM0NzUwZjk4YmQ1OWZjZmM5NDZkYTQ1YWFhYmU5MzNiZTE1NGE0YjUwOTRlMWM0YWJmNDI4NjY1MDVmM2M5N2UiLCJzaWduYXR1cmUiOiJENE5KdWpSL3NZZHNHYWw4VS96VjhFUVY4ck1lZlc4UUR2NnNYdUMvVEd0Lys2YnArZGlpVS9VMjBwYit1VWEyaGxwaVZDTGxtcU1wb29UL2FycldEZz09In1dfV0sInNjaGVtYSI6Im9wZW4tc2hvcmViaXJkLnJlbGVhc2UtdHJ1c3QifQ\n",
     );
 
     #[test]
@@ -983,14 +1250,17 @@ pub(crate) mod tests {
             evaluate(&hardened_with_key(), &source, "linux", "x86_64", &fake),
             Ok(())
         );
-        // The same build output under another compiled key is refused.
-        let other = CompiledPolicy {
-            build_manifest_keys: vec![public_key_b64(&OTHER_SEED)],
-            ..hardened()
-        };
+        // The same build output under another compiled root is refused.
+        let other = policy_with_root(&trust::root_payload(1, 1, &[OTHER_SEED]), 1);
         assert_eq!(
             evaluate(&other, &source, "linux", "x86_64", &fake),
-            Err(IntegrityFailure::UntrustedSigner)
+            Err(IntegrityFailure::TrustUnverified("delegations signature"))
+        );
+        // And under a compiled delegations floor above its delegations.
+        let raised = policy_with_root(&trust::default_root(), 2);
+        assert_eq!(
+            evaluate(&raised, &source, "linux", "x86_64", &fake),
+            Err(IntegrityFailure::TrustRollback)
         );
     }
 

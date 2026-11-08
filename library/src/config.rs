@@ -632,9 +632,10 @@ mod tests {
                 unpaired.replace("strict", "install_only"),
                 hardened_yaml_text().replace("required", "optional"),
                 hardened_yaml_text().replace("https://", "http://"),
+                // A contract v1 (P1-P3) declaration on a v2 updater.
                 hardened_yaml_text().replace(
-                    "security_contract_version: 1",
                     "security_contract_version: 2",
+                    "security_contract_version: 1",
                 ),
                 hardened_yaml_text().replace("toolchain_id: sha256:7", "toolchain_id: sha256:8"),
                 "app_id: app\nbase_url: https://updates.example.com\npatch_public_key: AQID"
@@ -746,12 +747,17 @@ mod tests {
                 // Signature bytes swapped for another manifest's.
                 (
                     {
-                        let (head, _) = signed.rsplit_once('.').unwrap();
-                        let (_, other_sig) = signed_yaml("app_id: x")
-                            .rsplit_once('.')
-                            .map(|(h, t)| (h.to_string(), t.to_string()))
-                            .unwrap();
-                        format!("{head}.{other_sig}")
+                        // Token segments: v2.<manifest>.<signature>.<trust>.
+                        let marker = format!("{MANIFEST_KEY}: ");
+                        let token_of = |text: &str| {
+                            let at = text.find(&marker).unwrap() + marker.len();
+                            (text[..at].to_string(), text[at..].trim_end().to_string())
+                        };
+                        let (head, token) = token_of(&signed);
+                        let (_, other) = token_of(&signed_yaml("app_id: x"));
+                        let mut parts: Vec<&str> = token.split('.').collect();
+                        parts[2] = other.split('.').nth(2).unwrap();
+                        format!("{head}{}\n", parts.join("."))
                     },
                     "manifest_bad_signature",
                 ),

@@ -46,8 +46,14 @@ mod integrity;
 #[cfg_attr(not(test), allow(dead_code))]
 mod module_measurement;
 mod package_identity;
+/// Release root of trust: root chain and role delegations (hardening P4,
+/// contract v2). The device uses the build-manifest role; the
+/// artifact-catalog role is verified by the build tools.
+#[cfg_attr(not(test), allow(dead_code))]
+mod release_trust;
 
-/// Compiled security floor and release admission (hardening contract v1).
+/// Compiled security floor and release admission (hardening contracts v1
+/// and v2).
 mod security;
 // Shared with build.rs; the library itself uses only the identity check.
 #[allow(dead_code)]

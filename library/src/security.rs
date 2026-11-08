@@ -20,8 +20,13 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/compiled_security_policy.rs"));
 }
 
-/// The only security contract version this updater understands.
-pub const SECURITY_CONTRACT_VERSION: u32 = 1;
+/// The security contract a hardened bundle must declare (contract v2, P4:
+/// the build manifest chains to a compiled release root).
+pub const SECURITY_CONTRACT_VERSION: u32 = 2;
+
+/// Declarations a legacy updater accepts. Legacy behavior does not depend on
+/// the version; an unknown one still fails closed.
+pub const KNOWN_CONTRACT_VERSIONS: [u32; 2] = [1, 2];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecurityProfile {
@@ -50,10 +55,11 @@ pub struct CompiledPolicy {
     /// Optional pinned trust-root key IDs. When non-empty, the bundled
     /// `patch_public_key` must be one of them.
     pub trust_root_key_ids: Vec<String>,
-    /// Base64 raw Ed25519 public keys that may sign the bundled build
-    /// manifest (hardening P3, `crate::integrity`). Hardened builds have at
-    /// least one; legacy builds none.
-    pub build_manifest_keys: Vec<String>,
+    /// The release-root pin (hardening P4, `crate::release_trust`): base64
+    /// of one `release-root` payload. Hardened builds have one; legacy none.
+    pub release_root: Option<String>,
+    /// Lowest `release-delegations` version accepted (1 by default).
+    pub min_delegations_version: u64,
 }
 
 /// How network requests are restricted under a policy.
@@ -75,7 +81,8 @@ impl CompiledPolicy {
             toolchain_id: None,
             development_exceptions: false,
             trust_root_key_ids: Vec::new(),
-            build_manifest_keys: Vec::new(),
+            release_root: None,
+            min_delegations_version: 1,
         }
     }
 
@@ -111,10 +118,8 @@ fn build_time_policy() -> CompiledPolicy {
             .iter()
             .map(|id| id.to_string())
             .collect(),
-        build_manifest_keys: generated::COMPILED_BUILD_MANIFEST_KEYS
-            .iter()
-            .map(|key| key.to_string())
-            .collect(),
+        release_root: generated::COMPILED_RELEASE_ROOT.map(str::to_string),
+        min_delegations_version: generated::COMPILED_MIN_DELEGATIONS_VERSION,
     }
 }
 
@@ -184,7 +189,10 @@ impl std::fmt::Display for SecurityError {
                 "security profile mismatch: updater compiled {compiled}, shorebird.yaml declares {declared}"
             ),
             SecurityError::MissingContractVersion => {
-                write!(f, "hardened shorebird.yaml lacks security_contract_version: 1")
+                write!(
+                    f,
+                    "hardened shorebird.yaml lacks security_contract_version: {SECURITY_CONTRACT_VERSION}"
+                )
             }
             SecurityError::MissingToolchainId => {
                 write!(f, "hardened shorebird.yaml lacks toolchain_id")
@@ -248,7 +256,12 @@ pub fn admit(policy: &CompiledPolicy, yaml: &YamlConfig) -> Result<Admitted, Sec
         return Err(SecurityError::ReservedProfile);
     }
     if let Some(version) = yaml.security_contract_version {
-        if version != SECURITY_CONTRACT_VERSION {
+        let supported = if policy.is_hardened() {
+            version == SECURITY_CONTRACT_VERSION
+        } else {
+            KNOWN_CONTRACT_VERSIONS.contains(&version)
+        };
+        if !supported {
             return Err(SecurityError::UnsupportedContractVersion(version));
         }
     }
@@ -400,7 +413,8 @@ pub(crate) mod tests {
             toolchain_id: Some(TOOLCHAIN.to_string()),
             development_exceptions: false,
             trust_root_key_ids: Vec::new(),
-            build_manifest_keys: Vec::new(),
+            release_root: None,
+            min_delegations_version: 1,
         }
     }
 
@@ -409,7 +423,7 @@ pub(crate) mod tests {
         format!(
             "app_id: app\nbase_url: https://updates.example.com\npatch_public_key: {KEY}\n\
              patch_verification: strict\npatch_response_verification: required\n\
-             security_profile: hardened\nsecurity_contract_version: 1\ntoolchain_id: {TOOLCHAIN}"
+             security_profile: hardened\nsecurity_contract_version: 2\ntoolchain_id: {TOOLCHAIN}"
         )
     }
 
@@ -439,13 +453,42 @@ pub(crate) mod tests {
         // A plain `cargo test` builds legacy. CI/verification also runs this
         // module with SHOREBIRD_SECURITY_PROFILE=hardened to prove build.rs
         // carries the inputs into the constants.
-        let expected = crate::security_inputs::parse_compiled_inputs(
-            option_env!("SHOREBIRD_SECURITY_PROFILE"),
-            option_env!("SHOREBIRD_TOOLCHAIN_ID"),
-            option_env!("SHOREBIRD_SECURITY_DEVELOPMENT_EXCEPTIONS"),
-            option_env!("SHOREBIRD_TRUST_ROOT_KEY_IDS"),
-            option_env!("SHOREBIRD_BUILD_MANIFEST_KEYS"),
-        )
+        let build_env = [
+            (
+                "SHOREBIRD_SECURITY_PROFILE",
+                option_env!("SHOREBIRD_SECURITY_PROFILE"),
+            ),
+            (
+                "SHOREBIRD_TOOLCHAIN_ID",
+                option_env!("SHOREBIRD_TOOLCHAIN_ID"),
+            ),
+            (
+                "SHOREBIRD_SECURITY_DEVELOPMENT_EXCEPTIONS",
+                option_env!("SHOREBIRD_SECURITY_DEVELOPMENT_EXCEPTIONS"),
+            ),
+            (
+                "SHOREBIRD_TRUST_ROOT_KEY_IDS",
+                option_env!("SHOREBIRD_TRUST_ROOT_KEY_IDS"),
+            ),
+            (
+                "SHOREBIRD_RELEASE_ROOT",
+                option_env!("SHOREBIRD_RELEASE_ROOT"),
+            ),
+            (
+                "SHOREBIRD_RELEASE_MIN_DELEGATIONS_VERSION",
+                option_env!("SHOREBIRD_RELEASE_MIN_DELEGATIONS_VERSION"),
+            ),
+            (
+                "SHOREBIRD_BUILD_MANIFEST_KEYS",
+                option_env!("SHOREBIRD_BUILD_MANIFEST_KEYS"),
+            ),
+        ];
+        let expected = crate::security_inputs::parse_compiled_inputs(&|name: &str| {
+            build_env
+                .iter()
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, v)| v.map(str::to_string))
+        })
         .unwrap();
         let policy = build_time_policy();
         assert_eq!(policy.profile.as_str(), expected.profile);
@@ -456,7 +499,11 @@ pub(crate) mod tests {
             expected.development_exceptions
         );
         assert_eq!(policy.trust_root_key_ids, expected.trust_root_key_ids);
-        assert_eq!(policy.build_manifest_keys, expected.build_manifest_keys);
+        assert_eq!(policy.release_root, expected.release_root);
+        assert_eq!(
+            policy.min_delegations_version,
+            expected.min_delegations_version
+        );
         if option_env!("SHOREBIRD_SECURITY_PROFILE").is_none() {
             assert_eq!(policy, CompiledPolicy::legacy());
         }
@@ -599,16 +646,39 @@ pub(crate) mod tests {
             admit_text(&hardened(), &edited("security_contract_version", None)),
             Err(SecurityError::MissingContractVersion)
         );
-        assert_eq!(
-            admit_text(&hardened(), &edited("security_contract_version", Some("2"))),
-            Err(SecurityError::UnsupportedContractVersion(2))
-        );
+        // Contract v1 (a P1-P3 bundle with a bare manifest key) and unknown
+        // versions are refused by a contract v2 hardened updater.
+        for (version, number) in [("1", 1), ("3", 3)] {
+            assert_eq!(
+                admit_text(
+                    &hardened(),
+                    &edited("security_contract_version", Some(version))
+                ),
+                Err(SecurityError::UnsupportedContractVersion(number))
+            );
+        }
         assert_eq!(
             admit_text(
                 &hardened(),
                 &edited("security_profile", Some("hardened-diversified"))
             ),
             Err(SecurityError::ReservedProfile)
+        );
+    }
+
+    #[test]
+    fn legacy_accepts_known_contract_versions_only() {
+        let legacy = CompiledPolicy::legacy();
+        for version in ["1", "2"] {
+            assert!(admit_text(
+                &legacy,
+                &format!("app_id: app\nsecurity_contract_version: {version}")
+            )
+            .is_ok());
+        }
+        assert_eq!(
+            admit_text(&legacy, "app_id: app\nsecurity_contract_version: 3"),
+            Err(SecurityError::UnsupportedContractVersion(3))
         );
     }
 

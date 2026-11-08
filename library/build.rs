@@ -50,22 +50,14 @@ fn generate_compiled_security_policy() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    let mut values = Vec::new();
     for name in security_inputs::ALL_ENV {
         println!("cargo:rerun-if-env-changed={name}");
-        values.push(match env::var(name) {
-            Ok(value) => Some(value),
-            Err(env::VarError::NotPresent) => None,
-            Err(env::VarError::NotUnicode(_)) => panic!("{name} is not valid UTF-8"),
-        });
     }
-    let inputs = security_inputs::parse_compiled_inputs(
-        values[0].as_deref(),
-        values[1].as_deref(),
-        values[2].as_deref(),
-        values[3].as_deref(),
-        values[4].as_deref(),
-    )
+    let inputs = security_inputs::parse_compiled_inputs(&|name: &str| match env::var(name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} is not valid UTF-8"),
+    })
     .unwrap_or_else(|error| panic!("Invalid compiled security policy: {error}"));
     if inputs.development_exceptions {
         println!(
