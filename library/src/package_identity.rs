@@ -307,8 +307,18 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_adapter_reads_the_running_signature() {
-        // cargo's test binaries are ad-hoc signed by the linker: valid, but
-        // without a team. A manifest naming any team therefore rejects them.
-        assert_eq!(macos_running_team_id(), Ok(None));
+        // On Apple silicon the linker ad-hoc signs cargo's test binaries:
+        // valid, but without a team. On Intel it leaves them unsigned, which
+        // SecCodeCheckValidity reports as errSecCSUnsigned (-67062). Either
+        // way no team is attested, so a manifest naming one rejects them.
+        let result = macos_running_team_id();
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(result, Ok(None));
+        } else {
+            assert!(
+                result == Ok(None) || result.as_ref().is_err_and(|e| e.contains("(-67062)")),
+                "{result:?}"
+            );
+        }
     }
 }
