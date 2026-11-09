@@ -227,6 +227,123 @@ pub fn macos_running_team_id() -> Result<Option<String>, String> {
     }
 }
 
+/// Lowercase hex SHA-256 of the DER leaf certificate of the primary
+/// Authenticode signer of the PE file at `path` (hardening P6, contract §12).
+///
+/// The file is opened once, without write or delete sharing, so it cannot be
+/// replaced while it is checked. Its bytes must measure to
+/// `expected_measurement` (the measurement of the loaded module), which ties
+/// the signer to the module the gate measured, and `WinVerifyTrust` then
+/// verifies the signature of that same open handle: the file digest, the
+/// signature and a chain to a trusted root, with revocation checking off and
+/// no network retrieval, so the check never blocks startup on the network.
+/// Only full success is accepted. A signature without an RFC 3161 timestamp
+/// stops verifying once its certificate expires, so release signing must
+/// timestamp (`signtool sign /tr ... /td sha256`).
+#[cfg(target_os = "windows")]
+pub fn windows_module_signers(
+    path: &std::path::Path,
+    expected_measurement: &str,
+) -> Result<Vec<String>, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::WinTrust::{
+        WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
+        WTHelperProvDataFromStateData, WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2,
+        WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
+        WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    };
+    const FILE_SHARE_READ: u32 = 0x1;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| format!("cannot open the engine module: {e}"))?;
+    let mut image = Vec::new();
+    file.read_to_end(&mut image)
+        .map_err(|e| format!("cannot read the engine module: {e}"))?;
+    let measured = crate::module_measurement::measure_pe_file(&image).map_err(|e| e.to_string())?;
+    if measured != expected_measurement {
+        return Err("the engine module file differs from the loaded module".into());
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: wide.as_ptr(),
+        hFile: file.as_raw_handle() as HANDLE,
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // SAFETY: `data`, `file_info`, `wide` and `file` outlive both calls; the
+    // state opened by STATEACTION_VERIFY is closed below on every path, and
+    // the provider pointers are read only while it is open.
+    unsafe {
+        let status = WinVerifyTrust(
+            std::ptr::null_mut(),
+            &mut action,
+            &mut data as *mut WINTRUST_DATA as *mut core::ffi::c_void,
+        );
+        let result = if status != 0 {
+            Err(format!(
+                "Authenticode verification failed (0x{:08x})",
+                status as u32
+            ))
+        } else {
+            let provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+            let signer = if provider.is_null() {
+                std::ptr::null_mut()
+            } else {
+                WTHelperGetProvSignerFromChain(provider, 0, 0, 0)
+            };
+            let certificate = if signer.is_null() {
+                std::ptr::null_mut()
+            } else {
+                WTHelperGetProvCertFromChain(signer, 0)
+            };
+            if certificate.is_null() || (*certificate).pCert.is_null() {
+                Err("Authenticode signature has no signer certificate".into())
+            } else {
+                let context = &*(*certificate).pCert;
+                let der = std::slice::from_raw_parts(
+                    context.pbCertEncoded,
+                    context.cbCertEncoded as usize,
+                );
+                Ok(vec![hex::encode(Sha256::digest(der))])
+            }
+        };
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(
+            std::ptr::null_mut(),
+            &mut action,
+            &mut data as *mut WINTRUST_DATA as *mut core::ffi::c_void,
+        );
+        result
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

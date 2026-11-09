@@ -205,6 +205,26 @@ pub struct PackageIdentity {
     pub android_signing_cert_sha256: Vec<String>,
     /// Apple team identifiers the running macOS app may be signed by.
     pub apple_team_ids: Vec<String>,
+    /// Lowercase hex SHA-256 of the DER leaf certificate(s) the loaded
+    /// Windows engine module's Authenticode signer may have (contract §12,
+    /// P6). Optional: absent means no Windows identity, and a manifest
+    /// without it is byte-identical to the pre-P6 form. Present, it must not
+    /// be empty.
+    #[serde(default, deserialize_with = "present_list")]
+    pub windows_signing_cert_sha256: Option<Vec<String>>,
+}
+
+impl PackageIdentity {
+    /// The declared Windows signer digests (empty when none is declared).
+    pub fn windows_signers(&self) -> &[String] {
+        self.windows_signing_cert_sha256.as_deref().unwrap_or(&[])
+    }
+}
+
+fn present_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Build manifest, contract v2 (or v3: v2 plus `diversification_profile_id`).
@@ -375,6 +395,10 @@ fn validate_shape(manifest: &BuildManifest, v3: bool) -> Result<(), IntegrityFai
                 && t.bytes()
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
         })
+        || identity
+            .windows_signing_cert_sha256
+            .as_ref()
+            .is_some_and(|list| list.is_empty() || !list.iter().all(|d| is_lower_hex(d, 64)))
     {
         return malformed("package identity");
     }
@@ -389,6 +413,10 @@ pub trait Observer {
     /// Team identifier of the running macOS process, after checking its
     /// code signature.
     fn apple_team_id(&self) -> Result<Option<String>, String>;
+    /// Leaf certificate digests of the Authenticode signer of the loaded
+    /// Windows engine module `module` (whose bytes must still measure to
+    /// its measurement).
+    fn windows_signers(&self, module: &RunningModule) -> Result<Vec<String>, String>;
 }
 
 /// The real platform observer.
@@ -417,13 +445,19 @@ impl Observer for PlatformObserver<'_> {
         #[cfg(not(target_os = "macos"))]
         Err("unsupported".to_string())
     }
-}
 
-/// Module-measurement binding per platform. flutter_tools binds every
-/// platform except Android, whose engine library reaches the build through
-/// Gradle (P6); there the APK signer identity anchors the packaged library.
-fn module_binding_required(platform: &str) -> bool {
-    platform != "android"
+    fn windows_signers(&self, module: &RunningModule) -> Result<Vec<String>, String> {
+        #[cfg(target_os = "windows")]
+        return crate::package_identity::windows_module_signers(
+            Path::new(&module.path),
+            &module.measurement,
+        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = module;
+            Err("unsupported".to_string())
+        }
+    }
 }
 
 /// The gate. `platform`/`arch` are the updater's `current_platform()` and
@@ -468,21 +502,19 @@ pub fn evaluate(
         return Err(IntegrityFailure::ConfigDigestMismatch);
     }
 
-    match manifest
+    // Every platform binds its engine module. Android has done so since P6
+    // (contract §12): flutter_tools measures the `libflutter.so` that Gradle
+    // resolves from Maven and packages.
+    let entry = manifest
         .modules
         .iter()
         .find(|m| m.platform == platform && m.arch == arch)
-    {
-        Some(entry) => {
-            let running = observer
-                .running_module()
-                .map_err(|e| IntegrityFailure::ModuleUnmeasurable(e.to_string()))?;
-            if running.measurement != entry.measurement {
-                return Err(IntegrityFailure::ModuleMismatch);
-            }
-        }
-        None if module_binding_required(platform) => return Err(IntegrityFailure::ModuleUnbound),
-        None => {}
+        .ok_or(IntegrityFailure::ModuleUnbound)?;
+    let running = observer
+        .running_module()
+        .map_err(|e| IntegrityFailure::ModuleUnmeasurable(e.to_string()))?;
+    if running.measurement != entry.measurement {
+        return Err(IntegrityFailure::ModuleMismatch);
     }
 
     let identity = &manifest.package_identity;
@@ -506,6 +538,18 @@ pub fn evaluate(
             {
                 Some(team) if identity.apple_team_ids.contains(&team) => {}
                 _ => return Err(IntegrityFailure::PackageIdentityMismatch),
+            }
+        }
+        "windows" if !identity.windows_signers().is_empty() => {
+            let signers = observer
+                .windows_signers(&running)
+                .map_err(IntegrityFailure::PackageIdentityUnavailable)?;
+            if signers.is_empty()
+                || !signers
+                    .iter()
+                    .all(|s| identity.windows_signers().contains(s))
+            {
+                return Err(IntegrityFailure::PackageIdentityMismatch);
             }
         }
         // A declared identity that this platform cannot verify fails closed.
@@ -535,6 +579,7 @@ pub fn check(
     if !policy.is_hardened() {
         return Ok(());
     }
+    let started = std::time::Instant::now();
     let result = evaluate(
         policy,
         source,
@@ -542,16 +587,20 @@ pub fn check(
         crate::config::current_arch(),
         &PlatformObserver { install_dir },
     );
+    // Startup cost of the gate (P6 measurement): a monotonic duration, never
+    // a wall-clock reading, logged in a stable form the device runbooks parse.
+    let micros = started.elapsed().as_micros();
     *STATUS.lock().unwrap_or_else(|e| e.into_inner()) = match &result {
         Ok(()) => "ok",
         Err(failure) => failure.code(),
     };
     match &result {
-        Ok(()) => shorebird_info!("Integrity check passed"),
+        Ok(()) => shorebird_info!("Integrity check passed ({} us)", micros),
         Err(failure) => shorebird_error!(
-            "{}. Patches and protected keys are disabled; the bundled release runs. \
-             Reinstall the app from its original source.",
-            failure
+            "{} ({} us). Patches and protected keys are disabled; the bundled \
+             release runs. Reinstall the app from its original source.",
+            failure,
+            micros
         ),
     }
     result
@@ -732,6 +781,7 @@ pub(crate) mod tests {
         module: Result<RunningModule, MeasureError>,
         signers: Result<Vec<String>, String>,
         team: Result<Option<String>, String>,
+        windows: Result<Vec<String>, String>,
     }
 
     const MEASUREMENT: &str =
@@ -746,6 +796,7 @@ pub(crate) mod tests {
                 }),
                 signers: Ok(vec!["aa".repeat(32)]),
                 team: Ok(Some("ABCDE12345".into())),
+                windows: Ok(vec!["dd".repeat(32)]),
             }
         }
     }
@@ -759,6 +810,13 @@ pub(crate) mod tests {
         }
         fn apple_team_id(&self) -> Result<Option<String>, String> {
             self.team.clone()
+        }
+        fn windows_signers(&self, module: &RunningModule) -> Result<Vec<String>, String> {
+            assert_eq!(
+                module.measurement, MEASUREMENT,
+                "signer read for another module"
+            );
+            self.windows.clone()
         }
     }
 
@@ -990,20 +1048,21 @@ pub(crate) mod tests {
             Err(IntegrityFailure::ModuleUnmeasurable(_))
         ));
         // A build for another architecture (or platform) binds nothing here.
+        // Since P6 that includes Android (contract §12): flutter_tools binds
+        // the Maven libflutter.so, so a missing entry is a refusal there too.
         for (platform, arch) in [
             ("linux", "aarch64"),
             ("windows", "x86_64"),
             ("ios", "aarch64"),
             ("macos", "x86_64"),
+            ("android", "aarch64"),
+            ("android", "arm"),
         ] {
             assert_eq!(
                 run(&text, platform, arch, &Fake::new()),
                 Err(IntegrityFailure::ModuleUnbound)
             );
         }
-        // Android binds the module when the build supplied it, and relies on
-        // the APK signer otherwise.
-        assert_eq!(run(&text, "android", "aarch64", &Fake::new()), Ok(()));
         let android = build(
             &config(),
             &module_entry("android", "aarch64", MEASUREMENT),
@@ -1014,6 +1073,20 @@ pub(crate) mod tests {
             run(&android, "android", "aarch64", &fake),
             Err(IntegrityFailure::ModuleUnmeasurable(_))
         ));
+        assert_eq!(run(&android, "android", "aarch64", &Fake::new()), Ok(()));
+        // An entry for another ABI does not bind this one.
+        assert_eq!(
+            run(&android, "android", "x86_64", &Fake::new()),
+            Err(IntegrityFailure::ModuleUnbound)
+        );
+        fake.module = Ok(RunningModule {
+            path: "libflutter.so".into(),
+            measurement: MEASUREMENT.replace('1', "3"),
+        });
+        assert_eq!(
+            run(&android, "android", "aarch64", &fake),
+            Err(IntegrityFailure::ModuleMismatch)
+        );
     }
 
     #[test]
@@ -1027,6 +1100,7 @@ pub(crate) mod tests {
         let modules = [
             module_entry("macos", "aarch64", MEASUREMENT),
             module_entry("ios", "aarch64", MEASUREMENT),
+            module_entry("android", "aarch64", MEASUREMENT),
         ]
         .join(",");
         let text = build(&config(), &modules, &identity, &SEED);
@@ -1070,6 +1144,137 @@ pub(crate) mod tests {
         assert_eq!(
             run(&text, "ios", "aarch64", &fake),
             Err(IntegrityFailure::PackageIdentityUnsupported)
+        );
+    }
+
+    /// A manifest bound to the Windows x86_64 module with `identity`.
+    fn windows_text(identity: &str) -> String {
+        build(
+            &config(),
+            &module_entry("windows", "x86_64", MEASUREMENT),
+            identity,
+            &SEED,
+        )
+    }
+
+    fn windows_identity(digests: &str) -> String {
+        format!(
+            "{{\"android_signing_cert_sha256\":[],\"apple_team_ids\":[],\
+             \"windows_signing_cert_sha256\":{digests}}}"
+        )
+    }
+
+    #[test]
+    fn windows_authenticode_identity_binds_the_module_signer() {
+        let ours = "dd".repeat(32);
+        let rotated = "ee".repeat(32);
+        let text = windows_text(&windows_identity(&format!("[\"{ours}\",\"{rotated}\"]")));
+        assert_eq!(run(&text, "windows", "x86_64", &Fake::new()), Ok(()));
+        let mut fake = Fake::new();
+        fake.windows = Ok(vec![rotated.clone()]);
+        assert_eq!(run(&text, "windows", "x86_64", &fake), Ok(()));
+        // Re-signed by another publisher.
+        fake.windows = Ok(vec!["cc".repeat(32)]);
+        assert_eq!(
+            run(&text, "windows", "x86_64", &fake),
+            Err(IntegrityFailure::PackageIdentityMismatch)
+        );
+        fake.windows = Ok(vec![]);
+        assert_eq!(
+            run(&text, "windows", "x86_64", &fake),
+            Err(IntegrityFailure::PackageIdentityMismatch)
+        );
+        // Unsigned, a broken signature, an untrusted chain, or a file that
+        // differs from the loaded module: no identity can be established.
+        fake.windows = Err("Authenticode verification failed (0x800b0100)".into());
+        assert!(matches!(
+            run(&text, "windows", "x86_64", &fake),
+            Err(IntegrityFailure::PackageIdentityUnavailable(_))
+        ));
+        // The identity is checked only after the module binding.
+        fake.module = Ok(RunningModule {
+            path: "flutter_windows.dll".into(),
+            measurement: MEASUREMENT.replace('1', "2"),
+        });
+        assert_eq!(
+            run(&text, "windows", "x86_64", &fake),
+            Err(IntegrityFailure::ModuleMismatch)
+        );
+        // Without a declaration the signer is never read (the Fake would
+        // fail its assertion), and other platforms ignore a Windows identity.
+        let mut unread = Fake::new();
+        unread.windows = Err("must not be read".into());
+        assert_eq!(
+            run(&windows_text(NO_IDENTITY), "windows", "x86_64", &unread),
+            Ok(())
+        );
+        let linux = build(
+            &config(),
+            &module_entry("linux", "x86_64", MEASUREMENT),
+            &windows_identity(&format!("[\"{ours}\"]")),
+            &SEED,
+        );
+        assert_eq!(run(&linux, "linux", "x86_64", &unread), Ok(()));
+    }
+
+    #[test]
+    fn windows_identity_shape_is_checked() {
+        for digests in [
+            "[]".to_string(),
+            format!("[\"{}\"]", "DD".repeat(32)),
+            format!("[\"{}\"]", "d".repeat(63)),
+            "null".to_string(),
+            "\"dd\"".to_string(),
+        ] {
+            let text = windows_text(&windows_identity(&digests));
+            assert!(
+                matches!(
+                    run(&text, "windows", "x86_64", &Fake::new()),
+                    Err(IntegrityFailure::ManifestMalformed(_))
+                ),
+                "{digests}"
+            );
+        }
+        // An unknown identity key is still refused.
+        let text =
+            windows_text("{\"android_signing_cert_sha256\":[],\"apple_team_ids\":[],\"linux\":[]}");
+        assert!(matches!(
+            run(&text, "windows", "x86_64", &Fake::new()),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_adapter_verifies_authenticode_on_the_open_file() {
+        use crate::module_measurement::measure_pe_file;
+        use crate::package_identity::windows_module_signers;
+        // Cargo's test binaries are unsigned: no identity.
+        let exe = std::env::current_exe().unwrap();
+        let measurement = measure_pe_file(&std::fs::read(&exe).unwrap()).unwrap();
+        let unsigned = windows_module_signers(&exe, &measurement);
+        assert!(
+            unsigned.as_ref().is_err_and(|e| e.contains("0x800b0100")),
+            "{unsigned:?}"
+        );
+        // A file that is not the measured module is refused before WinVerifyTrust.
+        let other = windows_module_signers(&exe, MEASUREMENT);
+        assert!(
+            other.as_ref().is_err_and(|e| e.contains("differs")),
+            "{other:?}"
+        );
+        // Boot-critical system images carry embedded Authenticode signatures
+        // that chain to a trusted root on every Windows installation.
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let signed = std::path::Path::new(&system).join(r"System32\ntoskrnl.exe");
+        let image = std::fs::read(&signed).unwrap();
+        let measurement = measure_pe_file(&image).unwrap();
+        let signers = windows_module_signers(&signed, &measurement).unwrap();
+        assert_eq!(signers.len(), 1);
+        assert!(is_lower_hex(&signers[0], 64), "{signers:?}");
+        assert_eq!(
+            windows_module_signers(&signed, &measurement).unwrap(),
+            signers
         );
     }
 
@@ -1142,6 +1347,46 @@ pub(crate) mod tests {
             ),
             Err(IntegrityFailure::ModuleMismatch)
         );
+    }
+
+    /// Host startup-cost evidence (P6): the uncached module measurement of
+    /// this test binary and the complete gate (trust chain, signature,
+    /// digests, cached measurement). The numbers are printed for the record;
+    /// the bound only catches a pathological regression. Device numbers come
+    /// from the "Integrity check passed (N us)" log line (contract §12).
+    #[test]
+    fn integrity_gate_startup_cost_on_this_host() {
+        let started = std::time::Instant::now();
+        let measured = measure_running_module().unwrap();
+        let measure_us = started.elapsed().as_micros();
+        let text = signed_hardened_yaml();
+        let observer = PlatformObserver {
+            install_dir: Path::new("."),
+        };
+        let platform = crate::config::current_platform();
+        let arch = crate::config::current_arch();
+        let mut gate_us = Vec::new();
+        for _ in 0..20 {
+            let started = std::time::Instant::now();
+            assert_eq!(
+                evaluate(
+                    &hardened_with_key(),
+                    &split_source(&text),
+                    platform,
+                    arch,
+                    &observer
+                ),
+                Ok(())
+            );
+            gate_us.push(started.elapsed().as_micros());
+        }
+        gate_us.sort_unstable();
+        eprintln!(
+            "integrity startup cost on {platform}/{arch}: module measurement {measure_us} us \
+             (module {}), gate p50 {} us, max {} us",
+            measured.path, gate_us[10], gate_us[19]
+        );
+        assert!(measure_us < 10_000_000 && gate_us[19] < 10_000_000);
     }
 
     /// A linux build output signed by `signer` under `delegations`, carried
