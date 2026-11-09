@@ -161,6 +161,29 @@ mod tests {
     }
 
     #[test]
+    fn diversified_policy_never_accepts_unsigned_content() {
+        // P5: hardened-diversified keeps the hardened signature rule.
+        let diversified = crate::security::tests::diversified();
+        for signature in [None, Some("garbage"), Some(SIGNATURE)] {
+            let error =
+                super::check_patch_signature_with_policy(&diversified, MESSAGE, signature, None)
+                    .unwrap_err();
+            assert!(error.to_string().contains("never accept unsigned"));
+        }
+        assert!(super::check_patch_signature_with_policy(
+            &diversified,
+            MESSAGE,
+            Some(SIGNATURE),
+            Some(PUBLIC_KEY)
+        )
+        .is_ok());
+        crate::security::testing_set_compiled_policy(Some(diversified));
+        let result = super::check_patch_signature(MESSAGE, None, None);
+        crate::security::testing_set_compiled_policy(None);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn check_patch_signature_verifies_when_signing_is_on() {
         assert!(super::check_patch_signature(MESSAGE, Some(SIGNATURE), Some(PUBLIC_KEY)).is_ok());
         let missing = super::check_patch_signature(MESSAGE, None, Some(PUBLIC_KEY));

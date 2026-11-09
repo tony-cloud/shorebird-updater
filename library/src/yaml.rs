@@ -28,7 +28,7 @@ pub enum PatchResponseVerificationMode {
 pub enum DeclaredProfile {
     Legacy,
     Hardened,
-    /// Reserved by contract v1; recognized only so it can be rejected.
+    /// Contract v3 (P5); only a hardened-diversified updater admits it.
     HardenedDiversified,
 }
 
@@ -82,6 +82,9 @@ pub struct YamlConfig {
     pub toolchain_id: Option<String>,
     /// `security_development_exceptions` declaration.
     pub security_development_exceptions: Option<bool>,
+    /// `diversification_profile_id` declaration (`sha256:<hex>`, contract
+    /// v3). Written only for hardened-diversified releases.
+    pub diversification_profile_id: Option<String>,
     /// Keys that appeared more than once (the last value wins, as before).
     /// A hardened policy rejects any duplicate; legacy ignores them.
     pub duplicate_keys: Vec<String>,
@@ -108,6 +111,7 @@ impl YamlConfig {
         let mut security_contract_version = None;
         let mut toolchain_id = None;
         let mut security_development_exceptions = None;
+        let mut diversification_profile_id = None;
         let mut seen_keys = std::collections::HashSet::new();
         let mut duplicate_keys = Vec::new();
 
@@ -172,6 +176,9 @@ impl YamlConfig {
                         })?);
                 }
                 "toolchain_id" => toolchain_id = Some(unquote(value).to_string()),
+                "diversification_profile_id" => {
+                    diversification_profile_id = Some(unquote(value).to_string())
+                }
                 "security_development_exceptions" => {
                     security_development_exceptions =
                         Some(unquote(value).parse::<bool>().map_err(|e| {
@@ -212,6 +219,7 @@ impl YamlConfig {
             security_contract_version,
             toolchain_id,
             security_development_exceptions,
+            diversification_profile_id,
             duplicate_keys,
             build_manifest: crate::integrity::split_source(yaml),
         })
@@ -421,7 +429,7 @@ mod security_declaration_tests {
     }
 
     #[test]
-    fn recognizes_reserved_profile_and_rejects_unknown_values() {
+    fn recognizes_the_diversified_profile_and_rejects_unknown_values() {
         let config =
             YamlConfig::from_yaml("app_id: a\nsecurity_profile: hardened-diversified").unwrap();
         assert_eq!(
@@ -440,6 +448,37 @@ mod security_declaration_tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn parses_the_diversification_profile_id() {
+        let id = format!("sha256:{}", "cd".repeat(32));
+        for quoted in [id.clone(), format!("\"{id}\""), format!("'{id}'")] {
+            let config = YamlConfig::from_yaml(&format!(
+                "app_id: a\nsecurity_profile: hardened-diversified\nsecurity_contract_version: 3\ndiversification_profile_id: {quoted}"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.security_profile,
+                Some(DeclaredProfile::HardenedDiversified)
+            );
+            assert_eq!(config.security_contract_version, Some(3));
+            assert_eq!(
+                config.diversification_profile_id.as_deref(),
+                Some(id.as_str())
+            );
+        }
+        assert_eq!(
+            YamlConfig::from_yaml("app_id: a")
+                .unwrap()
+                .diversification_profile_id,
+            None
+        );
+        let repeated = YamlConfig::from_yaml(&format!(
+            "app_id: a\ndiversification_profile_id: {id}\ndiversification_profile_id: x"
+        ))
+        .unwrap();
+        assert_eq!(repeated.duplicate_keys, vec!["diversification_profile_id"]);
     }
 
     #[test]

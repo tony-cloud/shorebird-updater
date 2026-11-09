@@ -563,11 +563,13 @@ mod tests {
     mod hardened_admission {
         use super::{fake_app_config, FakeExternalFileProvider};
         use crate::integrity::tests::{
-            hardened_with_key, manifest_json, module_entry, signed_hardened_yaml, signed_yaml,
-            token, NO_IDENTITY, SEED,
+            diversified_with_key, hardened_with_key, manifest_json, module_entry,
+            signed_diversified_yaml, signed_hardened_yaml, signed_yaml, token, NO_IDENTITY, SEED,
         };
         use crate::integrity::{IntegrityFailure, MANIFEST_KEY};
-        use crate::security::tests::{hardened, hardened_yaml_text};
+        use crate::security::tests::{
+            diversified_yaml_text, hardened, hardened_yaml_text, PROFILE_ID,
+        };
         use crate::security::{testing_set_compiled_policy, CompiledPolicy, SecurityError};
         use crate::yaml::{PatchResponseVerificationMode, PatchVerificationMode, YamlConfig};
         use crate::{network::NetworkHooks, testing_reset_config, InitError};
@@ -846,6 +848,84 @@ mod tests {
             )
             .unwrap();
             assert!(published());
+            testing_reset_config();
+            testing_set_compiled_policy(None);
+        }
+
+        #[serial]
+        #[test]
+        fn diversified_updater_boots_the_diversified_build_output() {
+            testing_reset_config();
+            testing_set_compiled_policy(Some(diversified_with_key()));
+            let text = diversified_yaml_text()
+                .replace("patch_verification: strict\n", "")
+                .replace("patch_response_verification: required\n", "");
+            configure(&signed_diversified_yaml(&text), false).unwrap();
+            let config = super::super::with_config(|c| Ok(c.clone())).unwrap();
+            testing_reset_config();
+            testing_set_compiled_policy(None);
+            assert_eq!(config.patch_verification, PatchVerificationMode::Strict);
+            assert_eq!(
+                config.patch_response_verification,
+                PatchResponseVerificationMode::Required
+            );
+        }
+
+        #[serial]
+        #[test]
+        fn diversified_refusals_publish_nothing_on_any_entry_point() {
+            let other = format!("sha256:{}", "0".repeat(64));
+            let with_other = diversified_yaml_text().replace(PROFILE_ID, &other);
+            let signed = signed_diversified_yaml(&diversified_yaml_text());
+            // Admission refusals: another or no profile, the hardened (v2)
+            // build output, a hardened declaration.
+            let admission = [
+                with_other.clone(),
+                diversified_yaml_text()
+                    .replace(&format!("\ndiversification_profile_id: {PROFILE_ID}"), ""),
+                hardened_yaml_text(),
+                signed_hardened_yaml(),
+                signed_diversified_yaml(&with_other),
+            ];
+            for text in &admission {
+                for checked in [false, true] {
+                    testing_reset_config();
+                    testing_set_compiled_policy(Some(diversified_with_key()));
+                    refusal(configure(text, checked));
+                    assert!(!published(), "{text}");
+                    assert!(crate::updater::next_boot_patch().is_err());
+                }
+            }
+            // Gate refusals: no manifest, a v2 token on the diversified
+            // declaration, a changed config.
+            let v2_token = signed_yaml(&diversified_yaml_text());
+            let gate = [
+                (format!("{}\n", diversified_yaml_text()), "manifest_missing"),
+                (v2_token, "manifest_malformed"),
+                (
+                    signed.replacen("updates.example.com", "attacker.example.com", 1),
+                    "config_digest_mismatch",
+                ),
+            ];
+            for (text, code) in &gate {
+                for checked in [false, true] {
+                    testing_reset_config();
+                    testing_set_compiled_policy(Some(diversified_with_key()));
+                    assert_eq!(integrity_refusal(configure(text, checked)).code(), *code);
+                    assert!(!published(), "{code}");
+                    assert!(crate::updater::next_boot_patch().is_err());
+                }
+            }
+            // A hardened updater refuses the diversified build output.
+            testing_reset_config();
+            testing_set_compiled_policy(Some(hardened_with_key()));
+            refusal(configure(&signed, false));
+            assert!(!published());
+            // So does a legacy one.
+            testing_reset_config();
+            testing_set_compiled_policy(Some(CompiledPolicy::legacy()));
+            refusal(configure(&signed, false));
+            assert!(!published());
             testing_reset_config();
             testing_set_compiled_policy(None);
         }

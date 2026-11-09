@@ -980,12 +980,22 @@ mod tests {
 
         #[test]
         fn hardened_download_refuses_http_before_any_request() {
+            for policy in [
+                crate::security::tests::hardened(),
+                // P5: hardened-diversified is hardened for every transport rule.
+                crate::security::tests::diversified(),
+            ] {
+                hardened_download_refuses_http_under(policy);
+            }
+        }
+
+        fn hardened_download_refuses_http_under(policy: crate::security::CompiledPolicy) {
             let tmp = tempfile::tempdir().unwrap();
             let refusing = NetworkHooks {
                 download_to_path_fn: refusing_hook,
                 ..NetworkHooks::default()
             };
-            testing_set_compiled_policy(Some(crate::security::tests::hardened()));
+            testing_set_compiled_policy(Some(policy));
             let http = download_to_path(
                 &refusing,
                 "http://cdn.example.com/p",

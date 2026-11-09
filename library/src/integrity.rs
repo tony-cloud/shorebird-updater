@@ -1,12 +1,18 @@
 //! Startup integrity gate for hardened releases (hardening stage P3,
 //! contract `docs/HARDENING_CONTRACTS.md` §9; release root of trust from
-//! stage P4, contract v2, §10 in the workspace).
+//! stage P4, contract v2, §10; hardened-diversified from stage P5, contract
+//! v3, §11 in the workspace).
 //!
 //! A hardened build appends one line to the bundled shorebird.yaml:
 //!
 //! ```text
 //! shorebird_build_manifest: v2.<b64url(manifest JSON)>.<b64url(Ed25519 signature)>.<b64url(release-trust JSON)>
 //! ```
+//!
+//! A hardened-diversified build writes the same line with the `v3.` prefix;
+//! its manifest also binds `diversification_profile_id`. The signature
+//! domain is unchanged: the token prefix and the manifest's contract version
+//! separate the versions, and each gate accepts exactly one of them.
 //!
 //! The manifest is signed by a `build-manifest` key that the release-trust
 //! bundle delegates under the release root compiled into the engine (GN
@@ -40,8 +46,10 @@ use std::path::Path;
 
 /// The YAML key carrying the signed manifest; always the last line.
 pub const MANIFEST_KEY: &str = "shorebird_build_manifest";
-/// Token version prefix (contract v2).
+/// Token version prefix (contract v2, hardened).
 pub const TOKEN_PREFIX: &str = "v2.";
+/// Token version prefix (contract v3, hardened-diversified).
+pub const TOKEN_PREFIX_V3: &str = "v3.";
 /// Ed25519 signs this prefix followed by the lowercase hex SHA-256 of the
 /// manifest JSON bytes.
 pub const SIGNATURE_DOMAIN: &str = "open-shorebird.build-manifest-signature.v2:";
@@ -199,8 +207,8 @@ pub struct PackageIdentity {
     pub apple_team_ids: Vec<String>,
 }
 
-/// Build manifest, contract v2. Every field is required; unknown fields and
-/// duplicate fields are rejected.
+/// Build manifest, contract v2 (or v3: v2 plus `diversification_profile_id`).
+/// Every field is required; unknown fields and duplicate fields are rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildManifest {
@@ -216,6 +224,36 @@ pub struct BuildManifest {
     pub config_sha256: String,
     pub modules: Vec<ModuleEntry>,
     pub package_identity: PackageIdentity,
+    /// Contract v3 only. `None` when the key is absent; a present key (even
+    /// `null`) is `Some`, so a v2 manifest cannot carry it at all.
+    #[serde(default, deserialize_with = "present")]
+    pub diversification_profile_id: Option<serde_json::Value>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+impl BuildManifest {
+    /// The declared diversification profile ID (shape checked by
+    /// [`verify_token`]).
+    pub fn diversification_profile_id(&self) -> Option<&str> {
+        self.diversification_profile_id
+            .as_ref()
+            .and_then(|value| value.as_str())
+    }
+}
+
+/// The one token prefix a policy accepts: `v3.` for hardened-diversified,
+/// `v2.` otherwise.
+pub fn token_prefix(policy: &CompiledPolicy) -> &'static str {
+    if policy.profile == crate::security::SecurityProfile::HardenedDiversified {
+        TOKEN_PREFIX_V3
+    } else {
+        TOKEN_PREFIX
+    }
 }
 
 fn is_lower_hex(value: &str, len: usize) -> bool {
@@ -237,8 +275,10 @@ pub fn verify_token(
     token: &str,
 ) -> Result<BuildManifest, IntegrityFailure> {
     let malformed = |why: &str| IntegrityFailure::ManifestMalformed(why.to_string());
+    // A hardened gate refuses a v3 token and a diversified gate a v2 one.
+    let v3 = token_prefix(policy) == TOKEN_PREFIX_V3;
     let body = token
-        .strip_prefix(TOKEN_PREFIX)
+        .strip_prefix(token_prefix(policy))
         .ok_or_else(|| malformed("unknown token version"))?;
     let mut parts = body.split('.');
     let (Some(manifest_b64), Some(signature_b64), Some(trust_b64), None) =
@@ -288,7 +328,7 @@ pub fn verify_token(
     if manifest.signer_key_id != selector.signer_key_id {
         return Err(malformed("signer_key_id"));
     }
-    validate_shape(&manifest)?;
+    validate_shape(&manifest, v3)?;
     // The manifest names the delegations it was signed under; another
     // (older or newer) delegations document is not a substitute.
     if manifest.delegations_sha256 != hex::encode(trust.delegations_sha256) {
@@ -297,8 +337,14 @@ pub fn verify_token(
     Ok(manifest)
 }
 
-fn validate_shape(manifest: &BuildManifest) -> Result<(), IntegrityFailure> {
+fn validate_shape(manifest: &BuildManifest, v3: bool) -> Result<(), IntegrityFailure> {
     let malformed = |why: &str| Err(IntegrityFailure::ManifestMalformed(why.to_string()));
+    // v3 requires a `sha256:` profile ID; v2 must not mention the key.
+    match (&manifest.diversification_profile_id, v3) {
+        (None, false) => {}
+        (Some(serde_json::Value::String(id)), true) if is_sha256_id(id) => {}
+        _ => return malformed("diversification_profile_id"),
+    }
     if !is_lower_hex(&manifest.config_sha256, 64) {
         return malformed("config_sha256");
     }
@@ -401,11 +447,16 @@ pub fn evaluate(
     if manifest.schema != MANIFEST_SCHEMA {
         return Err(IntegrityFailure::PolicyMismatch("schema"));
     }
-    if manifest.contract_version != crate::security::SECURITY_CONTRACT_VERSION {
+    if manifest.contract_version != policy.contract_version() {
         return Err(IntegrityFailure::PolicyMismatch("contract_version"));
     }
     if manifest.security_profile != policy.profile.as_str() {
         return Err(IntegrityFailure::PolicyMismatch("security_profile"));
+    }
+    if manifest.diversification_profile_id() != policy.diversification_profile_id.as_deref() {
+        return Err(IntegrityFailure::PolicyMismatch(
+            "diversification_profile_id",
+        ));
     }
     if Some(&manifest.toolchain_id) != policy.toolchain_id.as_ref() {
         return Err(IntegrityFailure::PolicyMismatch("toolchain_id"));
@@ -511,7 +562,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::module_measurement::RunningModule;
     use crate::release_trust::tests as trust;
-    use crate::security::tests::{hardened, hardened_yaml_text, TOOLCHAIN};
+    use crate::security::tests::{
+        diversified, diversified_yaml_text, hardened, hardened_yaml_text, PROFILE_ID, TOOLCHAIN,
+    };
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     /// The delegated build-manifest key of the default test trust.
@@ -577,6 +630,15 @@ pub(crate) mod tests {
     }
 
     pub fn token_with_trust(seed: &[u8; 32], manifest: &str, bundle: &str) -> String {
+        token_with_prefix(TOKEN_PREFIX, seed, manifest, bundle)
+    }
+
+    pub fn token_with_prefix(
+        prefix: &str,
+        seed: &[u8; 32],
+        manifest: &str,
+        bundle: &str,
+    ) -> String {
         let pair = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
         let message = format!(
             "{SIGNATURE_DOMAIN}{}",
@@ -584,7 +646,7 @@ pub(crate) mod tests {
         );
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         format!(
-            "{TOKEN_PREFIX}{}.{}.{}",
+            "{prefix}{}.{}.{}",
             b64.encode(manifest),
             b64.encode(pair.sign(message.as_bytes())),
             b64.encode(bundle)
@@ -620,6 +682,50 @@ pub(crate) mod tests {
 
     pub fn signed_hardened_yaml() -> String {
         signed_yaml(&hardened_yaml_text())
+    }
+
+    /// The hardened-diversified test policy with the test release root.
+    pub fn diversified_with_key() -> CompiledPolicy {
+        CompiledPolicy {
+            release_root: hardened_with_key().release_root,
+            ..diversified()
+        }
+    }
+
+    /// A hardened manifest turned into the contract v3 manifest a
+    /// diversified build signs (`id` is the declared profile ID).
+    pub fn v3_manifest(manifest: &str, id: &str) -> String {
+        manifest
+            .replacen("\"contract_version\":2", "\"contract_version\":3", 1)
+            .replacen(
+                "\"security_profile\":\"hardened\"",
+                "\"security_profile\":\"hardened-diversified\"",
+                1,
+            )
+            .replacen(
+                "\"development_exceptions\":false,",
+                &format!(
+                    "\"development_exceptions\":false,\"diversification_profile_id\":\"{id}\","
+                ),
+                1,
+            )
+    }
+
+    pub fn v3_token(seed: &[u8; 32], manifest: &str) -> String {
+        token_with_prefix(TOKEN_PREFIX_V3, seed, manifest, &trust::default_bundle())
+    }
+
+    /// A diversified YAML as the build writes it, bound to this process's
+    /// module.
+    pub fn signed_diversified_yaml(config: &str) -> String {
+        let signed = signed_yaml(config);
+        let (head, token) = signed.rsplit_once(&format!("{MANIFEST_KEY}: ")).unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let manifest = b64
+            .decode(token.trim_end().split('.').nth(1).unwrap())
+            .unwrap();
+        let manifest = v3_manifest(std::str::from_utf8(&manifest).unwrap(), PROFILE_ID);
+        format!("{head}{MANIFEST_KEY}: {}\n", v3_token(&SEED, &manifest))
     }
 
     struct Fake {
@@ -1264,12 +1370,263 @@ pub(crate) mod tests {
         );
     }
 
+    /// The exact output of flutter_tools' `appendShorebirdBuildManifest` for
+    /// the same input as [`FLUTTER_TOOLS_OUTPUT`] built hardened-diversified
+    /// with the DEVELOPMENT-ONLY diversification profile
+    /// (`shorebird_build_manifest_test.dart`, "matches the v3 token the
+    /// updater verifies"): the v3 token format, the profile binding and the
+    /// unchanged signature domain agree across the two implementations.
+    const FLUTTER_TOOLS_V3_OUTPUT: &str = concat!(
+        "app_id: app\nbase_url: https://updates.example.com\n",
+        "shorebird_build_manifest: ",
+        "v3.eyJzY2hlbWEiOiJvcGVuLXNob3JlYmlyZC5idWlsZC1tYW5pZmVzdCIsImNvbnRyYWN0X3ZlcnNpb24iOjMsInNlY3VyaXR5X3Byb2ZpbGUiOiJoYXJkZW5lZC1kaXZlcnNpZmllZCIsInRvb2xjaGFpbl9pZCI6InNoYTI1Njo3MDIyOWU0MDdlNTMxMTQwMWFhMzI1MTQxOGVmZjEwNjQ2N2E3NTBjY2ZjYjdlOGZlN2I2MWM0NDQyNzAwMDQwIiwiZGV2ZWxvcG1lbnRfZXhjZXB0aW9ucyI6ZmFsc2UsImRpdmVyc2lmaWNhdGlvbl9wcm9maWxlX2lkIjoic2hhMjU2OjgzMjg1NmQwYmVkMjc4MzM0MzRlM2YyNmI2NWQwM2NlZGMzMTNmOTg1MGMyNTc3Y2E3NTY1YzRkYzY0NGY0NmQiLCJzaWduZXJfa2V5X2lkIjoic2hhMjU2OmZlODEyYzEyZjNhYjRjZTZhYzVkYjY5YWMzNTJmOTA2Y2IxYjExZWY0M2ZiMzNlMjUyZWY3ZmY1NTIyNjM4ODkiLCJkZWxlZ2F0aW9uc19zaGEyNTYiOiI3OWE2MDRmZjkxZDY4YWFkY2JkMTJjNGZhNGEzZTQyYzVkY2UyYjRkOWNlNzFhMWVmMjJkYzM5NzdjYjk5NGRmIiwiY29uZmlnX3NoYTI1NiI6IjA4NGM4ZDY1NDI4NGMwZmNmOTJlZDllODE0MTRhMTVkZDE5NTMyNjEyZTYzMDFkOWUxODRlNGUwZTYyNDI2YzQiLCJtb2R1bGVzIjpbeyJwbGF0Zm9ybSI6ImxpbnV4IiwiYXJjaCI6Ing4Nl82NCIsIm1lYXN1cmVtZW50Ijoic2hhMjU2OmYxNzcxNjkyNDUxODZiZThlMGZhMmU4ZTZmZmI5ZGY3MGY4ZGQwODI0YzhmMzA1YzA2ZTE3ZjMwZjYzOTkxY2QifV0sInBhY2thZ2VfaWRlbnRpdHkiOnsiYW5kcm9pZF9zaWduaW5nX2NlcnRfc2hhMjU2IjpbXSwiYXBwbGVfdGVhbV9pZHMiOltdfX0.7ENISJNDkATY08LKzMmG06cTNqDolWt8yE7q516TfjdapJmY-H0tlhT2s5JekK5N0vRyUuyHVF_FjJZb7JDBAw.eyJjb250cmFjdF92ZXJzaW9uIjoyLCJkZWxlZ2F0aW9ucyI6eyJwYXlsb2FkIjoiZXlKamIyNTBjbUZqZEY5MlpYSnphVzl1SWpveUxDSmxlSEJwY21WelgyRjBJam9pTWpBek5pMHhNUzB3TVZRd01Eb3dNRG93TUZvaUxDSnBjM04xWldSZllYUWlPaUl5TURJMkxURXhMVEF4VkRBd09qQXdPakF3V2lJc0luSmxkbTlyWldSZmEyVjVYMmxrY3lJNlcxMHNJbkp2YkdWeklqcDdJbUZ5ZEdsbVlXTjBMV05oZEdGc2IyY2lPbHQ3SW10bGVWOXBaQ0k2SW5Ob1lUSTFOam80Tm1RME5tVXdPV1E1TW1JME1UTXhNREJpWWpZMVl6Rm1NRGs0TWpNMVpXUXlNMlJrWWpnMFpUQTRNV0kxTnpSak1qQmlaVEV4WkRFMVptUTJOVGcwSWl3aWJtOTBYMkZtZEdWeUlqb2lNakF6TmkweE1TMHdNVlF3TURvd01Eb3dNRm9pTENKdWIzUmZZbVZtYjNKbElqb2lNakF5TmkweE1TMHdNVlF3TURvd01Eb3dNRm9pTENKd2RXSnNhV05mYTJWNUlqb2lWblp6ZEVkMkwydGlNemxZTm5JelJqUjZWSEJZYUV0a1IyMTNVMEZHYTFkQ09YbzRMMUpyVVZoMGJ6MGlmVjBzSW1KMWFXeGtMVzFoYm1sbVpYTjBJanBiZXlKclpYbGZhV1FpT2lKemFHRXlOVFk2Wm1VNE1USmpNVEptTTJGaU5HTmxObUZqTldSaU5qbGhZek0xTW1ZNU1EWmpZakZpTVRGbFpqUXpabUl6TTJVeU5USmxaamRtWmpVMU1qSTJNemc0T1NJc0ltNXZkRjloWm5SbGNpSTZJakl3TXpZdE1URXRNREZVTURBNk1EQTZNREJhSWl3aWJtOTBYMkpsWm05eVpTSTZJakl3TWpZdE1URXRNREZVTURBNk1EQTZNREJhSWl3aWNIVmliR2xqWDJ0bGVTSTZJalpyY0hOWkswdGpWV2R4S3psV1FqZEZlVGRHSzFwV1NHUnhOaXQyYm5WVFVXZzNjV0ZTVWtjd2FYYzlJbjFkZlN3aWNtOXZkRjkyWlhKemFXOXVJam94TENKelkyaGxiV0VpT2lKdmNHVnVMWE5vYjNKbFltbHlaQzV5Wld4bFlYTmxMV1JsYkdWbllYUnBiMjV6SWl3aWRtVnljMmx2YmlJNk1YMD0iLCJzaWduYXR1cmVzIjpbeyJrZXlfaWQiOiJzaGEyNTY6MzQ3NTBmOThiZDU5ZmNmYzk0NmRhNDVhYWFiZTkzM2JlMTU0YTRiNTA5NGUxYzRhYmY0Mjg2NjUwNWYzYzk3ZSIsInNpZ25hdHVyZSI6ImI2NzQ1cFFFS2k4WHR4cHg3VzM5NlZqb1pWUWUxUXRNcUthWlJWeFJJcVJobk85NldnUngrK1lxdzFZeE1NR05XZEZYNlhwVnlDQkpQOGtjbEt3WUJBPT0ifV19LCJyb290X2NoYWluIjpbeyJwYXlsb2FkIjoiZXlKamIyNTBjbUZqZEY5MlpYSnphVzl1SWpveUxDSmxlSEJwY21WelgyRjBJam9pTWpBek5pMHhNUzB3T1ZRd01Eb3dNRG93TUZvaUxDSnJaWGx6SWpwYmV5SnJaWGxmYVdRaU9pSnphR0V5TlRZNk16UTNOVEJtT1RoaVpEVTVabU5tWXprME5tUmhORFZoWVdGaVpUa3pNMkpsTVRVMFlUUmlOVEE1TkdVeFl6UmhZbVkwTWpnMk5qVXdOV1l6WXprM1pTSXNJbkIxWW14cFkxOXJaWGtpT2lKcGIycHFNMWhSU2poYVdEbFZkSE4wVUV4d1pHTnpjRzVEWWpoa2JFSkpZamd6VTBsQllsRlFZakYzUFNKOVhTd2ljMk5vWlcxaElqb2liM0JsYmkxemFHOXlaV0pwY21RdWNtVnNaV0Z6WlMxeWIyOTBJaXdpZEdoeVpYTm9iMnhrSWpveExDSjJaWEp6YVc5dUlqb3hmUT09Iiwic2lnbmF0dXJlcyI6W3sia2V5X2lkIjoic2hhMjU2OjM0NzUwZjk4YmQ1OWZjZmM5NDZkYTQ1YWFhYmU5MzNiZTE1NGE0YjUwOTRlMWM0YWJmNDI4NjY1MDVmM2M5N2UiLCJzaWduYXR1cmUiOiJENE5KdWpSL3NZZHNHYWw4VS96VjhFUVY4ck1lZlc4UUR2NnNYdUMvVEd0Lys2YnArZGlpVS9VMjBwYit1VWEyaGxwaVZDTGxtcU1wb29UL2FycldEZz09In1dfV0sInNjaGVtYSI6Im9wZW4tc2hvcmViaXJkLnJlbGVhc2UtdHJ1c3QifQ\n",
+    );
+
+    #[test]
+    fn flutter_tools_v3_output_verifies() {
+        let mut fake = Fake::new();
+        fake.module = Ok(RunningModule {
+            path: "libflutter_linux_gtk.so".into(),
+            measurement: crate::module_measurement::tests::ELF64_GOLDEN.into(),
+        });
+        let source = split_source(FLUTTER_TOOLS_V3_OUTPUT);
+        assert_eq!(
+            evaluate(&diversified_with_key(), &source, "linux", "x86_64", &fake),
+            Ok(())
+        );
+        // A hardened updater refuses the v3 token, and the v2 output is
+        // refused by the diversified updater.
+        assert!(matches!(
+            evaluate(&hardened_with_key(), &source, "linux", "x86_64", &fake),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        assert!(matches!(
+            evaluate(
+                &diversified_with_key(),
+                &split_source(FLUTTER_TOOLS_OUTPUT),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        // A diversified updater compiled with another profile.
+        let mut other = diversified_with_key();
+        other.diversification_profile_id = Some(format!("sha256:{}", "0".repeat(64)));
+        assert_eq!(
+            evaluate(&other, &source, "linux", "x86_64", &fake),
+            Err(IntegrityFailure::PolicyMismatch(
+                "diversification_profile_id"
+            ))
+        );
+    }
+
     #[test]
     fn legacy_never_runs_the_gate() {
         let policy = CompiledPolicy::legacy();
         assert_eq!(
             check(&policy, &split_source("app_id: app"), Path::new(".")),
             Ok(())
+        );
+    }
+
+    fn run_diversified(text: &str) -> Result<(), IntegrityFailure> {
+        evaluate(
+            &diversified_with_key(),
+            &split_source(text),
+            "linux",
+            "x86_64",
+            &Fake::new(),
+        )
+    }
+
+    fn diversified_config() -> String {
+        format!("{}\n", diversified_yaml_text())
+    }
+
+    /// A linux diversified build output whose (v3) manifest is `edit`ed
+    /// before signing.
+    fn diversified_text(edit: &dyn Fn(String) -> String, prefix: &str) -> String {
+        let config = diversified_config();
+        let manifest = edit(v3_manifest(
+            &manifest_json(
+                &config,
+                &module_entry("linux", "x86_64", MEASUREMENT),
+                NO_IDENTITY,
+            ),
+            PROFILE_ID,
+        ));
+        format!(
+            "{config}{MANIFEST_KEY}: {}\n",
+            token_with_prefix(prefix, &SEED, &manifest, &trust::default_bundle())
+        )
+    }
+
+    #[test]
+    fn diversified_gate_accepts_the_v3_build_output() {
+        let text = diversified_text(&|m| m, TOKEN_PREFIX_V3);
+        assert_eq!(run_diversified(&text), Ok(()));
+        // Every hardened gate rule applies: a changed config, another module.
+        assert_eq!(
+            run_diversified(&text.replacen("app_id: app", "app_id: other", 1)),
+            Err(IntegrityFailure::ConfigDigestMismatch)
+        );
+        let mut fake = Fake::new();
+        fake.module = Ok(RunningModule {
+            path: "libflutter_linux_gtk.so".into(),
+            measurement: MEASUREMENT.replace('1', "2"),
+        });
+        assert_eq!(
+            evaluate(
+                &diversified_with_key(),
+                &split_source(&text),
+                "linux",
+                "x86_64",
+                &fake
+            ),
+            Err(IntegrityFailure::ModuleMismatch)
+        );
+        // Without a compiled release root it trusts nothing.
+        assert_eq!(
+            evaluate(
+                &diversified(),
+                &split_source(&text),
+                "linux",
+                "x86_64",
+                &Fake::new()
+            ),
+            Err(IntegrityFailure::TrustRootMissing)
+        );
+    }
+
+    #[test]
+    fn each_gate_accepts_only_its_own_token_version() {
+        // A hardened gate refuses a v3 token, a diversified gate a v2 one.
+        let v3 = diversified_text(&|m| m, TOKEN_PREFIX_V3);
+        assert!(matches!(
+            run(&v3, "linux", "x86_64", &Fake::new()),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        assert!(matches!(
+            run_diversified(&linux_text()),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        // The v3 manifest under a v2 token, and the v2 manifest under a v3
+        // token, are malformed as well (the key's presence follows the
+        // token version).
+        assert!(matches!(
+            run_diversified(&diversified_text(&|m| m, TOKEN_PREFIX)),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        let hardened_manifest = manifest_json(
+            &config(),
+            &module_entry("linux", "x86_64", MEASUREMENT),
+            NO_IDENTITY,
+        );
+        let v2_under_v3 = format!(
+            "{}{MANIFEST_KEY}: {}\n",
+            config(),
+            v3_token(&SEED, &hardened_manifest)
+        );
+        assert!(matches!(
+            evaluate(
+                &hardened_with_key(),
+                &split_source(&v2_under_v3),
+                "linux",
+                "x86_64",
+                &Fake::new()
+            ),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        assert!(matches!(
+            run_diversified(&v2_under_v3),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        // A v2 manifest that names a profile is malformed for a hardened gate.
+        let named = v3_manifest(&hardened_manifest, PROFILE_ID)
+            .replace("\"contract_version\":3", "\"contract_version\":2")
+            .replace("\"hardened-diversified\"", "\"hardened\"");
+        let text = format!("{}{MANIFEST_KEY}: {}\n", config(), token(&SEED, &named));
+        assert_eq!(
+            run(&text, "linux", "x86_64", &Fake::new()),
+            Err(IntegrityFailure::ManifestMalformed(
+                "diversification_profile_id".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn diversified_manifest_binds_the_compiled_profile() {
+        let other = format!("sha256:{}", "0".repeat(64));
+        let id = format!("\"diversification_profile_id\":\"{PROFILE_ID}\"");
+        let cases: Vec<(String, IntegrityFailure)> = vec![
+            (
+                format!("\"diversification_profile_id\":\"{other}\""),
+                IntegrityFailure::PolicyMismatch("diversification_profile_id"),
+            ),
+            (
+                "\"diversification_profile_id\":null".to_string(),
+                IntegrityFailure::ManifestMalformed("diversification_profile_id".to_string()),
+            ),
+            (
+                format!(
+                    "\"diversification_profile_id\":\"{}\"",
+                    PROFILE_ID.to_uppercase()
+                ),
+                IntegrityFailure::ManifestMalformed("diversification_profile_id".to_string()),
+            ),
+            (
+                "\"diversification_profile_id\":1".to_string(),
+                IntegrityFailure::ManifestMalformed("diversification_profile_id".to_string()),
+            ),
+        ];
+        for (replacement, expected) in cases {
+            let text = diversified_text(&|m| m.replace(&id, &replacement), TOKEN_PREFIX_V3);
+            assert_eq!(run_diversified(&text), Err(expected), "{replacement}");
+        }
+        // Missing and duplicated keys are malformed even when signed.
+        let missing = diversified_text(&|m| m.replace(&format!("{id},"), ""), TOKEN_PREFIX_V3);
+        assert_eq!(
+            run_diversified(&missing),
+            Err(IntegrityFailure::ManifestMalformed(
+                "diversification_profile_id".to_string()
+            ))
+        );
+        let duplicated =
+            diversified_text(&|m| m.replace(&id, &format!("{id},{id}")), TOKEN_PREFIX_V3);
+        assert!(matches!(
+            run_diversified(&duplicated),
+            Err(IntegrityFailure::ManifestMalformed(_))
+        ));
+        // Another contract or profile inside a v3 token.
+        for (from, to, field) in [
+            (
+                "\"contract_version\":3",
+                "\"contract_version\":2",
+                "contract_version",
+            ),
+            (
+                "\"security_profile\":\"hardened-diversified\"",
+                "\"security_profile\":\"hardened\"",
+                "security_profile",
+            ),
+        ] {
+            let text = diversified_text(&|m| m.replace(from, to), TOKEN_PREFIX_V3);
+            assert_eq!(
+                run_diversified(&text),
+                Err(IntegrityFailure::PolicyMismatch(field))
+            );
+        }
+        // The signed YAML must be the diversified declaration it binds: the
+        // gate checks the bytes, admission checks the declaration.
+        let hardened_config = diversified_text(&|m| m, TOKEN_PREFIX_V3).replacen(
+            &format!("diversification_profile_id: {PROFILE_ID}"),
+            "",
+            1,
+        );
+        assert_eq!(
+            run_diversified(&hardened_config),
+            Err(IntegrityFailure::ConfigDigestMismatch)
         );
     }
 }

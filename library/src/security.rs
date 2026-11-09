@@ -1,5 +1,5 @@
-//! Compiled security floor and release admission (hardening contract v1;
-//! docs/HARDENING_CONTRACTS.md in the workspace, sections 2 and 7).
+//! Compiled security floor and release admission (hardening contracts v1-v3;
+//! docs/HARDENING_CONTRACTS.md in the workspace, sections 2, 7, 10 and 11).
 //!
 //! The profile is fixed when the native release is built: `build.rs` turns
 //! the `SHOREBIRD_SECURITY_*` build environment (set by the engine's GN args)
@@ -10,6 +10,8 @@
 //! `legacy` keeps today's behavior unchanged. `hardened` requires a trust
 //! root, strict boot verification, signed responses, an explicit HTTPS
 //! origin and a matching toolchain identity, and rejects any weaker knob.
+//! `hardened-diversified` (P5, contract v3) is `hardened` plus a compiled
+//! diversification profile ID that the YAML and the build manifest must name.
 use crate::security_inputs::is_sha256_id;
 use crate::yaml::{
     DeclaredProfile, PatchResponseVerificationMode, PatchVerificationMode, YamlConfig,
@@ -24,6 +26,10 @@ mod generated {
 /// the build manifest chains to a compiled release root).
 pub const SECURITY_CONTRACT_VERSION: u32 = 2;
 
+/// The security contract a hardened-diversified bundle must declare
+/// (contract v3, P5).
+pub const DIVERSIFIED_CONTRACT_VERSION: u32 = 3;
+
 /// Declarations a legacy updater accepts. Legacy behavior does not depend on
 /// the version; an unknown one still fails closed.
 pub const KNOWN_CONTRACT_VERSIONS: [u32; 2] = [1, 2];
@@ -32,6 +38,9 @@ pub const KNOWN_CONTRACT_VERSIONS: [u32; 2] = [1, 2];
 pub enum SecurityProfile {
     Legacy,
     Hardened,
+    /// Hardened for every P1-P4 rule, plus a release-specific bytecode
+    /// opcode map (contract v3).
+    HardenedDiversified,
 }
 
 impl SecurityProfile {
@@ -39,6 +48,15 @@ impl SecurityProfile {
         match self {
             SecurityProfile::Legacy => "legacy",
             SecurityProfile::Hardened => "hardened",
+            SecurityProfile::HardenedDiversified => "hardened-diversified",
+        }
+    }
+
+    fn declared(self) -> DeclaredProfile {
+        match self {
+            SecurityProfile::Legacy => DeclaredProfile::Legacy,
+            SecurityProfile::Hardened => DeclaredProfile::Hardened,
+            SecurityProfile::HardenedDiversified => DeclaredProfile::HardenedDiversified,
         }
     }
 }
@@ -60,6 +78,9 @@ pub struct CompiledPolicy {
     pub release_root: Option<String>,
     /// Lowest `release-delegations` version accepted (1 by default).
     pub min_delegations_version: u64,
+    /// `sha256:` ID of the compiled diversification profile;
+    /// hardened-diversified only.
+    pub diversification_profile_id: Option<String>,
 }
 
 /// How network requests are restricted under a policy.
@@ -83,11 +104,23 @@ impl CompiledPolicy {
             trust_root_key_ids: Vec::new(),
             release_root: None,
             min_delegations_version: 1,
+            diversification_profile_id: None,
         }
     }
 
+    /// True for `hardened` and `hardened-diversified`: every P1-P4 rule
+    /// (signatures, HTTPS, integrity gate, release root) applies to both.
     pub fn is_hardened(&self) -> bool {
-        self.profile == SecurityProfile::Hardened
+        self.profile != SecurityProfile::Legacy
+    }
+
+    /// The contract version a hardened bundle must declare (2 or 3).
+    pub fn contract_version(&self) -> u32 {
+        if self.profile == SecurityProfile::HardenedDiversified {
+            DIVERSIFIED_CONTRACT_VERSION
+        } else {
+            SECURITY_CONTRACT_VERSION
+        }
     }
 
     /// Hardened releases never accept unsigned content.
@@ -96,21 +129,21 @@ impl CompiledPolicy {
     }
 
     pub fn transport_rule(&self) -> TransportRule {
-        match (self.profile, self.development_exceptions) {
-            (SecurityProfile::Legacy, _) => TransportRule::Unrestricted,
-            (SecurityProfile::Hardened, false) => TransportRule::HttpsOnly,
-            (SecurityProfile::Hardened, true) => TransportRule::LoopbackDevelopment,
+        match (self.is_hardened(), self.development_exceptions) {
+            (false, _) => TransportRule::Unrestricted,
+            (true, false) => TransportRule::HttpsOnly,
+            (true, true) => TransportRule::LoopbackDevelopment,
         }
     }
 }
 
 fn build_time_policy() -> CompiledPolicy {
     CompiledPolicy {
-        // build.rs only ever emits "legacy" or "hardened".
-        profile: if generated::COMPILED_SECURITY_PROFILE == "hardened" {
-            SecurityProfile::Hardened
-        } else {
-            SecurityProfile::Legacy
+        // build.rs only ever emits these three names.
+        profile: match generated::COMPILED_SECURITY_PROFILE {
+            "hardened" => SecurityProfile::Hardened,
+            "hardened-diversified" => SecurityProfile::HardenedDiversified,
+            _ => SecurityProfile::Legacy,
         },
         toolchain_id: generated::COMPILED_TOOLCHAIN_ID.map(str::to_string),
         development_exceptions: generated::COMPILED_DEVELOPMENT_EXCEPTIONS,
@@ -120,6 +153,8 @@ fn build_time_policy() -> CompiledPolicy {
             .collect(),
         release_root: generated::COMPILED_RELEASE_ROOT.map(str::to_string),
         min_delegations_version: generated::COMPILED_MIN_DELEGATIONS_VERSION,
+        diversification_profile_id: generated::COMPILED_DIVERSIFICATION_PROFILE_ID
+            .map(str::to_string),
     }
 }
 
@@ -155,7 +190,6 @@ pub fn compiled() -> CompiledPolicy {
 /// signatures or URLs (download URLs can be bearer credentials).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SecurityError {
-    ReservedProfile,
     UnsupportedContractVersion(u32),
     ProfileMismatch {
         compiled: &'static str,
@@ -173,14 +207,15 @@ pub enum SecurityError {
     MissingOrigin,
     InsecureOrigin,
     OriginCredentials,
+    /// A non-diversified updater given a `diversification_profile_id`.
+    UnexpectedDiversificationProfile,
+    MissingDiversificationProfileId,
+    DiversificationProfileMismatch,
 }
 
 impl std::fmt::Display for SecurityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SecurityError::ReservedProfile => {
-                write!(f, "security_profile hardened-diversified is reserved by contract v1")
-            }
             SecurityError::UnsupportedContractVersion(v) => {
                 write!(f, "unsupported security_contract_version {v}")
             }
@@ -189,10 +224,7 @@ impl std::fmt::Display for SecurityError {
                 "security profile mismatch: updater compiled {compiled}, shorebird.yaml declares {declared}"
             ),
             SecurityError::MissingContractVersion => {
-                write!(
-                    f,
-                    "hardened shorebird.yaml lacks security_contract_version: {SECURITY_CONTRACT_VERSION}"
-                )
+                write!(f, "hardened shorebird.yaml lacks security_contract_version")
             }
             SecurityError::MissingToolchainId => {
                 write!(f, "hardened shorebird.yaml lacks toolchain_id")
@@ -222,6 +254,18 @@ impl std::fmt::Display for SecurityError {
             SecurityError::OriginCredentials => {
                 write!(f, "hardened origins must not embed credentials")
             }
+            SecurityError::UnexpectedDiversificationProfile => write!(
+                f,
+                "shorebird.yaml declares diversification_profile_id, but this updater is not \
+                 hardened-diversified"
+            ),
+            SecurityError::MissingDiversificationProfileId => {
+                write!(f, "hardened-diversified shorebird.yaml lacks diversification_profile_id")
+            }
+            SecurityError::DiversificationProfileMismatch => write!(
+                f,
+                "diversification_profile_id differs from the compiled diversification profile"
+            ),
         }
     }
 }
@@ -247,17 +291,14 @@ pub fn trust_root_key_id(patch_public_key: &str) -> Result<String, SecurityError
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(&der))))
 }
 
-/// Startup admission (contract v1 §2 matrix): compares the bundled
-/// declaration with the compiled policy. Runs before any configuration is
-/// published, so a refusal means no key is requested and no patch activates.
+/// Startup admission (contract v1 §2 matrix, v3 §11.6): compares the
+/// bundled declaration with the compiled policy. Runs before any
+/// configuration is published, so a refusal means no key is requested and no
+/// patch activates.
 pub fn admit(policy: &CompiledPolicy, yaml: &YamlConfig) -> Result<Admitted, SecurityError> {
-    // Declarations no compiled profile accepts (fail closed, contract §5.7).
-    if yaml.security_profile == Some(DeclaredProfile::HardenedDiversified) {
-        return Err(SecurityError::ReservedProfile);
-    }
     if let Some(version) = yaml.security_contract_version {
         let supported = if policy.is_hardened() {
-            version == SECURITY_CONTRACT_VERSION
+            version == policy.contract_version()
         } else {
             KNOWN_CONTRACT_VERSIONS.contains(&version)
         };
@@ -278,10 +319,12 @@ pub fn admit(policy: &CompiledPolicy, yaml: &YamlConfig) -> Result<Admitted, Sec
     if !policy.is_hardened() {
         // Legacy: exactly today's behavior, unless the YAML claims a
         // stronger build than this updater is.
-        if yaml.security_profile == Some(DeclaredProfile::Hardened) {
+        if let Some(declared @ (DeclaredProfile::Hardened | DeclaredProfile::HardenedDiversified)) =
+            yaml.security_profile
+        {
             return Err(SecurityError::ProfileMismatch {
                 compiled: "legacy",
-                declared: "hardened",
+                declared: declared.as_str(),
             });
         }
         if yaml.security_development_exceptions == Some(true) {
@@ -296,9 +339,9 @@ pub fn admit(policy: &CompiledPolicy, yaml: &YamlConfig) -> Result<Admitted, Sec
     if let Some(key) = yaml.duplicate_keys.first() {
         return Err(SecurityError::DuplicateKey(key.clone()));
     }
-    if yaml.security_profile != Some(DeclaredProfile::Hardened) {
+    if yaml.security_profile != Some(policy.profile.declared()) {
         return Err(SecurityError::ProfileMismatch {
-            compiled: "hardened",
+            compiled: policy.profile.as_str(),
             declared: yaml
                 .security_profile
                 .map_or("none", DeclaredProfile::as_str),
@@ -306,6 +349,24 @@ pub fn admit(policy: &CompiledPolicy, yaml: &YamlConfig) -> Result<Admitted, Sec
     }
     if yaml.security_contract_version.is_none() {
         return Err(SecurityError::MissingContractVersion);
+    }
+    // P5: a diversified updater admits only its own profile; a hardened one
+    // admits no profile at all.
+    match (
+        policy.profile,
+        policy.diversification_profile_id.as_deref(),
+        yaml.diversification_profile_id.as_deref(),
+    ) {
+        (SecurityProfile::HardenedDiversified, _, None) => {
+            return Err(SecurityError::MissingDiversificationProfileId)
+        }
+        (SecurityProfile::HardenedDiversified, Some(compiled), Some(declared))
+            if declared == compiled && is_sha256_id(declared) => {}
+        (SecurityProfile::HardenedDiversified, _, Some(_)) => {
+            return Err(SecurityError::DiversificationProfileMismatch)
+        }
+        (_, _, Some(_)) => return Err(SecurityError::UnexpectedDiversificationProfile),
+        (_, _, None) => {}
     }
     match (&yaml.toolchain_id, &policy.toolchain_id) {
         (None, _) => return Err(SecurityError::MissingToolchainId),
@@ -415,7 +476,34 @@ pub(crate) mod tests {
             trust_root_key_ids: Vec::new(),
             release_root: None,
             min_delegations_version: 1,
+            diversification_profile_id: None,
         }
+    }
+
+    /// The development diversification profile ID (any `sha256:` ID works
+    /// for admission).
+    pub const PROFILE_ID: &str = crate::security_inputs::DEVELOPMENT_DIVERSIFICATION_PROFILE_IDS[0];
+
+    pub fn diversified() -> CompiledPolicy {
+        CompiledPolicy {
+            profile: SecurityProfile::HardenedDiversified,
+            diversification_profile_id: Some(PROFILE_ID.to_string()),
+            ..hardened()
+        }
+    }
+
+    /// A bundled shorebird.yaml exactly as the hardened-diversified build
+    /// writes it.
+    pub fn diversified_yaml_text() -> String {
+        hardened_yaml_text()
+            .replace(
+                "security_profile: hardened\nsecurity_contract_version: 2",
+                "security_profile: hardened-diversified\nsecurity_contract_version: 3",
+            )
+            .replace(
+                &format!("toolchain_id: {TOOLCHAIN}"),
+                &format!("toolchain_id: {TOOLCHAIN}\ndiversification_profile_id: {PROFILE_ID}"),
+            )
     }
 
     /// A bundled shorebird.yaml exactly as the hardened build writes it.
@@ -482,6 +570,10 @@ pub(crate) mod tests {
                 "SHOREBIRD_BUILD_MANIFEST_KEYS",
                 option_env!("SHOREBIRD_BUILD_MANIFEST_KEYS"),
             ),
+            (
+                "SHOREBIRD_DIVERSIFICATION_PROFILE",
+                option_env!("SHOREBIRD_DIVERSIFICATION_PROFILE"),
+            ),
         ];
         let expected = crate::security_inputs::parse_compiled_inputs(&|name: &str| {
             build_env
@@ -503,6 +595,10 @@ pub(crate) mod tests {
         assert_eq!(
             policy.min_delegations_version,
             expected.min_delegations_version
+        );
+        assert_eq!(
+            policy.diversification_profile_id,
+            expected.diversification_profile_id
         );
         if option_env!("SHOREBIRD_SECURITY_PROFILE").is_none() {
             assert_eq!(policy, CompiledPolicy::legacy());
@@ -657,12 +753,16 @@ pub(crate) mod tests {
                 Err(SecurityError::UnsupportedContractVersion(number))
             );
         }
+        // P5: a hardened updater refuses the diversified declaration.
         assert_eq!(
             admit_text(
                 &hardened(),
                 &edited("security_profile", Some("hardened-diversified"))
             ),
-            Err(SecurityError::ReservedProfile)
+            Err(SecurityError::ProfileMismatch {
+                compiled: "hardened",
+                declared: "hardened-diversified"
+            })
         );
     }
 
@@ -824,7 +924,15 @@ pub(crate) mod tests {
                 &CompiledPolicy::legacy(),
                 "app_id: a\nsecurity_profile: hardened-diversified"
             ),
-            Err(SecurityError::ReservedProfile)
+            Err(SecurityError::ProfileMismatch {
+                compiled: "legacy",
+                declared: "hardened-diversified"
+            })
+        );
+        // The full diversified build output (contract 3) is refused too.
+        assert_eq!(
+            admit_text(&CompiledPolicy::legacy(), &diversified_yaml_text()),
+            Err(SecurityError::UnsupportedContractVersion(3))
         );
     }
 
@@ -834,5 +942,184 @@ pub(crate) mod tests {
         let error = admit_text(&hardened(), &edited("base_url", Some(secret))).unwrap_err();
         assert!(!error.to_string().contains("token"));
         assert!(!error.to_string().contains(KEY));
+    }
+
+    /// Replaces (or with `None`, removes) one line of the diversified YAML.
+    fn diversified_edited(key: &str, value: Option<&str>) -> String {
+        let mut lines: Vec<String> = diversified_yaml_text()
+            .lines()
+            .filter(|line| !line.starts_with(&format!("{key}:")))
+            .map(str::to_string)
+            .collect();
+        if let Some(value) = value {
+            lines.push(format!("{key}: {value}"));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn diversified_accepts_the_build_output_and_forces_the_hardened_floor() {
+        let policy = diversified();
+        assert!(policy.is_hardened());
+        assert!(policy.requires_signatures());
+        assert_eq!(policy.contract_version(), 3);
+        assert_eq!(policy.transport_rule(), TransportRule::HttpsOnly);
+        let admitted = admit_text(&policy, &diversified_yaml_text()).unwrap();
+        assert_eq!(admitted.patch_verification, PatchVerificationMode::Strict);
+        assert_eq!(
+            admitted.patch_response_verification,
+            PatchResponseVerificationMode::Required
+        );
+        // Quoted, as a YAML writer may emit it.
+        assert!(admit_text(
+            &policy,
+            &diversified_edited(
+                "diversification_profile_id",
+                Some(&format!("\"{PROFILE_ID}\""))
+            )
+        )
+        .is_ok());
+        // Every hardened rule still applies.
+        for (text, error) in [
+            (
+                diversified_edited("base_url", Some("http://updates.example.com")),
+                SecurityError::InsecureOrigin,
+            ),
+            (
+                diversified_edited("patch_response_verification", Some("optional")),
+                SecurityError::WeakerThanFloor("patch_response_verification"),
+            ),
+            (
+                diversified_edited("toolchain_id", None),
+                SecurityError::MissingToolchainId,
+            ),
+            (
+                diversified_edited("security_development_exceptions", Some("true")),
+                SecurityError::DevelopmentExceptionsMismatch,
+            ),
+            (
+                diversified_edited("base_url", None),
+                SecurityError::MissingOrigin,
+            ),
+        ] {
+            assert_eq!(admit_text(&policy, &text), Err(error), "{text}");
+        }
+        let mut development = diversified();
+        development.development_exceptions = true;
+        assert_eq!(
+            development.transport_rule(),
+            TransportRule::LoopbackDevelopment
+        );
+    }
+
+    #[test]
+    fn diversified_rejects_another_profile_or_declaration() {
+        let policy = diversified();
+        let other = format!("sha256:{}", "0".repeat(64));
+        for (text, error) in [
+            (
+                diversified_edited("diversification_profile_id", None),
+                SecurityError::MissingDiversificationProfileId,
+            ),
+            (
+                diversified_edited("diversification_profile_id", Some(&other)),
+                SecurityError::DiversificationProfileMismatch,
+            ),
+            (
+                diversified_edited(
+                    "diversification_profile_id",
+                    Some(&PROFILE_ID.to_uppercase()),
+                ),
+                SecurityError::DiversificationProfileMismatch,
+            ),
+            (
+                diversified_edited("diversification_profile_id", Some("")),
+                SecurityError::DiversificationProfileMismatch,
+            ),
+            // The hardened (contract 2) build output.
+            (
+                hardened_yaml_text(),
+                SecurityError::UnsupportedContractVersion(2),
+            ),
+            (
+                diversified_edited("security_profile", Some("hardened")),
+                SecurityError::ProfileMismatch {
+                    compiled: "hardened-diversified",
+                    declared: "hardened",
+                },
+            ),
+            (
+                diversified_edited("security_profile", None),
+                SecurityError::ProfileMismatch {
+                    compiled: "hardened-diversified",
+                    declared: "none",
+                },
+            ),
+            (
+                diversified_edited("security_contract_version", Some("2")),
+                SecurityError::UnsupportedContractVersion(2),
+            ),
+            (
+                diversified_edited("security_contract_version", None),
+                SecurityError::MissingContractVersion,
+            ),
+            (
+                "app_id: app\nbase_url: https://updates.example.com\npatch_public_key: AQID"
+                    .to_string(),
+                SecurityError::ProfileMismatch {
+                    compiled: "hardened-diversified",
+                    declared: "none",
+                },
+            ),
+            // A repeated ID cannot smuggle a second value.
+            (
+                format!(
+                    "{}\ndiversification_profile_id: {PROFILE_ID}",
+                    diversified_yaml_text()
+                ),
+                SecurityError::DuplicateKey("diversification_profile_id".to_string()),
+            ),
+            (
+                format!(
+                    "{}\ndiversification_profile_id: {other}",
+                    diversified_yaml_text()
+                ),
+                SecurityError::DuplicateKey("diversification_profile_id".to_string()),
+            ),
+        ] {
+            assert_eq!(admit_text(&policy, &text), Err(error), "{text}");
+        }
+        // A diversified updater without a compiled ID (a build bug) admits
+        // nothing.
+        let mut broken = diversified();
+        broken.diversification_profile_id = None;
+        assert_eq!(
+            admit_text(&broken, &diversified_yaml_text()),
+            Err(SecurityError::DiversificationProfileMismatch)
+        );
+    }
+
+    #[test]
+    fn hardened_rejects_a_diversification_declaration() {
+        let with_id = format!(
+            "{}\ndiversification_profile_id: {PROFILE_ID}",
+            hardened_yaml_text()
+        );
+        assert_eq!(
+            admit_text(&hardened(), &with_id),
+            Err(SecurityError::UnexpectedDiversificationProfile)
+        );
+        // The diversified build output: contract 3 first.
+        assert_eq!(
+            admit_text(&hardened(), &diversified_yaml_text()),
+            Err(SecurityError::UnsupportedContractVersion(3))
+        );
+        assert_eq!(hardened().contract_version(), 2);
+        // Legacy ignores an undeclared ID exactly as before (unknown keys).
+        assert!(admit_text(
+            &CompiledPolicy::legacy(),
+            &format!("app_id: a\ndiversification_profile_id: {PROFILE_ID}")
+        )
+        .is_ok());
     }
 }

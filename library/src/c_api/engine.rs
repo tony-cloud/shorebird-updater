@@ -206,15 +206,21 @@ pub extern "C" fn shorebird_init(
     )
 }
 
-/// The security profile compiled into this updater ("legacy" or "hardened"),
-/// as a static NUL-terminated string the caller must not free. The engine
+/// The security profile compiled into this updater ("legacy", "hardened" or
+/// "hardened-diversified"), as a static NUL-terminated string the caller must
+/// not free. The engine
 /// compares it with its own compiled `shorebird_security_profile` GN arg and
 /// refuses to initialize on a mismatch (a stale or wrong updater library).
 #[no_mangle]
 pub extern "C" fn shorebird_compiled_security_profile() -> *const c_char {
-    match crate::security::compiled_profile_name() {
-        "hardened" => c"hardened".as_ptr(),
-        _ => c"legacy".as_ptr(),
+    security_profile_cstr(crate::security::compiled_profile_name()).as_ptr()
+}
+
+fn security_profile_cstr(name: &str) -> &'static std::ffi::CStr {
+    match name {
+        "hardened" => c"hardened",
+        "hardened-diversified" => c"hardened-diversified",
+        _ => c"legacy",
     }
 }
 
@@ -841,6 +847,19 @@ mod native_source_tests {
         }
         assert!(crate::with_state(|s| Ok(s.currently_booting_patch().is_none())).unwrap());
         crate::testing_reset_config();
+    }
+
+    #[test]
+    fn compiled_security_profile_names_each_contract_profile() {
+        for name in ["legacy", "hardened", "hardened-diversified"] {
+            assert_eq!(super::security_profile_cstr(name).to_str().unwrap(), name);
+        }
+        let compiled =
+            unsafe { std::ffi::CStr::from_ptr(super::shorebird_compiled_security_profile()) };
+        assert_eq!(
+            compiled.to_str().unwrap(),
+            crate::security::compiled_profile_name()
+        );
     }
 
     #[test]
